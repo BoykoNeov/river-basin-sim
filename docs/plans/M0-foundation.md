@@ -39,8 +39,8 @@ one terrain tile as a static 3D heightmap in Godot. **No dynamics yet.**
 - **Stop and confirm before M1** (local-inertial solver).
 
 ## Open questions for the developer
-- **License** for the public repo (currently none → all-rights-reserved). MIT /
-  Apache-2.0 / other?
+- ~~License~~ → **MIT** (chosen 2026-06-20). Copyright line reads "Boyko Neov" —
+  correct on next commit if a different name/entity is wanted.
 - Sample DEM region/source preference, or pick a small public-domain SRTM tile?
 - Terrain rendering: `Terrain3D` plugin vs hand-rolled clipmap for M0 (a flat
   heightmap is enough for the M0 demo; LOD can wait).

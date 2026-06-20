@@ -68,5 +68,4 @@ roadmap (M0–M7) and current milestone plan.
 
 ## License
 
-Not yet chosen — see the repo owner. (No license file currently means the default of
-"all rights reserved"; this will be set deliberately.)
+[MIT](./LICENSE) — free to use, fork, and modify with attribution.
