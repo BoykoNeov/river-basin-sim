@@ -1,0 +1,17 @@
+# Normalize line endings: store LF in the repo, check out native per OS.
+* text=auto
+
+# Source / text formats: always LF, even on Windows checkouts.
+*.py    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.gd    text eol=lf
+*.glsl  text eol=lf
+*.json  text eol=lf
+
+# Binary assets — never normalize.
+*.raw    binary
+*.png    binary
+*.jpg    binary
+*.exr    binary
+*.tif    binary

@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Project data & results (large, regenerated) — HANDOFF §6
+/data/*
+!/data/.gitkeep
+*.zarr/
+results/
+frames/
+status.json
+
+# Godot 4 viewer caches
+viewer/.godot/
+viewer/.import/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

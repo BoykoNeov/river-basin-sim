@@ -1,0 +1,42 @@
+[project]
+name = "river-basin-sim"
+version = "0.1.0"
+description = "Batch GPU shallow-water river-basin simulator (NVIDIA Warp) with a Godot 4 viewer."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.4.6",
+    "warp-lang>=1.14.0",
+    "xarray>=2026.4.0",
+    "zarr>=3.2.1",
+]
+
+[project.optional-dependencies]
+# Offline DEM-conditioning / data-prep stack. Installed in the M0-pipeline batch
+# (`uv sync --extra geo`); resolution is verified there, not here.
+# richdem is intentionally absent: its wheels stop at cp37 and it will not build
+# on modern Python. pysheds replaces it (HANDOFF allows the swap); WhiteboxTools
+# is the standalone-binary fallback if pysheds + new numba misbehaves.
+geo = [
+    "rasterio>=1.5.0",
+    "pyproj>=3.7.2",
+    "pysheds>=0.5",
+    "matplotlib>=3.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.9",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["validation", "solver", "pipeline"]
