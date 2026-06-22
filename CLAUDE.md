@@ -15,18 +15,25 @@ A faithful research/education sandbox validated against benchmarks — **not a
 regulatory-certification tool**. State that honestly anywhere it matters.
 
 ## Status
-- **M0 — Foundation: in progress.** Done: repo scaffold, uv env, toolchain smoke
-  test (Warp sees the RTX 5090, sm_120 JIT, Zarr round-trip all green). Next:
-  DEM-conditioning pipeline + a static Godot terrain scene. See
-  `docs/plans/M0-foundation.md`.
+- **M0 — Foundation: acceptance met; confirm before M1.** Pipeline + viewer +
+  handoff proven end to end: SRTM `N35W083` → conditioned (UTM 17N, sink-fill, D8
+  flow dir/accum) → `.r32` tile → loads as static 3D terrain in Godot via Terrain3D
+  (verified on Godot 4.7). `ruff`/`pytest`/smoke all green. Tooling locked:
+  **pysheds** (with a NumPy-2.x `np.in1d` shim in `pipeline/_compat.py`) and
+  **Terrain3D**. See `docs/plans/M0-foundation.md`.
 - Milestones M0–M7: `docs/plans/roadmap.md`.
 
 ## Commands
 - `uv sync` — create/refresh the venv (installs deps + `dev` group).
+- `uv sync --extra geo` — also installs the offline DEM-conditioning stack
+  (rasterio, pyproj, pysheds). **Needed for the pipeline tests** — without it the 5
+  `pipeline/test_pipeline.py` tests `importorskip` and silently skip (still "green").
 - `uv run python scripts/smoke_test.py` — toolchain self-check (GPU + Zarr).
 - `uv run ruff check .` / `uv run ruff format .` — lint / format.
 - `uv run pytest` — tests + validation harness (runs on Warp's **CPU** backend, so
-  it works in CI without a GPU).
+  it works in CI without a GPU). Run after `uv sync --extra geo` to exercise the pipeline.
+- Pipeline (M0): `uv run python -m pipeline.condition --src <dem> --out <dir>` then
+  `uv run python -m pipeline.tile --src <dir> --out data/tiles/demo --single`.
 - Solver entry point (later milestones): `uv run python -m solver.run --config <toml>`.
 
 ## Conventions
