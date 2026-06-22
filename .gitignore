@@ -17,6 +17,14 @@ status.json
 # Godot 4 viewer caches
 viewer/.godot/
 viewer/.import/
+viewer/uid_cache.bin
+
+# Terrain3D addon: ~50 MB of third-party GDExtension binaries, fetched not vendored.
+# Install with viewer/scripts/fetch_terrain3d.sh (or Godot AssetLib). See viewer/README.
+viewer/addons/
+
+# Throwaway Terrain3D compatibility-probe project
+.t3dtest/
 
 # OS / editor
 .DS_Store

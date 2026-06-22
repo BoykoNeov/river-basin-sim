@@ -1,0 +1,19 @@
+; River Basin Simulator -- Godot 4 viewer (M0: static terrain).
+; The viewer only ever READS files the pipeline/solver write (HANDOFF §4, §7).
+
+config_version=5
+
+[application]
+
+config/name="River Basin Viewer"
+run/main_scene="res://scenes/terrain_view.tscn"
+config/features=PackedStringArray("4.7")
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=720
+
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/terrain_3d/plugin.cfg")
