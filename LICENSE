@@ -1,21 +1,136 @@
-MIT License
+Boyko Non-Commercial License v1.0
+(BNCL-1.0)
 
 Copyright (c) 2026 Boyko Neov
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. Definitions
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+"Software" means the source code, object code, documentation,
+examples, and other materials distributed under this License.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+"Copyright Holder" means Boyko Neov.
+
+"You" means any individual or legal entity exercising permissions
+granted by this License.
+
+"Derivative Work" means any work based upon, incorporating,
+modifying, adapting, translating, or extending the Software.
+
+"Non-Commercial Purpose" means any purpose that is not
+primarily intended for or directed toward commercial advantage,
+monetary compensation, revenue generation, or operation of a
+commercial business.
+
+"Commercial Use" includes, but is not limited to:
+  - selling or licensing the Software or Derivative Works;
+  - providing paid services using the Software;
+  - integrating the Software into commercial products or services;
+  - internal business use by a for-profit organization where the
+    Software contributes to commercial operations;
+  - any use intended to generate revenue or commercial benefit.
+
+2. Grant of License
+
+Subject to the terms of this License, the Copyright Holder grants You
+a worldwide, non-exclusive, non-transferable, revocable license to:
+  - use the Software;
+  - copy the Software;
+  - modify the Software;
+  - create Derivative Works;
+  - distribute the Software and Derivative Works;
+
+provided that all such activities are solely for Non-Commercial
+Purposes.
+
+No ownership of the Software is transferred under this License.
+
+3. Commercial Use Prohibited
+
+Except with prior written permission from the Copyright Holder, You
+may not:
+  - use the Software for any Commercial Use;
+  - distribute the Software as part of a commercial offering;
+  - sell, sublicense, lease, rent, or otherwise commercially exploit
+    the Software or any Derivative Work.
+
+Commercial licenses may be obtained separately from the
+Copyright Holder.
+
+4. Attribution Requirement
+
+Any redistribution of the Software, whether modified or unmodified,
+must include:
+  - this License in its entirety;
+  - the accompanying NOTICE file, if one is provided;
+  - the original copyright notice.
+
+Any Derivative Work must clearly acknowledge the original
+Software by including the following attribution in documentation,
+source code, or another reasonably visible location:
+
+    This software is based on software originally created by Boyko Neov.
+
+The attribution may not be removed, obscured, or replaced.
+
+5. Modification Requirements
+
+You may modify the Software for Non-Commercial Purposes.
+
+If You distribute a Derivative Work, You must:
+  - clearly identify that modifications have been made;
+  - include the date of modification, where practical;
+  - not misrepresent the Derivative Work as the original Software.
+
+6. Reservation of Rights
+
+All rights not expressly granted under this License are reserved by
+the Copyright Holder.
+
+This License does not grant any trademark rights, trade name rights,
+patent rights, or rights to use the Copyright Holder's name except as
+required for attribution under Section 4.
+
+7. Termination
+
+This License terminates automatically if You violate any of its terms.
+
+Upon termination, You must immediately cease use and distribution
+of the Software and destroy all copies within Your possession or
+control, except where retention is required by law.
+
+Termination does not affect any remedies available to the Copyright
+Holder under applicable law.
+
+8. Disclaimer of Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY
+OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, TITLE, OR NONINFRINGEMENT.
+YOU ASSUME ALL RISKS ARISING FROM THE USE OF THE
 SOFTWARE.
+
+9. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW,
+THE COPYRIGHT HOLDER SHALL NOT BE LIABLE FOR ANY
+CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN
+CONTRACT, TORT, OR OTHERWISE, ARISING FROM OR
+RELATED TO THE SOFTWARE OR ITS USE.
+
+10. Severability
+
+If any provision of this License is held unenforceable, the remaining
+provisions shall remain in full force and effect.
+
+11. Governing Law
+
+Unless otherwise agreed in writing, this License shall be governed
+by the laws of the jurisdiction in which the Copyright Holder resides,
+excluding its conflict-of-law rules.
+
+12. Acceptance
+
+By using, copying, modifying, or distributing the Software, You
+acknowledge that You have read and agree to be bound by the
+terms of this License.
