@@ -28,6 +28,7 @@ from solver.core.massbalance import MASS_GATE, MassLedger
 from solver.core.state import State
 from solver.io.config import Scenario, load_config
 from solver.io.fields import load_field
+from solver.io.provenance import write_provenance
 from solver.io.status import StatusWriter
 from solver.io.viewer_export import export_frames
 from solver.io.zarr_writer import ZarrWriter
@@ -131,6 +132,8 @@ def run_simulation(
         "infiltration_mm_hr": scenario.infiltration_mm_hr,
         "end_time_s": scenario.end_time,
         "output_every_s": scenario.output_every,
+        # Static provenance (§2): source hash + resolved scenario -> reproducible.
+        "provenance": write_provenance(scenario, out_path),
     }
     writer = ZarrWriter(out_path, grid, n_frames, attrs)
     writer.write_bed(bed)
