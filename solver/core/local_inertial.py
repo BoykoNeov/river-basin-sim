@@ -31,7 +31,7 @@ import math
 
 import warp as wp
 
-from solver.core.boundaries import apply_closed_bc
+from solver.core.boundaries import apply_closed_bc, apply_open_outflow
 from solver.core.friction import manning_denominator
 from solver.core.grid import GRAVITY, H_DRY
 from solver.core.state import State
@@ -161,15 +161,16 @@ def apply_rain_field(
 def apply_infiltration(
     h: wp.array2d(dtype=wp.float32),
     infil: wp.array2d(dtype=wp.float32),
-    loss_cum: wp.array2d(dtype=wp.float32),
+    loss_cum: wp.array2d(dtype=wp.float64),
     dt: wp.float32,
 ):
     """Remove a capped infiltration loss and bank it in ``loss_cum`` (M3 sink).
 
     Constant-rate (Horton-final) infiltration: a cell loses ``infil*dt`` but never
-    more than it holds, so depth stays non-negative. The removed depth is banked
-    per-cell (one writer -> deterministic, §8/§12) so the float64 sum at output
-    cadence gives the exact outflow the mass ledger needs.
+    more than it holds, so depth stays non-negative. We bank the **exact** depth
+    the float32 field lost (``f64(avail) - f64(h_new)``) into the float64
+    accumulator (one writer -> deterministic, §8/§12), so the outflow the ledger
+    reads mirrors ``h`` bit-for-bit and the residual stays at field quantization.
     """
     i, j = wp.tid()
     avail = h[i, j]
@@ -178,8 +179,9 @@ def apply_infiltration(
         inf = avail
     if inf < 0.0:
         inf = 0.0
-    h[i, j] = avail - inf
-    loss_cum[i, j] = loss_cum[i, j] + inf
+    h_new = avail - inf
+    h[i, j] = h_new
+    loss_cum[i, j] = loss_cum[i, j] + (wp.float64(avail) - wp.float64(h_new))
 
 
 @wp.kernel
@@ -363,3 +365,5 @@ def step(
             inputs=[state.h, state.infil, state.loss_cum, dtf],
             device=state.device,
         )
+    if state.open_edges:
+        apply_open_outflow(state, dt)

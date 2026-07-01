@@ -112,6 +112,8 @@ def run_simulation(
         rain_field_sum_m_s = float(rain_field.astype(np.float64).sum())
     # Inflow hydrographs (prescribed discharge point sources).
     injector = InflowInjector(scenario.inflows, grid, device) if scenario.inflows else None
+    # Open (free-outflow) boundaries (no-op when every edge is closed).
+    st.set_open_boundaries(scenario.boundaries)
 
     ledger = MassLedger.from_state(st)
 

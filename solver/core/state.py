@@ -49,9 +49,11 @@ class State:
     # M3 optional source/sink fields (None unless the scenario needs them):
     infil: wp.array | None = None  # (ny, nx) infiltration rate, m/s
     rain: wp.array | None = None  # (ny, nx) spatial rainfall rate, m/s (temporally scaled)
-    # (ny, nx) cumulative depth of water removed by local sinks (infiltration,
-    # open-boundary outflow); float64-summed at output cadence -> ledger outflow.
+    # (ny, nx) float64 cumulative depth of water removed by local sinks
+    # (infiltration, open-boundary outflow); summed at output cadence -> outflow.
     loss_cum: wp.array | None = None
+    # Names of open (free-outflow) domain edges, subset of {north,south,east,west}.
+    open_edges: frozenset[str] = frozenset()
 
     def set_infiltration(self, infil: np.ndarray) -> None:
         """Attach an infiltration-rate field (m/s) and arm the loss accumulator."""
@@ -68,9 +70,22 @@ class State:
             raise ValueError(f"rain-field shape {rain.shape} != grid {(ny, nx)}")
         self.rain = wp.array(np.ascontiguousarray(rain, dtype=np.float32), device=self.device)
 
+    def set_open_boundaries(self, boundaries: dict[str, str]) -> None:
+        """Mark which edges are open (free-outflow) and arm the loss accumulator.
+
+        ``boundaries`` maps edge name -> "closed"|"open" (per :func:`solver.io.config`).
+        Only the open edges are recorded; if none are open this is a no-op.
+        """
+        self.open_edges = frozenset(e for e, v in boundaries.items() if v == "open")
+        if self.open_edges:
+            self._ensure_loss_cum()
+
     def _ensure_loss_cum(self) -> None:
+        # float64: sink outflow can concentrate at a single edge cell and grow far
+        # larger than any per-step increment; a float32 accumulator there would
+        # drift (HANDOFF §2/§12 -- the accumulator that judges mass stays float64).
         if self.loss_cum is None:
-            self.loss_cum = wp.zeros(self.grid.shape, dtype=wp.float32, device=self.device)
+            self.loss_cum = wp.zeros(self.grid.shape, dtype=wp.float64, device=self.device)
 
     def loss_volume(self, cell_area: float) -> float:
         """Cumulative sink volume (m^3) so far, float64-summed (0 if unarmed)."""

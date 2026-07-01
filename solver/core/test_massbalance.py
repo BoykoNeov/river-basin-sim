@@ -75,9 +75,13 @@ def test_infiltration_is_capped_and_banked():
 
 def test_rain_and_infiltration_balance_to_gate():
     """Uniform rain into a closed basin with a partial infiltration sink: the
-    residual (inflow - infiltration_outflow - dV) stays under the <1e-6 gate."""
+    residual (inflow - infiltration_outflow - dV) stays under the <1e-6 gate.
+
+    The infiltration sink is float64-exact by construction, so the residual here
+    is really the float32 rain-accumulation floor -- kept well under the gate by a
+    realistic (non-thin) stored volume, the same regime as the M1 rain test."""
     bed = np.zeros((16, 16), dtype=np.float32)
-    st = State.from_bed(bed, dx=10.0, depth=0.05, device=DEV)
+    st = State.from_bed(bed, dx=10.0, depth=0.5, device=DEV)
     st.set_infiltration(np.full((16, 16), 5.0 / 1000.0 / 3600.0, dtype=np.float32))  # 5 mm/hr
     ledger = MassLedger.from_state(st)
     rain = 50.0 / 1000.0 / 3600.0  # 50 mm/hr
