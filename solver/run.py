@@ -31,6 +31,7 @@ from solver.io.fields import load_field
 from solver.io.status import StatusWriter
 from solver.io.viewer_export import export_frames
 from solver.io.zarr_writer import ZarrWriter
+from solver.processes.inflow import InflowInjector
 
 # Scenario is defined in solver.io.config (the §7.1 contract); re-exported here so
 # existing callers (`from solver.run import Scenario`) keep working.
@@ -109,6 +110,8 @@ def run_simulation(
         rain_field = load_field(scenario.rain_field, grid) / 1000.0 / 3600.0
         st.set_rain_field(rain_field)
         rain_field_sum_m_s = float(rain_field.astype(np.float64).sum())
+    # Inflow hydrographs (prescribed discharge point sources).
+    injector = InflowInjector(scenario.inflows, grid, device) if scenario.inflows else None
 
     ledger = MassLedger.from_state(st)
 
@@ -136,13 +139,19 @@ def run_simulation(
 
     t = 0.0
     next_output = scenario.output_every
-    # Event times a step must not cross: output cadence, rain end, end of run.
+    # Event times a step must not cross: output cadence, rain end, end of run, and
+    # each inflow-hydrograph breakpoint (so the sampled discharge stays faithful).
     output_times = [scenario.output_every * k for k in range(1, n_frames)]
-    events = output_times + [scenario.rain_duration, scenario.end_time]
+    inflow_events = injector.breakpoints() if injector else []
+    events = output_times + [scenario.rain_duration, scenario.end_time] + inflow_events
 
     while t < scenario.end_time - EPS_T:
         dt = compute_dt(st, alpha=scenario.alpha, dt_max=scenario.dt_max)
         dt = min(dt, _next_event_time(t, events) - t)
+
+        # Inject inflow hydrographs for this step (midpoint discharge -> volume).
+        if injector is not None:
+            ledger.add_inflow(injector.apply(st, t, dt))
 
         raining = t < scenario.rain_duration - EPS_T
 
