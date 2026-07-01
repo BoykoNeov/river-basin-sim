@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import warp as wp
 
 from solver.core.local_inertial import compute_dt, step
@@ -50,6 +51,66 @@ def test_uniform_rain_balances_to_gate():
     assert ledger.max_rel_error < MASS_GATE
     # Sanity: volume actually grew by ~inflow.
     assert ledger.series[-1].volume > ledger.v0
+
+
+def test_infiltration_is_capped_and_banked():
+    """Infiltration removes at most the available depth and banks it in loss_cum.
+
+    A single big-rate step over a shallow sheet must drain each cell to exactly 0
+    (never negative), and the removed volume must equal the ledger outflow.
+    """
+    bed = np.zeros((4, 4), dtype=np.float32)
+    st = State.from_bed(bed, dx=10.0, depth=0.01, device=DEV)  # 1 cm sheet
+    st.set_infiltration(np.full((4, 4), 1.0, dtype=np.float32))  # 1 m/s -> huge
+    ledger = MassLedger.from_state(st)
+    step(st, dt=1.0)  # infil*dt = 1 m >> 0.01 m available -> fully drained
+    ledger.record(st, 1.0)
+
+    h = st.h.numpy()
+    assert h.min() >= 0.0 and float(h.max()) < 1e-7  # emptied, non-negative
+    removed = st.loss_volume(st.grid.cell_area)
+    assert removed == pytest.approx(0.01 * st.grid.cell_area * st.grid.n_cells, rel=1e-5)
+    assert ledger.series[-1].outflow_cum == pytest.approx(removed, rel=1e-6)
+
+
+def test_rain_and_infiltration_balance_to_gate():
+    """Uniform rain into a closed basin with a partial infiltration sink: the
+    residual (inflow - infiltration_outflow - dV) stays under the <1e-6 gate."""
+    bed = np.zeros((16, 16), dtype=np.float32)
+    st = State.from_bed(bed, dx=10.0, depth=0.05, device=DEV)
+    st.set_infiltration(np.full((16, 16), 5.0 / 1000.0 / 3600.0, dtype=np.float32))  # 5 mm/hr
+    ledger = MassLedger.from_state(st)
+    rain = 50.0 / 1000.0 / 3600.0  # 50 mm/hr
+
+    t = 0.0
+    for _ in range(60):
+        dt = compute_dt(st, alpha=0.5, dt_max=5.0)
+        step(st, dt=dt, rain=rain)
+        ledger.add_rain_step(rain, dt, st.grid.n_cells)
+        t += dt
+    ledger.record(st, t)
+
+    assert ledger.max_rel_error < MASS_GATE
+    assert ledger.series[-1].outflow_cum > 0.0  # the sink actually removed water
+
+
+def test_rain_field_adds_expected_volume():
+    """A spatial rain field adds sum(rate)*area*time and balances to the gate."""
+    bed = np.zeros((8, 8), dtype=np.float32)
+    st = State.from_bed(bed, dx=10.0, depth=0.1, device=DEV)
+    # A ramp field so the pattern is non-uniform (per-cell mm/hr -> m/s).
+    rate_mm_hr = (np.arange(64, dtype=np.float32).reshape(8, 8) + 1.0) * 2.0
+    rain_m_s = (rate_mm_hr / 1000.0 / 3600.0).astype(np.float32)
+    st.set_rain_field(rain_m_s)
+    ledger = MassLedger.from_state(st)
+    rain_sum_m_s = float(rain_m_s.astype(np.float64).sum())
+
+    dt, nsteps = 5.0, 40
+    for _ in range(nsteps):
+        step(st, dt=dt, rain_scale=1.0)
+        ledger.add_inflow(rain_sum_m_s * dt * st.grid.cell_area)
+    ledger.record(st, dt * nsteps)
+    assert ledger.max_rel_error < MASS_GATE
 
 
 def test_kahan_beats_naive_sum():

@@ -95,6 +95,21 @@ def run_simulation(
     st = State.from_bed(
         bed, dx=scenario.dx, depth=scenario.initial_depth, manning=manning, device=device
     )
+
+    # --- M3 sources/sinks -------------------------------------------------------
+    # Infiltration (constant-rate sink, mm/hr -> m/s); armed only when nonzero.
+    infil = load_field(scenario.infiltration_field, grid, scalar=scenario.infiltration_mm_hr)
+    infil_m_s = infil / 1000.0 / 3600.0
+    if scenario.infiltration_field is not None or float(infil_m_s.max()) > 0.0:
+        st.set_infiltration(infil_m_s)
+    # Spatial rainfall field (mm/hr -> m/s); uniform rain keeps the scalar path.
+    rain_is_field = scenario.rain_type == "field"
+    rain_field_sum_m_s = 0.0
+    if rain_is_field:
+        rain_field = load_field(scenario.rain_field, grid) / 1000.0 / 3600.0
+        st.set_rain_field(rain_field)
+        rain_field_sum_m_s = float(rain_field.astype(np.float64).sum())
+
     ledger = MassLedger.from_state(st)
 
     n_frames = int(round(scenario.end_time / scenario.output_every)) + 1
@@ -104,9 +119,11 @@ def run_simulation(
         "dx": scenario.dx,
         "units": {"depth": "m", "u": "m/s", "v": "m/s", "time": "s", "bed": "m"},
         "scenario": scenario.name,
+        "rain_type": scenario.rain_type,
         "rain_mm_hr": scenario.rain_mm_hr,
         "rain_duration_s": scenario.rain_duration,
         "manning_n": scenario.manning_n,
+        "infiltration_mm_hr": scenario.infiltration_mm_hr,
         "end_time_s": scenario.end_time,
         "output_every_s": scenario.output_every,
     }
@@ -128,11 +145,16 @@ def run_simulation(
         dt = min(dt, _next_event_time(t, events) - t)
 
         raining = t < scenario.rain_duration - EPS_T
-        rain = scenario.rain_m_s if raining else 0.0
 
-        step(st, dt=dt, rain=rain)
-        if rain > 0.0:
-            ledger.add_rain_step(rain, dt, grid.n_cells)
+        if rain_is_field:
+            step(st, dt=dt, rain_scale=(1.0 if raining else 0.0))
+            if raining:
+                ledger.add_inflow(rain_field_sum_m_s * dt * grid.cell_area)
+        else:
+            rain = scenario.rain_m_s if raining else 0.0
+            step(st, dt=dt, rain=rain)
+            if rain > 0.0:
+                ledger.add_rain_step(rain, dt, grid.n_cells)
         t += dt
 
         if t >= next_output - EPS_T and next_output <= scenario.end_time + EPS_T:

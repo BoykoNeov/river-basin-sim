@@ -46,6 +46,37 @@ class State:
     eta: wp.array
     beta: wp.array  # (ny, nx) per-cell outflow-limiter factor in [0, 1]
     h_max: wp.array  # (1,) float32 scratch for the timestep reduction
+    # M3 optional source/sink fields (None unless the scenario needs them):
+    infil: wp.array | None = None  # (ny, nx) infiltration rate, m/s
+    rain: wp.array | None = None  # (ny, nx) spatial rainfall rate, m/s (temporally scaled)
+    # (ny, nx) cumulative depth of water removed by local sinks (infiltration,
+    # open-boundary outflow); float64-summed at output cadence -> ledger outflow.
+    loss_cum: wp.array | None = None
+
+    def set_infiltration(self, infil: np.ndarray) -> None:
+        """Attach an infiltration-rate field (m/s) and arm the loss accumulator."""
+        ny, nx = self.grid.shape
+        if infil.shape != (ny, nx):
+            raise ValueError(f"infiltration shape {infil.shape} != grid {(ny, nx)}")
+        self.infil = wp.array(np.ascontiguousarray(infil, dtype=np.float32), device=self.device)
+        self._ensure_loss_cum()
+
+    def set_rain_field(self, rain: np.ndarray) -> None:
+        """Attach a spatial rainfall-rate field (m/s); scaled on/off over time."""
+        ny, nx = self.grid.shape
+        if rain.shape != (ny, nx):
+            raise ValueError(f"rain-field shape {rain.shape} != grid {(ny, nx)}")
+        self.rain = wp.array(np.ascontiguousarray(rain, dtype=np.float32), device=self.device)
+
+    def _ensure_loss_cum(self) -> None:
+        if self.loss_cum is None:
+            self.loss_cum = wp.zeros(self.grid.shape, dtype=wp.float32, device=self.device)
+
+    def loss_volume(self, cell_area: float) -> float:
+        """Cumulative sink volume (m^3) so far, float64-summed (0 if unarmed)."""
+        if self.loss_cum is None:
+            return 0.0
+        return float(self.loss_cum.numpy().astype(np.float64).sum()) * cell_area
 
     @classmethod
     def from_bed(

@@ -97,10 +97,16 @@ class MassLedger:
         self.add_inflow(rain_m_s * dt * self.cell_area * n_cells)
 
     def record(self, state: State, time: float) -> MassRecord:
-        """Snapshot the balance at ``time`` and append it to the series."""
+        """Snapshot the balance at ``time`` and append it to the series.
+
+        Local sinks (M3 infiltration + open-boundary outflow) are read as an
+        **absolute** cumulative volume from ``state.loss_cum`` (float64-summed) and
+        added to the incremental ``_outflow`` accumulator -- so the residual tests
+        both sides of the ledger.
+        """
         v = self._volume(state, self.cell_area)
         inflow = self._inflow.total
-        outflow = self._outflow.total
+        outflow = self._outflow.total + state.loss_volume(self.cell_area)
         residual = inflow - outflow - (v - self.v0)
         denom = max(abs(inflow), abs(v), 1e-12)
         rel = abs(residual) / denom

@@ -142,6 +142,47 @@ def update_h(
 
 
 @wp.kernel
+def apply_rain_field(
+    h: wp.array2d(dtype=wp.float32),
+    rain: wp.array2d(dtype=wp.float32),
+    dt: wp.float32,
+    scale: wp.float32,
+):
+    """Add a spatial rainfall source ``rain[i,j]*scale*dt`` (M3 field rainfall).
+
+    ``scale`` is the temporal on/off multiplier (1 while raining, 0 otherwise);
+    the spatial pattern is static so mass inflow stays analytic (§8).
+    """
+    i, j = wp.tid()
+    h[i, j] = h[i, j] + rain[i, j] * scale * dt
+
+
+@wp.kernel
+def apply_infiltration(
+    h: wp.array2d(dtype=wp.float32),
+    infil: wp.array2d(dtype=wp.float32),
+    loss_cum: wp.array2d(dtype=wp.float32),
+    dt: wp.float32,
+):
+    """Remove a capped infiltration loss and bank it in ``loss_cum`` (M3 sink).
+
+    Constant-rate (Horton-final) infiltration: a cell loses ``infil*dt`` but never
+    more than it holds, so depth stays non-negative. The removed depth is banked
+    per-cell (one writer -> deterministic, §8/§12) so the float64 sum at output
+    cadence gives the exact outflow the mass ledger needs.
+    """
+    i, j = wp.tid()
+    avail = h[i, j]
+    inf = infil[i, j] * dt
+    if inf > avail:
+        inf = avail
+    if inf < 0.0:
+        inf = 0.0
+    h[i, j] = avail - inf
+    loss_cum[i, j] = loss_cum[i, j] + inf
+
+
+@wp.kernel
 def compute_outflow_beta(
     h: wp.array2d(dtype=wp.float32),
     qx: wp.array2d(dtype=wp.float32),
@@ -239,13 +280,26 @@ def compute_dt(state: State, alpha: float = 0.7, dt_max: float = 30.0) -> float:
     return min(dt, dt_max)
 
 
-def step(state: State, dt: float, rain: float = 0.0, limit: bool = True) -> None:
+def step(
+    state: State,
+    dt: float,
+    rain: float = 0.0,
+    limit: bool = True,
+    rain_scale: float = 1.0,
+) -> None:
     """Advance the state by one local-inertial step of size ``dt`` (seconds).
 
     Order: refresh ``eta`` -> update x/y face discharges (friction folded in, from
     the per-cell roughness field ``state.n``) -> re-assert closed boundaries ->
-    (optional) mass-conservative outflow limiter -> continuity + rainfall. Rain is
-    a velocity (m/s): ``rate_mm_hr / 1000 / 3600``.
+    (optional) mass-conservative outflow limiter -> continuity + uniform rainfall
+    -> spatial rain field (if any) -> infiltration sink (if any). Rain is a
+    velocity (m/s): ``rate_mm_hr / 1000 / 3600``.
+
+    ``rain`` is a *uniform* scalar source (M1/M2 path); ``state.rain`` carries the
+    optional M3 spatial rain field, temporally gated by ``rain_scale`` (1 while
+    raining, 0 otherwise). ``state.infil`` is the optional M3 infiltration sink.
+    Both are skipped (no launch, bitwise no-op) when unset -- so uniform-parameter
+    runs such as dam-break are unchanged.
 
     ``limit`` enables the per-cell donor limiter that keeps depths non-negative
     when the scheme is pushed out of regime (steep thin-sheet flow). It is
@@ -294,3 +348,18 @@ def step(state: State, dt: float, rain: float = 0.0, limit: bool = True) -> None
         inputs=[state.h, state.qx, state.qy, dxf, dtf, float(rain)],
         device=state.device,
     )
+
+    if state.rain is not None:
+        wp.launch(
+            apply_rain_field,
+            dim=g.shape,
+            inputs=[state.h, state.rain, dtf, float(rain_scale)],
+            device=state.device,
+        )
+    if state.infil is not None:
+        wp.launch(
+            apply_infiltration,
+            dim=g.shape,
+            inputs=[state.h, state.infil, state.loss_cum, dtf],
+            device=state.device,
+        )
