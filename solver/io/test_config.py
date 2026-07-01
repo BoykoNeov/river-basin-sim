@@ -1,4 +1,4 @@
-"""Config loader + scope-gate tests (M2, HANDOFF §7.1)."""
+"""Config loader + scope-gate tests (M2 + M3, HANDOFF §7.1)."""
 
 from __future__ import annotations
 
@@ -40,8 +40,8 @@ default = "closed"
 """
 
 
-def _write(tmp_path: Path, text: str) -> Path:
-    p = tmp_path / "s.toml"
+def _write(tmp_path: Path, text: str, name: str = "s.toml") -> Path:
+    p = tmp_path / name
     p.write_text(text, encoding="utf-8")
     return p
 
@@ -60,6 +60,13 @@ def test_full_config_maps_every_field(tmp_path):
     assert scn.rain_mm_hr == 40.0
     assert scn.rain_duration == 600.0
     assert scn.manning_n == 0.03
+    # M3 defaults when omitted:
+    assert scn.manning_field is None
+    assert scn.infiltration_mm_hr == 0.0 and scn.infiltration_field is None
+    assert scn.rain_type == "uniform" and scn.rain_field is None
+    assert scn.inflows == []
+    assert scn.boundaries == {e: "closed" for e in ("north", "south", "east", "west")}
+    assert scn.has_open_boundary is False
 
 
 def test_dx_crs_default_to_manifest_when_omitted(tmp_path):
@@ -83,34 +90,83 @@ def test_shipped_demo_scenario_loads(tmp_path):
     )
 
 
+# --- M3: features that are now SUPPORTED -----------------------------------
+
+
+def test_manning_field_path_resolved_relative_to_config(tmp_path):
+    text = _FULL.replace("manning_n = 0.03", 'manning_n = "fields/n.r32"')
+    scn = load_config(_write(tmp_path, text))
+    assert scn.manning_field == str(tmp_path / "fields" / "n.r32")
+    assert scn.manning_n == Scenario().manning_n  # scalar untouched (field wins)
+
+
+def test_infiltration_scalar_and_field(tmp_path):
+    scn = load_config(_write(tmp_path, _FULL.replace("manning_n = 0.03", "infiltration = 5.0")))
+    assert scn.infiltration_mm_hr == 5.0 and scn.infiltration_field is None
+    scn2 = load_config(
+        _write(tmp_path, _FULL.replace("manning_n = 0.03", 'infiltration = "f/infil.r32"'))
+    )
+    assert scn2.infiltration_field == str(tmp_path / "f" / "infil.r32")
+
+
+def test_rain_field(tmp_path):
+    text = _FULL.replace(
+        'type = "uniform"\nrate_mm_hr = 40.0', 'type = "field"\nfield = "fields/rain.r32"'
+    )
+    scn = load_config(_write(tmp_path, text))
+    assert scn.rain_type == "field"
+    assert scn.rain_field == str(tmp_path / "fields" / "rain.r32")
+
+
+def test_rain_field_requires_path(tmp_path):
+    text = _FULL.replace('type = "uniform"\nrate_mm_hr = 40.0', 'type = "field"')
+    with pytest.raises(ConfigError, match="requires a 'field' path"):
+        load_config(_write(tmp_path, text))
+
+
+def test_inflow_hydrograph_parsed(tmp_path):
+    text = _FULL + '\n[[inflow]]\ncell = [10, 20]\nhydrograph = [[0.0, 0.0], [600.0, 5.0]]\n'
+    scn = load_config(_write(tmp_path, text))
+    assert len(scn.inflows) == 1
+    inf = scn.inflows[0]
+    assert inf.cell == (10, 20)
+    assert inf.discharge_at(300.0) == pytest.approx(2.5)  # linear interp
+    assert inf.discharge_at(-1.0) == 0.0 and inf.discharge_at(1e9) == 0.0
+    assert inf.breakpoints == [0.0, 600.0]
+
+
+def test_inflow_bad_shape_rejected(tmp_path):
+    text = _FULL + '\n[[inflow]]\ncell = [10]\nhydrograph = [[0.0, 0.0]]\n'
+    with pytest.raises(ConfigError, match="cell"):
+        load_config(_write(tmp_path, text))
+
+
+def test_open_boundaries_default_and_per_edge(tmp_path):
+    scn = load_config(_write(tmp_path, _FULL.replace('default = "closed"', 'default = "open"')))
+    assert all(v == "open" for v in scn.boundaries.values())
+    assert scn.has_open_boundary
+
+    text = _FULL.replace('default = "closed"', 'default = "closed"\neast = "open"')
+    scn2 = load_config(_write(tmp_path, text))
+    assert scn2.boundaries["east"] == "open"
+    assert scn2.boundaries["west"] == "closed"
+    assert scn2.has_open_boundary
+
+
+# --- scope gate: features still DEFERRED ------------------------------------
+
+
 @pytest.mark.parametrize(
-    ("mutation", "needle"),
+    ("mutation", "repl", "needle"),
     [
-        ('scheme = "local_inertial"', "M4"),  # hllc_fv rejected -> names M4
-        ('type = "uniform"', "M3"),  # non-uniform rainfall -> M3
-        ('default = "closed"', "M3"),  # open BC -> M3
+        ('scheme = "local_inertial"', 'scheme = "hllc_fv"', "M4"),  # HLLC
+        ('type = "uniform"', 'type = "storm_cells"', "later"),  # temporal rain
+        ('default = "closed"', 'default = "fixed_stage"', "M4"),  # fixed-stage BC
     ],
 )
-def test_scope_gate_names_the_milestone(tmp_path, mutation, needle):
-    repl = {
-        'scheme = "local_inertial"': 'scheme = "hllc_fv"',
-        'type = "uniform"': 'type = "storm_cells"',
-        'default = "closed"': 'default = "open"',
-    }[mutation]
+def test_scope_gate_names_the_milestone(tmp_path, mutation, repl, needle):
     text = _FULL.replace(mutation, repl)
     with pytest.raises(ConfigError, match=needle):
-        load_config(_write(tmp_path, text))
-
-
-def test_manning_field_rejected(tmp_path):
-    text = _FULL.replace("manning_n = 0.03", 'manning_n = "data/fields/n.tif"')
-    with pytest.raises(ConfigError, match="manning_n must be a scalar"):
-        load_config(_write(tmp_path, text))
-
-
-def test_infiltration_rejected(tmp_path):
-    text = _FULL.replace("manning_n = 0.03", 'manning_n = 0.03\ninfiltration = "x.tif"')
-    with pytest.raises(ConfigError, match="infiltration"):
         load_config(_write(tmp_path, text))
 
 
@@ -120,9 +176,9 @@ def test_structures_rejected(tmp_path):
         load_config(_write(tmp_path, text))
 
 
-def test_per_edge_boundary_override_rejected(tmp_path):
-    text = _FULL + '\nnorth = "open"\n'  # extra key under [boundaries]
-    with pytest.raises(ConfigError, match="per-edge"):
+def test_manning_bool_rejected(tmp_path):
+    text = _FULL.replace("manning_n = 0.03", "manning_n = true")
+    with pytest.raises(ConfigError, match="manning_n"):
         load_config(_write(tmp_path, text))
 
 
