@@ -1,0 +1,34 @@
+# M3 scenario (HANDOFF §7.1) -- spatially-varying parameter fields on the demo tile.
+#
+# Uses the .r32 fields produced by scripts/make_demo_fields.py: Manning roughness
+# and infiltration that vary with elevation (rougher/less-infiltrating uplands,
+# smoother/more-infiltrating valleys). Uniform rain, closed boundaries.
+#
+# First:  uv run python scripts/make_demo_fields.py
+# Then:   uv run python -m solver.run --config scenarios/spatial_fields.toml
+
+[meta]
+name = "spatial_fields"
+seed = 12345
+scheme = "local_inertial"
+
+[grid]
+tiles_dir = "data/tiles/demo"
+
+[run]
+end_time = 3600.0
+output_every = 300.0
+cfl = 0.7
+dt_max = 30.0
+
+[rainfall]
+type = "uniform"
+rate_mm_hr = 40.0
+duration_s = 1800.0
+
+[parameters]
+manning_n = "../data/fields/manning.r32"     # relative to this TOML's directory
+infiltration = "../data/fields/infil.r32"    # mm/hr field
+
+[boundaries]
+default = "closed"

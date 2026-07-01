@@ -15,9 +15,26 @@ A faithful research/education sandbox validated against benchmarks — **not a
 regulatory-certification tool**. State that honestly anywhere it matters.
 
 ## Status
-- **M2 — The loop closes: acceptance met; confirm before M3.** The §7 contracts
+- **M3 — Real scenarios: acceptance met; confirm before M4.** The scenario system
+  now carries real physics beyond "uniform rain on a closed box", all
+  mass-accounted and reproducible: **spatially-varying parameter fields** (Manning
+  + infiltration as scalar *or* `.r32` field via `solver/io/fields.py`; Manning is
+  a per-cell `State.n` face-averaged in the LI kernels — uniform `n` is bitwise
+  identical, so dam-break/M2 are unchanged), a **constant-rate infiltration sink**
+  (capped, banks exact `f64` loss into `State.loss_cum`), **spatial rainfall
+  fields**, **inflow hydrographs** (`solver/processes/inflow.py` — piecewise-linear
+  `Q(t)` cell sources, event-clamped), and **open / free-outflow boundaries**
+  (`solver/core/boundaries.py` — a *post-interior self-capping sink*, not a live
+  boundary face, because the M1 limiter never scales edge faces; `loss_cum` is
+  **float64** since open outflow concentrates at one edge cell). **Command-log /
+  provenance** (`solver/io/provenance.py`) records source+field sha256 + resolved
+  scenario into `.zattrs` + a `<store>.provenance.json` sidecar. **Validated:** a
+  mild steady channel reaches **Manning normal depth within 1%**; a steep basin
+  drains with `h.min() >= 0`. Two GPU demos green (`river_reach` mass 1.24e-7,
+  `spatial_fields` 7.57e-8). 65 tests green. See `docs/plans/M3-real-scenarios.md`.
+- **M2 — The loop closes: done.** The §7 contracts
   are live end to end: **§7.1 config-in** (`solver/io/config.py` — TOML → `Scenario`,
-  parses the full schema but *rejects* M3/M4 features with a milestone-naming
+  parses the full schema but *rejects* M4/M5 features with a milestone-naming
   `ConfigError`, the scope gate), **§7.4 status.json** (`solver/io/status.py` —
   atomic `starting→running→writing→done|error`; wall-clock `eta_s` never touches
   the sim), **§7.3 per-frame viewer stream** (`solver/io/viewer_export.py` — a
@@ -59,12 +76,16 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   it works in CI without a GPU). Run after `uv sync --extra geo` to exercise the pipeline.
 - Pipeline (M0): `uv run python -m pipeline.condition --src <dem> --out <dir>` then
   `uv run python -m pipeline.tile --src <dir> --out data/tiles/demo --single`.
-- Solver (M2): `uv run python -m solver.run --config scenarios/demo_basin_rain.toml`
-  runs a §7.1 scenario → `results.zarr` + `status.json` + `frames/` (viewer stream).
-  Bare `uv run python -m solver.run` still runs the in-code demo; `--tiles`, `--out`,
-  `--status`, `--frames-dir`, `--no-frames`, `--end-time`, `--output-every`,
-  `--rain-mm-hr`, `--device` override. Re-export viewer tiles from an existing store:
-  `uv run python -m solver.io.viewer_export <zarr> <out_dir>`.
+- Solver: `uv run python -m solver.run --config scenarios/demo_basin_rain.toml`
+  runs a §7.1 scenario → `results.zarr` + `status.json` + `frames/` (viewer stream)
+  + `<store>.provenance.json`. Bare `uv run python -m solver.run` still runs the
+  in-code demo; `--tiles`, `--out`, `--status`, `--frames-dir`, `--no-frames`,
+  `--end-time`, `--output-every`, `--rain-mm-hr`, `--device` override. Re-export
+  viewer tiles from an existing store: `uv run python -m solver.io.viewer_export <zarr> <out_dir>`.
+- M3 scenarios: `scenarios/river_reach.toml` (inflow hydrograph + infiltration +
+  open boundary, self-contained) and `scenarios/spatial_fields.toml` (Manning +
+  infiltration `.r32` fields — generate them first with
+  `uv run python scripts/make_demo_fields.py`).
 - Viewer (M2): open `viewer/` in Godot 4.7 (main scene `results_view.tscn`) — it
   loads `data/results/frames/` and can launch the solver via the **Run solver**
   button. Headless checks: `godot --headless --path viewer -- --rbverify` (read

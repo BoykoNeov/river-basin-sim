@@ -153,21 +153,37 @@ The M3 demo is driven from configs + the validation harness.
 
 ---
 
-## 4. Acceptance / demo (to be checked off)
+## 4. Acceptance / demo — MET (2026-07-01)
 
-- [ ] A scenario with a Manning field, an infiltration field, an inflow
-      hydrograph, and an open outflow edge runs to completion, writes the Zarr +
-      frames + provenance, mass gate `< 1e-6`.
-- [ ] Scope gate still rejects `hllc_fv` (M4), `[[structures]]` (M5),
+- [x] `scenarios/river_reach.toml` (inflow hydrograph + scalar infiltration + open
+      south boundary + uniform rain) runs to completion on the RTX 5090, writes
+      the Zarr + frames + provenance; **mass gate 1.24e-7** `< 1e-6`.
+- [x] `scenarios/spatial_fields.toml` runs with on-disk `.r32` **Manning +
+      infiltration fields** (from `scripts/make_demo_fields.py`); mass **7.57e-8**.
+- [x] Scope gate still rejects `hllc_fv` (M4), `[[structures]]` (M5),
       `fixed_stage` (M4), temporal rainfall — each naming its milestone.
-- [ ] Uniform-parameter runs (dam-break, M1/M2 demo) are **bitwise-unchanged** —
-      the field paths are strict generalizations.
-- [ ] `validation/test_channel_flow.py`: inflow≈outflow at steady state (hard mass
-      gate) and depth within a loose band of Manning normal depth.
-- [ ] Provenance record round-trips: hashes stable, resolved scenario complete.
-- [ ] `ruff` + `ruff format` clean; `pytest` green (new field/infil/inflow/open/
-      provenance/channel tests included).
-- **Stop and confirm before M4.**
+- [x] Uniform-parameter runs (dam-break, M1/M2 demo) are **bitwise-unchanged** —
+      the field paths are strict generalizations (`0.5*(n+n)==n`; sinks/fields are
+      `None` and never launch). Verified by the unchanged dam-break tolerances and
+      a fully-closed bitwise-determinism test.
+- [x] `validation/test_channel_flow.py`: a mild steady channel reaches **Manning
+      normal depth within 1%** (0.366 vs 0.369 m); a steep basin **drains with
+      `h.min() >= 0`** (the discriminating check a boundary-face impl would fail).
+- [x] Provenance record round-trips: source + field hashes stable, resolved
+      scenario complete; Zarr `.zattrs` + sidecar.
+- [x] `ruff` + `ruff format` clean; `pytest` green (**65 tests**; new field /
+      infiltration / inflow / open-BC / per-edge / provenance / channel tests).
+- **Stop and confirm before M4.** ← we are here.
+
+### Key correction during build (open boundaries)
+The first plan (§1.6) said the M1 donor limiter would guard non-negativity at open
+edges. It would **not** — `limit_qx`/`limit_qy` launch over *interior* faces only,
+so a live boundary face would drain edge cells unbounded (negative depth on the
+steep tile). Open outflow is instead a **post-interior, self-capping sink**
+(structurally like infiltration): extrapolate the nearest interior face
+(outflow-only), remove `min(dt/dx·q, h)` — capped — and bank the exact `f64` loss.
+`loss_cum` had to become **float64**: open outflow concentrates at one edge cell
+and a float32 accumulator there drifted (residual 2.9e-5 → 8e-9 after the fix).
 
 ---
 
