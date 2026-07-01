@@ -68,4 +68,5 @@ roadmap (M0–M7) and current milestone plan.
 
 ## License
 
-[MIT](./LICENSE) — free to use, fork, and modify with attribution.
+[Boyko Non-Commercial License v1.0 (BNCL-1.0)](./LICENSE) — free for
+non-commercial use, forking, and modification with attribution.

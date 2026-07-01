@@ -55,6 +55,7 @@ one terrain tile as a static 3D heightmap in Godot. **No dynamics yet.**
 - **Stop and confirm before M1** (local-inertial solver). ← we are here.
 
 ## Open questions for the developer
-- ~~License~~ → **MIT** (chosen 2026-06-20). Copyright "Boyko Neov".
+- ~~License~~ → **BNCL-1.0** (Boyko Non-Commercial License v1.0; replaced the
+  initial MIT choice). Copyright "Boyko Neov".
 - ~~Sample DEM~~ → SRTM `N35W083` (Great Smoky Mtns), chosen 2026-06-22.
 - ~~Terrain rendering~~ → **Terrain3D** (chosen 2026-06-22); verified on Godot 4.7.

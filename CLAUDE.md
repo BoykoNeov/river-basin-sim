@@ -15,12 +15,22 @@ A faithful research/education sandbox validated against benchmarks — **not a
 regulatory-certification tool**. State that honestly anywhere it matters.
 
 ## Status
-- **M0 — Foundation: acceptance met; confirm before M1.** Pipeline + viewer +
-  handoff proven end to end: SRTM `N35W083` → conditioned (UTM 17N, sink-fill, D8
-  flow dir/accum) → `.r32` tile → loads as static 3D terrain in Godot via Terrain3D
-  (verified on Godot 4.7). `ruff`/`pytest`/smoke all green. Tooling locked:
-  **pysheds** (with a NumPy-2.x `np.in1d` shim in `pipeline/_compat.py`) and
-  **Terrain3D**. See `docs/plans/M0-foundation.md`.
+- **M1 — Water moves: acceptance met; confirm before M2.** Local-inertial (Bates
+  2010) shallow-water solver in Warp on the staggered raster: uniform rainfall,
+  closed BCs, deterministic state-derived Δt, canonical Zarr out (§7.2), live
+  float64/Kahan mass balance. **Dam-break validated** (wet-bed Stoker enforced:
+  mass 2.5e-9, nRMSE 0.074; dry-bed Ritter diagnostic). The real M0 Smoky Mtns
+  tile is steep — LI's worst case — so M1 also has a **mass-conservative per-cell
+  flux limiter** (donor-cell β scaling) that keeps depths non-negative out of
+  regime; the demo runs stably (mass 2.1e-8, mean depth = rain input). Note: on
+  the steep tile mass + spatial pattern are sound, but steep-cell velocities are
+  limiter-shaped, **not** validated LI hydraulics — don't carry that as a fidelity
+  claim into M2. Runs are bitwise-deterministic (verified). 18 tests green on Warp
+  CPU backend. See `docs/plans/M1-water-moves.md`.
+- **M0 — Foundation: done.** SRTM `N35W083` → conditioned (UTM 17N, sink-fill, D8
+  flow dir/accum) → `.r32` tile → static 3D terrain in Godot via Terrain3D
+  (Godot 4.7). Tooling locked: **pysheds** (NumPy-2.x `np.in1d` shim in
+  `pipeline/_compat.py`) and **Terrain3D**. See `docs/plans/M0-foundation.md`.
 - Milestones M0–M7: `docs/plans/roadmap.md`.
 
 ## Commands
@@ -34,7 +44,10 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   it works in CI without a GPU). Run after `uv sync --extra geo` to exercise the pipeline.
 - Pipeline (M0): `uv run python -m pipeline.condition --src <dem> --out <dir>` then
   `uv run python -m pipeline.tile --src <dir> --out data/tiles/demo --single`.
-- Solver entry point (later milestones): `uv run python -m solver.run --config <toml>`.
+- Solver (M1): `uv run python -m solver.run` runs the demo (uniform rain on the M0
+  tile → `data/results/demo.zarr`); `--tiles`, `--out`, `--end-time`,
+  `--output-every`, `--rain-mm-hr`, `--device` override the in-code scenario. The
+  §7.1 `--config <toml>` interface arrives with M2.
 
 ## Conventions
 - **Package manager: `uv`** (not pip/venv). Python pinned to **3.13** via
