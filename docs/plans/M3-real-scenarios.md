@@ -171,8 +171,9 @@ The M3 demo is driven from configs + the validation harness.
       `h.min() >= 0`** (the discriminating check a boundary-face impl would fail).
 - [x] Provenance record round-trips: source + field hashes stable, resolved
       scenario complete; Zarr `.zattrs` + sidecar.
-- [x] `ruff` + `ruff format` clean; `pytest` green (**65 tests**; new field /
-      infiltration / inflow / open-BC / per-edge / provenance / channel tests).
+- [x] `ruff` + `ruff format` clean; `pytest` green (**69 tests**; new field /
+      infiltration / inflow / open-BC / per-edge / provenance / channel tests, plus
+      inflow-race guard, M3-path determinism, and rate/conversion checks).
 - **Stop and confirm before M4.** ← we are here.
 
 ### Key correction during build (open boundaries)
