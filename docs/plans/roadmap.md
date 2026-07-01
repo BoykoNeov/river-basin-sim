@@ -7,8 +7,8 @@ diagnostic and the validation harness gate every step.
 | # | Milestone | Demo / gate | Status |
 |---|---|---|---|
 | **M0** | **Foundation** | Pipeline + viewer + handoff proven: sample DEM conditioned + tiled, static terrain loads in Godot. *No dynamics.* | **done** |
-| **M1** | **Water moves** | Local-inertial solver (Warp), uniform rainfall, closed BCs, Zarr out, live mass balance. **Validate: dam-break.** | **acceptance met; confirm before M2** |
-| M2 | The loop closes | §7 contracts: config-in/results-out, subprocess + status.json, per-frame tiles; Godot timeline + depth colormap + water surface. | not started |
+| **M1** | **Water moves** | Local-inertial solver (Warp), uniform rainfall, closed BCs, Zarr out, live mass balance. **Validate: dam-break.** | **done** |
+| **M2** | **The loop closes** | §7 contracts: config-in/results-out, subprocess + status.json, per-frame tiles; Godot timeline + depth colormap + water surface. | **acceptance met; confirm before M3** |
 | M3 | Real scenarios | Scenario system + command log + spatially-varying parameter fields; inflow hydrographs + open boundaries. | not started |
 | M4 | Fidelity step | Well-balanced HLLC FV behind the same kernel interface. **Validate: lake-at-rest + UK EA 2D suite.** | not started |
 | M5 | Multi-physics | Multi-rate scheduler, exercised by reservoir operations. | not started |

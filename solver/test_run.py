@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
+import pytest
 import warp as wp
 import xarray as xr
 
 from solver.core.massbalance import MASS_GATE
-from solver.run import Scenario, run_simulation
+from solver.io.config import ConfigError
+from solver.run import Scenario, main, run_simulation
 
 wp.init()
 
@@ -78,3 +82,27 @@ def test_run_is_bitwise_deterministic(tmp_path):
     assert np.array_equal(da["u"].values, db["u"].values)
     assert np.array_equal(da["v"].values, db["v"].values)
     assert a.max_rel_error == b.max_rel_error
+
+
+def test_main_writes_error_status_on_bad_config(tmp_path):
+    """A scope-gate ConfigError must be reported via status.json, not a silent exit
+    (else the viewer polls forever). The error is written *and* re-raised."""
+    cfg = tmp_path / "bad.toml"
+    cfg.write_text('[meta]\nscheme = "hllc_fv"\n', encoding="utf-8")  # M4, rejected in M2
+    status_path = tmp_path / "status.json"
+
+    with pytest.raises(ConfigError):
+        main(
+            [
+                "--config",
+                str(cfg),
+                "--out",
+                str(tmp_path / "out.zarr"),
+                "--status",
+                str(status_path),
+            ]
+        )
+
+    rec = json.loads(status_path.read_text(encoding="utf-8"))
+    assert rec["state"] == "error"
+    assert "hllc_fv" in rec["message"]

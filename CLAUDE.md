@@ -15,7 +15,22 @@ A faithful research/education sandbox validated against benchmarks — **not a
 regulatory-certification tool**. State that honestly anywhere it matters.
 
 ## Status
-- **M1 — Water moves: acceptance met; confirm before M2.** Local-inertial (Bates
+- **M2 — The loop closes: acceptance met; confirm before M3.** The §7 contracts
+  are live end to end: **§7.1 config-in** (`solver/io/config.py` — TOML → `Scenario`,
+  parses the full schema but *rejects* M3/M4 features with a milestone-naming
+  `ConfigError`, the scope gate), **§7.4 status.json** (`solver/io/status.py` —
+  atomic `starting→running→writing→done|error`; wall-clock `eta_s` never touches
+  the sim), **§7.3 per-frame viewer stream** (`solver/io/viewer_export.py` — a
+  post-process over the Zarr: raw LE-f32 depth tiles + `manifest.json` with a
+  *global* robust colormap range, p99 clamp so the thin sheet stays visible). The
+  **Godot viewer** (`viewer/scenes/results_view.tscn`) launches the solver as a
+  non-blocking subprocess (Windows batch + `uv run`), polls status at 4 Hz,
+  auto-loads results, and renders a **lifted depth-coloured water surface**
+  (`water_surface.gdshader`: η = bed + depth reconstructed in-shader, dry-cell
+  discard) with a timeline scrubber. Full loop verified from Godot (`--rblaunch`)
+  on the RTX 5090; mass gate 2.12e-8; error path writes `state="error"` (viewer
+  never hangs); 38 tests green. See `docs/plans/M2-loop-closes.md`.
+- **M1 — Water moves: done.** Local-inertial (Bates
   2010) shallow-water solver in Warp on the staggered raster: uniform rainfall,
   closed BCs, deterministic state-derived Δt, canonical Zarr out (§7.2), live
   float64/Kahan mass balance. **Dam-break validated** (wet-bed Stoker enforced:
@@ -25,8 +40,8 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   regime; the demo runs stably (mass 2.1e-8, mean depth = rain input). Note: on
   the steep tile mass + spatial pattern are sound, but steep-cell velocities are
   limiter-shaped, **not** validated LI hydraulics — don't carry that as a fidelity
-  claim into M2. Runs are bitwise-deterministic (verified). 18 tests green on Warp
-  CPU backend. See `docs/plans/M1-water-moves.md`.
+  claim into M2. Runs are bitwise-deterministic (verified). See
+  `docs/plans/M1-water-moves.md`.
 - **M0 — Foundation: done.** SRTM `N35W083` → conditioned (UTM 17N, sink-fill, D8
   flow dir/accum) → `.r32` tile → static 3D terrain in Godot via Terrain3D
   (Godot 4.7). Tooling locked: **pysheds** (NumPy-2.x `np.in1d` shim in
@@ -44,10 +59,17 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   it works in CI without a GPU). Run after `uv sync --extra geo` to exercise the pipeline.
 - Pipeline (M0): `uv run python -m pipeline.condition --src <dem> --out <dir>` then
   `uv run python -m pipeline.tile --src <dir> --out data/tiles/demo --single`.
-- Solver (M1): `uv run python -m solver.run` runs the demo (uniform rain on the M0
-  tile → `data/results/demo.zarr`); `--tiles`, `--out`, `--end-time`,
-  `--output-every`, `--rain-mm-hr`, `--device` override the in-code scenario. The
-  §7.1 `--config <toml>` interface arrives with M2.
+- Solver (M2): `uv run python -m solver.run --config scenarios/demo_basin_rain.toml`
+  runs a §7.1 scenario → `results.zarr` + `status.json` + `frames/` (viewer stream).
+  Bare `uv run python -m solver.run` still runs the in-code demo; `--tiles`, `--out`,
+  `--status`, `--frames-dir`, `--no-frames`, `--end-time`, `--output-every`,
+  `--rain-mm-hr`, `--device` override. Re-export viewer tiles from an existing store:
+  `uv run python -m solver.io.viewer_export <zarr> <out_dir>`.
+- Viewer (M2): open `viewer/` in Godot 4.7 (main scene `results_view.tscn`) — it
+  loads `data/results/frames/` and can launch the solver via the **Run solver**
+  button. Headless checks: `godot --headless --path viewer -- --rbverify` (read
+  path), `godot --path viewer -- --rbshot[=name.png]` (screenshot),
+  `godot --path viewer -- --rblaunch` (full-loop subprocess smoke).
 
 ## Conventions
 - **Package manager: `uv`** (not pip/venv). Python pinned to **3.13** via

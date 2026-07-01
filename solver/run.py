@@ -1,13 +1,14 @@
-"""Solver entry point (M1): in-code scenario -> run -> canonical Zarr results.
+"""Solver entry point (M2): config/in-code scenario -> run -> results + viewer stream.
 
-M1 is driven by a **minimal in-code** :class:`Scenario` rather than the §7.1 TOML
-config -- the config loader and the subprocess/status protocol land in M2 when the
-loop closes. The demo runs uniform rainfall over the real M0 terrain tile
-(``data/tiles/demo``) with closed boundaries and writes ``results.zarr`` (§7.2)
-plus a live float64/Kahan mass-balance series.
+With M2 the loop closes: the run is driven by a §7.1 TOML config (``--config``) or
+the in-code demo scenario, writes the canonical Zarr (§7.2), reports progress via
+``status.json`` (§7.4), and post-processes the Zarr into the lean per-frame viewer
+stream (§7.3) that Godot reads. The demo runs uniform rainfall over the real M0
+terrain tile (``data/tiles/demo``) with closed boundaries.
 
 CLI::
 
+    uv run python -m solver.run --config scenarios/demo_basin_rain.toml
     uv run python -m solver.run                    # demo: M0 tile + uniform rain
     uv run python -m solver.run --tiles data/tiles/demo --out data/results/demo.zarr
 """
@@ -16,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -26,31 +26,16 @@ from solver.core.grid import Grid
 from solver.core.local_inertial import compute_dt, step
 from solver.core.massbalance import MASS_GATE, MassLedger
 from solver.core.state import State
+from solver.io.config import Scenario, load_config
+from solver.io.status import StatusWriter
+from solver.io.viewer_export import export_frames
 from solver.io.zarr_writer import ZarrWriter
 
+# Scenario is defined in solver.io.config (the §7.1 contract); re-exported here so
+# existing callers (`from solver.run import Scenario`) keep working.
+__all__ = ["Scenario", "load_config", "run_simulation", "main"]
+
 EPS_T = 1e-6  # time-comparison tolerance (seconds)
-
-
-@dataclass
-class Scenario:
-    """Minimal M1 run configuration (the §7.1 TOML contract arrives in M2)."""
-
-    name: str = "demo_basin_rain"
-    dx: float = 30.0  # metres; overridden by the tile manifest when loading
-    end_time: float = 3600.0  # simulated seconds
-    output_every: float = 300.0
-    alpha: float = 0.7  # CFL-like coefficient for the adaptive timestep
-    dt_max: float = 30.0
-    manning_n: float = 0.035
-    rain_mm_hr: float = 50.0
-    rain_duration: float = 1800.0  # rain falls for the first half-hour
-    crs: str = ""
-    initial_depth: float = 0.0
-    meta: dict = field(default_factory=dict)
-
-    @property
-    def rain_m_s(self) -> float:
-        return self.rain_mm_hr / 1000.0 / 3600.0
 
 
 def load_r32_bed(tiles_dir: str | Path) -> tuple[np.ndarray, dict]:
@@ -89,6 +74,7 @@ def run_simulation(
     *,
     device: str = "cpu",
     verbose: bool = True,
+    status: StatusWriter | None = None,
 ) -> MassLedger:
     """Run the local-inertial solver and stream results to a Zarr store.
 
@@ -96,7 +82,13 @@ def run_simulation(
     so a step never crosses an output time or the rainfall on/off boundary -- so
     frames land exactly on ``output_every`` and each step is either fully raining
     or fully dry (exact source accounting).
+
+    If ``status`` is given, a ``running`` record is written at each output frame
+    (§7.4). ``status`` is a read-only progress observer -- it never touches Δt or
+    the Zarr, so determinism is unaffected.
     """
+    if scenario.dx is None:
+        raise ValueError("scenario.dx is unresolved; fill it from the tile manifest first")
     grid = Grid(ny=bed.shape[0], nx=bed.shape[1], dx=scenario.dx)
     st = State.from_bed(bed, dx=scenario.dx, depth=scenario.initial_depth, device=device)
     ledger = MassLedger.from_state(st)
@@ -143,10 +135,14 @@ def run_simulation(
             rec = ledger.record(st, t)
             u, v = st.velocities_numpy()
             writer.append(t, st.depth_numpy(), u, v)
+            h_max = float(st.h.numpy().max())
             if verbose:
-                print(
-                    f"  t={t:8.1f}s  h_max={float(st.h.numpy().max()):6.3f}m  "
-                    f"mass_rel_err={rec.rel_error:.2e}"
+                print(f"  t={t:8.1f}s  h_max={h_max:6.3f}m  mass_rel_err={rec.rel_error:.2e}")
+            if status is not None:
+                status.write(
+                    "running",
+                    sim_time=t,
+                    message=f"t={t:.0f}s  h_max={h_max:.3f}m  mass_rel_err={rec.rel_error:.1e}",
                 )
             next_output += scenario.output_every
 
@@ -161,32 +157,82 @@ def run_simulation(
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run the M1 local-inertial solver (demo).")
-    p.add_argument("--tiles", default="data/tiles/demo", help="M0 tiles dir (tiles.json)")
+    p = argparse.ArgumentParser(description="Run the local-inertial solver (M2: config + loop).")
+    p.add_argument("--config", default=None, help="§7.1 scenario TOML (overrides the demo flags)")
+    p.add_argument("--tiles", default=None, help="M0 tiles dir (tiles.json); default from config")
     p.add_argument("--out", default="data/results/demo.zarr", help="output Zarr store")
+    p.add_argument("--status", default=None, help="status.json path; default <out-dir>/status.json")
+    p.add_argument("--frames-dir", default=None, help="frames/ dir; default <out-dir>/frames")
+    p.add_argument("--no-frames", action="store_true", help="skip the §7.3 viewer export")
     p.add_argument("--device", default=None, help="warp device (cpu / cuda:0); auto if unset")
-    p.add_argument("--end-time", type=float, default=3600.0, help="simulated seconds")
-    p.add_argument("--output-every", type=float, default=300.0, help="write cadence (s)")
-    p.add_argument("--rain-mm-hr", type=float, default=50.0)
-    p.add_argument("--rain-duration", type=float, default=1800.0)
+    p.add_argument("--end-time", type=float, default=3600.0, help="sim seconds (no --config)")
+    p.add_argument("--output-every", type=float, default=300.0, help="write cadence (no --config)")
+    p.add_argument("--rain-mm-hr", type=float, default=50.0, help="(no --config)")
+    p.add_argument("--rain-duration", type=float, default=1800.0, help="(no --config)")
     return p.parse_args(argv)
+
+
+def _resolve_scenario(args: argparse.Namespace) -> tuple[Scenario, np.ndarray]:
+    """Build the run Scenario (from --config or the demo flags) and load its bed.
+
+    ``dx``/``crs`` unset by the config inherit from the tile manifest (§7.1).
+    """
+    if args.config:
+        scenario = load_config(args.config)
+        if args.tiles:
+            scenario.tiles_dir = args.tiles
+    else:
+        scenario = Scenario(
+            tiles_dir=args.tiles or Scenario().tiles_dir,
+            end_time=args.end_time,
+            output_every=args.output_every,
+            rain_mm_hr=args.rain_mm_hr,
+            rain_duration=args.rain_duration,
+        )
+    bed, manifest = load_r32_bed(scenario.tiles_dir)
+    if scenario.dx is None:
+        scenario.dx = float(manifest["dx_m"])
+    if not scenario.crs:
+        scenario.crs = manifest.get("crs", "")
+    return scenario, bed
 
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
-    device = pick_device(args.device)
-    bed, manifest = load_r32_bed(args.tiles)
-    scenario = Scenario(
-        dx=float(manifest["dx_m"]),
-        crs=manifest.get("crs", ""),
-        end_time=args.end_time,
-        output_every=args.output_every,
-        rain_mm_hr=args.rain_mm_hr,
-        rain_duration=args.rain_duration,
-    )
-    print(f"River Basin M1 solver | device={device} | grid={bed.shape} dx={scenario.dx:.2f}m")
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    run_simulation(scenario, bed, args.out, device=device)
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path = Path(args.status) if args.status else out_path.parent / "status.json"
+    frames_dir = Path(args.frames_dir) if args.frames_dir else out_path.parent / "frames"
+
+    # Create the status channel FIRST and keep everything that can fail -- config
+    # parsing (the §7.1 scope gate), tile loading, warp init -- inside the try, so
+    # any failure is reported as state="error" instead of a silent exit that leaves
+    # the viewer polling forever (§7.4). end_time is patched in once resolved.
+    status = StatusWriter(status_path, end_time=1.0)
+    status.write("starting", message="resolving scenario")
+    try:
+        device = pick_device(args.device)
+        scenario, bed = _resolve_scenario(args)
+        status.end_time = scenario.end_time
+        print(
+            f"River Basin M2 solver | device={device} | grid={bed.shape} "
+            f"dx={scenario.dx:.2f}m | scenario={scenario.name}"
+        )
+        status.write("starting", message=f"{scenario.name}: {bed.shape} @ dx={scenario.dx:.2f}m")
+
+        ledger = run_simulation(scenario, bed, out_path, device=device, status=status)
+        if not args.no_frames:
+            status.write("writing", sim_time=scenario.end_time, message="exporting viewer frames")
+            manifest = export_frames(out_path, frames_dir)
+            print(f"  viewer frames : {manifest}")
+        status.write(
+            "done",
+            sim_time=scenario.end_time,
+            message=f"mass_max_rel_err={ledger.max_rel_error:.2e}",
+        )
+    except Exception as e:  # noqa: BLE001 -- report to the viewer, then re-raise
+        status.write("error", message=f"{type(e).__name__}: {e}")
+        raise
 
 
 if __name__ == "__main__":

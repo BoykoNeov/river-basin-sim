@@ -1,0 +1,33 @@
+# Demo scenario (M2, HANDOFF §7.1) -- reproduces the M1 in-code demo as a config.
+#
+# Uniform rainfall on the real M0 terrain tile (Great Smoky Mtns, EPSG:32617),
+# closed boundaries, scalar Manning n. This is the config the Godot viewer
+# launches to close the configure -> run -> explore loop.
+#
+# Run: uv run python -m solver.run --config scenarios/demo_basin_rain.toml
+
+[meta]
+name = "demo_basin_rain"
+seed = 12345
+scheme = "local_inertial"        # "local_inertial" (M2) | "hllc_fv" (M4)
+
+[grid]
+tiles_dir = "data/tiles/demo"    # engine-ready terrain tiles (M0 pipeline output)
+# dx / crs inherit from the tile manifest (tiles.json) when omitted.
+
+[run]
+end_time = 3600.0                # simulated seconds
+output_every = 300.0             # write cadence, simulated seconds
+cfl = 0.7                        # local-inertial adaptive-dt coefficient (alpha)
+dt_max = 30.0
+
+[rainfall]
+type = "uniform"                 # "uniform" (M2) | field/timeseries/storm_cells (M3)
+rate_mm_hr = 50.0
+duration_s = 1800.0              # rain falls for the first half hour
+
+[parameters]
+manning_n = 0.035                # scalar (M2); parameter-field rasters arrive in M3
+
+[boundaries]
+default = "closed"               # closed (M2) | open/inflow/fixed_stage (M3)
