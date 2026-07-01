@@ -226,5 +226,3 @@ convention is correct → `flip_v = false` is confirmed.
   friction — resolve the interpreter explicitly, keep a `uv run` fallback.
 - **Determinism** unaffected: `status.json`/export are read-only observers of a
   run whose Δt still derives from state. `eta_s` wall-clock stays out of the sim.
-</content>
-</invoke>
