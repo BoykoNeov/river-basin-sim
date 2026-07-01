@@ -36,6 +36,19 @@ def test_out_of_bounds_cell_rejected():
         )
 
 
+def test_duplicate_cell_rejected():
+    """Two entries on the same cell would race (non-atomic h += ...) -> rejected."""
+    with pytest.raises(ValueError, match="duplicate"):
+        InflowInjector(
+            [
+                Inflow(cell=(2, 2), hydrograph=[(0.0, 1.0), (100.0, 1.0)]),
+                Inflow(cell=(2, 2), hydrograph=[(0.0, 2.0), (100.0, 2.0)]),
+            ],
+            Grid(ny=4, nx=4, dx=10.0),
+            DEV,
+        )
+
+
 def test_injected_volume_matches_hydrograph():
     """A constant 3 m^3/s inflow for 100 s adds ~300 m^3 to the target cell."""
     grid = Grid(ny=5, nx=5, dx=10.0)

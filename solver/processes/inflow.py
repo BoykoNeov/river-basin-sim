@@ -50,11 +50,20 @@ class InflowInjector:
         self.device = device
         self.cell_area = grid.cell_area
         ny, nx = grid.shape
-        rows, cols = [], []
+        rows, cols, seen = [], [], set()
         for inf in self.inflows:
             i, j = inf.cell
             if not (0 <= i < ny and 0 <= j < nx):
                 raise ValueError(f"inflow cell {inf.cell} is outside the {ny}x{nx} grid")
+            # One thread per entry does a non-atomic h[cell] += ...; two entries on
+            # the same cell would race (lost updates, nondeterministic -- breaks the
+            # §12 determinism invariant). Reject; merge the hydrographs upstream.
+            if inf.cell in seen:
+                raise ValueError(
+                    f"duplicate inflow cell {inf.cell}; merge their hydrographs into "
+                    "one [[inflow]] entry (concurrent same-cell sources would race)"
+                )
+            seen.add(inf.cell)
             rows.append(i)
             cols.append(j)
         self._rows = wp.array(np.asarray(rows, dtype=np.int32), dtype=wp.int32, device=device)

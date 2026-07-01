@@ -10,10 +10,15 @@ import warp as wp
 import xarray as xr
 
 from solver.core.massbalance import MASS_GATE
-from solver.io.config import ConfigError
+from solver.io.config import ConfigError, Inflow
 from solver.run import Scenario, main, run_simulation
 
 wp.init()
+
+
+def _bowl(ny: int, nx: int) -> np.ndarray:
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    return (((yy - ny / 2) ** 2 + (xx - nx / 2) ** 2) * 0.02).astype(np.float32)
 
 
 def test_run_writes_valid_zarr_and_conserves_mass(tmp_path):
@@ -82,6 +87,56 @@ def test_run_is_bitwise_deterministic(tmp_path):
     assert np.array_equal(da["u"].values, db["u"].values)
     assert np.array_equal(da["v"].values, db["v"].values)
     assert a.max_rel_error == b.max_rel_error
+
+
+def test_m3_paths_are_deterministic(tmp_path):
+    """Determinism (§12) must hold for the new state-mutating M3 kernels too:
+    an infiltration + inflow + open-boundary run repeated must be bitwise identical
+    (single-writer kernels, no float atomics -- but assert it, don't assume it)."""
+    bed = _bowl(20, 20)
+    scn = Scenario(
+        name="m3det",
+        dx=20.0,
+        end_time=400.0,
+        output_every=200.0,
+        dt_max=10.0,
+        rain_mm_hr=60.0,
+        rain_duration=200.0,
+        infiltration_mm_hr=5.0,
+        inflows=[Inflow(cell=(4, 4), hydrograph=[(0.0, 0.0), (400.0, 3.0)])],
+        boundaries={"north": "closed", "south": "open", "east": "closed", "west": "closed"},
+    )
+    run_simulation(scn, bed, tmp_path / "a.zarr", device="cpu", verbose=False)
+    run_simulation(scn, bed, tmp_path / "b.zarr", device="cpu", verbose=False)
+    da = xr.open_zarr(tmp_path / "a.zarr", consolidated=False)
+    db = xr.open_zarr(tmp_path / "b.zarr", consolidated=False)
+    assert np.array_equal(da["depth"].values, db["depth"].values)
+
+
+def test_infiltration_mm_hr_conversion(tmp_path):
+    """Guard the run.py mm/hr -> m/s conversion (untested by the m/s kernel tests):
+    a shallow, still, non-raining basin loses ~ rate_m_s * area * end_time. Catches
+    a gross conversion slip (a missing /1000 or /3600 is orders of magnitude); the
+    1% tolerance absorbs float32 field quantization (shallow h keeps it small)."""
+    ny = nx = 12
+    scn = Scenario(
+        name="infil_conv",
+        dx=10.0,
+        end_time=200.0,
+        output_every=200.0,
+        dt_max=10.0,
+        rain_mm_hr=0.0,
+        rain_duration=0.0,
+        infiltration_mm_hr=30.0,
+        initial_depth=0.5,  # shallow -> fine ULP; removes ~1.7e-3 m << 0.5 (uncapped)
+    )
+    ledger = run_simulation(
+        scn, np.zeros((ny, nx), np.float32), tmp_path / "c.zarr", device="cpu", verbose=False
+    )
+    rate_m_s = 30.0 / 1000.0 / 3600.0
+    expected = rate_m_s * scn.end_time * (scn.dx**2) * ny * nx
+    assert ledger.series[-1].outflow_cum == pytest.approx(expected, rel=1e-2)
+    assert ledger.max_rel_error < MASS_GATE
 
 
 def test_main_writes_error_status_on_bad_config(tmp_path):

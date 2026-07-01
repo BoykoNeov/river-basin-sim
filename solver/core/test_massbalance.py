@@ -73,6 +73,28 @@ def test_infiltration_is_capped_and_banked():
     assert ledger.series[-1].outflow_cum == pytest.approx(removed, rel=1e-6)
 
 
+def test_infiltration_uncapped_rate_is_exact():
+    """Uncapped infiltration removes exactly rate*time*area (independent of the gate).
+
+    The mass gate is ~0 for any sink by construction (loss_cum mirrors h), so it
+    can't check the *rate*. Here the cells never run dry -> the removed volume is
+    the pure infiltration rate, catching a mis-scaled kernel.
+
+    Note: use *shallow* water. Banking is exact (loss_cum == the depth h lost), but
+    h loses ``rate*dt`` only to float32 precision -- and that is worst when
+    ``h >> rate*dt`` (large h -> coarse ULP swallows the tiny decrement). Shallow h
+    keeps the ULP fine so the rate reads true."""
+    rate = 5.0e-5  # m/s
+    st = State.from_bed(np.zeros((5, 5), dtype=np.float32), dx=10.0, depth=0.3, device=DEV)
+    st.set_infiltration(np.full((5, 5), rate, dtype=np.float32))
+    dt, nsteps = 2.0, 20  # removes 2e-3 m << 0.3 m -> uncapped
+    for _ in range(nsteps):
+        step(st, dt=dt)
+    removed = st.loss_volume(st.grid.cell_area)
+    expected = rate * dt * nsteps * st.grid.cell_area * st.grid.n_cells
+    assert removed == pytest.approx(expected, rel=1e-3)
+
+
 def test_rain_and_infiltration_balance_to_gate():
     """Uniform rain into a closed basin with a partial infiltration sink: the
     residual (inflow - infiltration_outflow - dV) stays under the <1e-6 gate.
