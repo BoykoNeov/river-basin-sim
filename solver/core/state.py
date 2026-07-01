@@ -8,6 +8,9 @@ mass-balance accumulator, which lives host-side in :mod:`solver.core.massbalance
 State carried between steps:
   * ``h``   -- water depth at cell centres, ``(ny, nx)``
   * ``z``   -- static bed elevation at cell centres, ``(ny, nx)``
+  * ``n``   -- static Manning roughness at cell centres, ``(ny, nx)`` (M3: may be
+    spatially varying; a scalar broadcasts to a uniform field, which is bitwise
+    identical to the old scalar path since the face average ``0.5*(n+n) == n``)
   * ``qx``  -- discharge per unit width on x-faces, ``(ny, nx+1)``
   * ``qy``  -- discharge per unit width on y-faces, ``(ny+1, nx)``
 
@@ -37,6 +40,7 @@ class State:
     device: str
     h: wp.array
     z: wp.array
+    n: wp.array  # (ny, nx) Manning roughness at cell centres
     qx: wp.array
     qy: wp.array
     eta: wp.array
@@ -50,13 +54,15 @@ class State:
         dx: float,
         *,
         depth: np.ndarray | float = 0.0,
+        manning: np.ndarray | float = 0.035,
         device: str = "cpu",
     ) -> State:
         """Build a state from a bed-elevation array (metres, row-major ``(y, x)``).
 
         ``depth`` seeds the initial water depth ``h`` -- either a scalar (uniform)
-        or a full ``(ny, nx)`` array (e.g. a dam-break step). Discharges start at
-        zero (fluid at rest).
+        or a full ``(ny, nx)`` array (e.g. a dam-break step). ``manning`` seeds the
+        roughness field the same way (scalar broadcasts to uniform). Discharges
+        start at zero (fluid at rest).
         """
         bed = np.ascontiguousarray(bed, dtype=np.float32)
         ny, nx = bed.shape
@@ -69,12 +75,20 @@ class State:
             if h0.shape != (ny, nx):
                 raise ValueError(f"depth shape {h0.shape} != bed shape {(ny, nx)}")
 
+        if np.isscalar(manning):
+            n0 = np.full((ny, nx), float(manning), dtype=np.float32)
+        else:
+            n0 = np.ascontiguousarray(manning, dtype=np.float32)
+            if n0.shape != (ny, nx):
+                raise ValueError(f"manning shape {n0.shape} != bed shape {(ny, nx)}")
+
         eta0 = (h0 + bed).astype(np.float32)
         return cls(
             grid=grid,
             device=device,
             h=wp.array(h0, dtype=wp.float32, device=device),
             z=wp.array(bed, dtype=wp.float32, device=device),
+            n=wp.array(n0, dtype=wp.float32, device=device),
             qx=wp.zeros(grid.qx_shape, dtype=wp.float32, device=device),
             qy=wp.zeros(grid.qy_shape, dtype=wp.float32, device=device),
             eta=wp.array(eta0, dtype=wp.float32, device=device),

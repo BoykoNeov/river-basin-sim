@@ -64,9 +64,9 @@ def update_qx(
     qx: wp.array2d(dtype=wp.float32),
     eta: wp.array2d(dtype=wp.float32),
     z: wp.array2d(dtype=wp.float32),
+    n: wp.array2d(dtype=wp.float32),
     dx: wp.float32,
     dt: wp.float32,
-    manning_n: wp.float32,
     g: wp.float32,
 ):
     """Update interior x-faces. Launched over ``(ny, nx-1)``; ``j = jj + 1``."""
@@ -82,9 +82,10 @@ def update_qx(
         return
 
     q = qx[i, j]
+    n_face = 0.5 * (n[i, j - 1] + n[i, j])  # uniform n -> 0.5*(n+n)==n (bit-exact)
     slope = (eta_r - eta_l) / dx  # d(h+z)/dx across the face
     num = q - g * h_flow * dt * slope
-    den = manning_denominator(q, h_flow, manning_n, g, dt)
+    den = manning_denominator(q, h_flow, n_face, g, dt)
     qx[i, j] = num / den
 
 
@@ -93,9 +94,9 @@ def update_qy(
     qy: wp.array2d(dtype=wp.float32),
     eta: wp.array2d(dtype=wp.float32),
     z: wp.array2d(dtype=wp.float32),
+    n: wp.array2d(dtype=wp.float32),
     dx: wp.float32,
     dt: wp.float32,
-    manning_n: wp.float32,
     g: wp.float32,
 ):
     """Update interior y-faces. Launched over ``(ny-1, nx)``; ``i = ii + 1``."""
@@ -111,9 +112,10 @@ def update_qy(
         return
 
     q = qy[i, j]
+    n_face = 0.5 * (n[i - 1, j] + n[i, j])  # uniform n -> 0.5*(n+n)==n (bit-exact)
     slope = (eta_b - eta_t) / dx
     num = q - g * h_flow * dt * slope
-    den = manning_denominator(q, h_flow, manning_n, g, dt)
+    den = manning_denominator(q, h_flow, n_face, g, dt)
     qy[i, j] = num / den
 
 
@@ -237,12 +239,13 @@ def compute_dt(state: State, alpha: float = 0.7, dt_max: float = 30.0) -> float:
     return min(dt, dt_max)
 
 
-def step(state: State, dt: float, manning_n: float, rain: float = 0.0, limit: bool = True) -> None:
+def step(state: State, dt: float, rain: float = 0.0, limit: bool = True) -> None:
     """Advance the state by one local-inertial step of size ``dt`` (seconds).
 
-    Order: refresh ``eta`` -> update x/y face discharges (friction folded in) ->
-    re-assert closed boundaries -> (optional) mass-conservative outflow limiter ->
-    continuity + rainfall. Rain is a velocity (m/s): ``rate_mm_hr / 1000 / 3600``.
+    Order: refresh ``eta`` -> update x/y face discharges (friction folded in, from
+    the per-cell roughness field ``state.n``) -> re-assert closed boundaries ->
+    (optional) mass-conservative outflow limiter -> continuity + rainfall. Rain is
+    a velocity (m/s): ``rate_mm_hr / 1000 / 3600``.
 
     ``limit`` enables the per-cell donor limiter that keeps depths non-negative
     when the scheme is pushed out of regime (steep thin-sheet flow). It is
@@ -250,21 +253,21 @@ def step(state: State, dt: float, manning_n: float, rain: float = 0.0, limit: bo
     perturb in-regime runs such as the dam-break validation.
     """
     g = state.grid
-    dxf, dtf, nf, gf = float(g.dx), float(dt), float(manning_n), float(GRAVITY)
+    dxf, dtf, gf = float(g.dx), float(dt), float(GRAVITY)
 
     wp.launch(compute_eta, dim=g.shape, inputs=[state.h, state.z, state.eta], device=state.device)
     if g.nx > 1:
         wp.launch(
             update_qx,
             dim=(g.ny, g.nx - 1),
-            inputs=[state.qx, state.eta, state.z, dxf, dtf, nf, gf],
+            inputs=[state.qx, state.eta, state.z, state.n, dxf, dtf, gf],
             device=state.device,
         )
     if g.ny > 1:
         wp.launch(
             update_qy,
             dim=(g.ny - 1, g.nx),
-            inputs=[state.qy, state.eta, state.z, dxf, dtf, nf, gf],
+            inputs=[state.qy, state.eta, state.z, state.n, dxf, dtf, gf],
             device=state.device,
         )
     apply_closed_bc(state)

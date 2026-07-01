@@ -42,14 +42,14 @@ def _simulate_dambreak(
     x = _cell_x(nx, dx)
     depth0 = np.where(x < 0.0, h_l, h_r).astype(np.float32)
     bed = np.zeros((1, nx), dtype=np.float32)
-    st = State.from_bed(bed, dx=dx, depth=depth0.reshape(1, nx), device=DEV)
+    st = State.from_bed(bed, dx=dx, depth=depth0.reshape(1, nx), manning=manning_n, device=DEV)
     ledger = MassLedger.from_state(st)
 
     t = 0.0
     while t < t_end - 1e-9:
         dt = compute_dt(st, alpha=0.7, dt_max=t_end)
         dt = min(dt, t_end - t)
-        step(st, dt=dt, manning_n=manning_n)
+        step(st, dt=dt)
         t += dt
     ledger.record(st, t)
     return x, st.h.numpy()[0].astype(np.float64), ledger

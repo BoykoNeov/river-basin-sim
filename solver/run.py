@@ -27,6 +27,7 @@ from solver.core.local_inertial import compute_dt, step
 from solver.core.massbalance import MASS_GATE, MassLedger
 from solver.core.state import State
 from solver.io.config import Scenario, load_config
+from solver.io.fields import load_field
 from solver.io.status import StatusWriter
 from solver.io.viewer_export import export_frames
 from solver.io.zarr_writer import ZarrWriter
@@ -90,7 +91,10 @@ def run_simulation(
     if scenario.dx is None:
         raise ValueError("scenario.dx is unresolved; fill it from the tile manifest first")
     grid = Grid(ny=bed.shape[0], nx=bed.shape[1], dx=scenario.dx)
-    st = State.from_bed(bed, dx=scenario.dx, depth=scenario.initial_depth, device=device)
+    manning = load_field(scenario.manning_field, grid, scalar=scenario.manning_n)
+    st = State.from_bed(
+        bed, dx=scenario.dx, depth=scenario.initial_depth, manning=manning, device=device
+    )
     ledger = MassLedger.from_state(st)
 
     n_frames = int(round(scenario.end_time / scenario.output_every)) + 1
@@ -126,7 +130,7 @@ def run_simulation(
         raining = t < scenario.rain_duration - EPS_T
         rain = scenario.rain_m_s if raining else 0.0
 
-        step(st, dt=dt, manning_n=scenario.manning_n, rain=rain)
+        step(st, dt=dt, rain=rain)
         if rain > 0.0:
             ledger.add_rain_step(rain, dt, grid.n_cells)
         t += dt

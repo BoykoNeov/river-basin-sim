@@ -19,13 +19,13 @@ def test_closed_no_source_conserves_to_gate():
     rng = np.random.default_rng(1)
     bed = rng.uniform(0.0, 3.0, size=(12, 10)).astype(np.float32)
     depth = rng.uniform(1.0, 4.0, size=(12, 10)).astype(np.float32)
-    st = State.from_bed(bed, dx=8.0, depth=depth, device=DEV)
+    st = State.from_bed(bed, dx=8.0, depth=depth, manning=0.03, device=DEV)
     ledger = MassLedger.from_state(st)
 
     t = 0.0
     for _ in range(50):
         dt = compute_dt(st, alpha=0.5, dt_max=5.0)
-        step(st, dt=dt, manning_n=0.03)
+        step(st, dt=dt)
         t += dt
     ledger.record(st, t)
 
@@ -35,14 +35,14 @@ def test_closed_no_source_conserves_to_gate():
 def test_uniform_rain_balances_to_gate():
     """Rain on a closed basin: inflow_cum matches stored-volume rise to the gate."""
     bed = np.zeros((16, 16), dtype=np.float32)
-    st = State.from_bed(bed, dx=10.0, depth=0.2, device=DEV)
+    st = State.from_bed(bed, dx=10.0, depth=0.2, manning=0.03, device=DEV)
     ledger = MassLedger.from_state(st)
     rain = 50.0 / 1000.0 / 3600.0  # 50 mm/hr -> m/s
 
     t = 0.0
     for _ in range(40):
         dt = compute_dt(st, alpha=0.5, dt_max=5.0)
-        step(st, dt=dt, manning_n=0.03, rain=rain)
+        step(st, dt=dt, rain=rain)
         ledger.add_rain_step(rain, dt, st.grid.n_cells)
         t += dt
     ledger.record(st, t)

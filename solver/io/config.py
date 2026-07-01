@@ -68,7 +68,7 @@ class Inflow:
         hg = self.hydrograph
         if not hg or t < hg[0][0] or t > hg[-1][0]:
             return 0.0
-        for (t0, q0), (t1, q1) in zip(hg, hg[1:]):
+        for (t0, q0), (t1, q1) in zip(hg, hg[1:], strict=False):
             if t0 <= t <= t1:
                 if t1 == t0:
                     return q1
@@ -139,7 +139,16 @@ class Scenario:
 
 
 # Tables/keys the loader knows about; anything else warns (typo guard).
-_KNOWN_TABLES = {"meta", "grid", "run", "rainfall", "parameters", "boundaries", "inflow", "structures"}
+_KNOWN_TABLES = {
+    "meta",
+    "grid",
+    "run",
+    "rainfall",
+    "parameters",
+    "boundaries",
+    "inflow",
+    "structures",
+}
 _KNOWN_KEYS = {
     "meta": {"name", "seed", "scheme"},
     "grid": {"tiles_dir", "dx", "crs"},
@@ -195,7 +204,7 @@ def _parse_inflows(doc: dict, ny_nx: tuple[int, int] | None = None) -> list[Infl
             )
         pts = [(float(t), float(q)) for t, q in hg]
         times = [t for t, _ in pts]
-        if any(b < a for a, b in zip(times, times[1:])):
+        if any(b < a for a, b in zip(times, times[1:], strict=False)):
             raise ConfigError(f"[[inflow]] #{k}: hydrograph times must be non-decreasing")
         inflows.append(Inflow(cell=(int(cell[0]), int(cell[1])), hydrograph=pts))
     return inflows

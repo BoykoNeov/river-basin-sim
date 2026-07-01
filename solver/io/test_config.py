@@ -125,7 +125,7 @@ def test_rain_field_requires_path(tmp_path):
 
 
 def test_inflow_hydrograph_parsed(tmp_path):
-    text = _FULL + '\n[[inflow]]\ncell = [10, 20]\nhydrograph = [[0.0, 0.0], [600.0, 5.0]]\n'
+    text = _FULL + "\n[[inflow]]\ncell = [10, 20]\nhydrograph = [[0.0, 0.0], [600.0, 5.0]]\n"
     scn = load_config(_write(tmp_path, text))
     assert len(scn.inflows) == 1
     inf = scn.inflows[0]
@@ -136,7 +136,7 @@ def test_inflow_hydrograph_parsed(tmp_path):
 
 
 def test_inflow_bad_shape_rejected(tmp_path):
-    text = _FULL + '\n[[inflow]]\ncell = [10]\nhydrograph = [[0.0, 0.0]]\n'
+    text = _FULL + "\n[[inflow]]\ncell = [10]\nhydrograph = [[0.0, 0.0]]\n"
     with pytest.raises(ConfigError, match="cell"):
         load_config(_write(tmp_path, text))
 
