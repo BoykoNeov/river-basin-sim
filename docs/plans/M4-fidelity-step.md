@@ -259,18 +259,37 @@ Ships as its own commit/PR, green on `ruff` + `pytest`, before touching the sche
       wetting/drying, depressions fill (11/16 wet, deepest SE 0.28 m), and the
       up-slope **top-right (NE) depressions stay dry** (the report's points-15/16
       finding). The full 20 m / 48 h run is deferred to a step-11 GPU demo.
-    - **Second EA case pending a scope call.** The plan's §6 pick was Test 1 + Test 2,
-      but **Test 1 (disconnected water body) requires a time-varying water-level
-      (`fixed_stage`) boundary** — the Dirichlet ghost BC deferred in step 9 (§6 open
-      decision #1). Cost asymmetry (advisor-flagged): Test 1's bed sits at ~10 m datum,
-      where extrapolating the measured f32 datum-sensitivity (~1e-4 m/s spurious rest
-      velocity, at the lake-at-rest gate) means the honest Test-1 route is `fixed_stage`
-      **plus** a datum-shift (`z' = z − z_ref`), not just the BC. Options: (a) build
-      `fixed_stage` + datum-shift then Test 1; (b) substitute **Test 3** (momentum over
-      a small obstruction — inflow + closed walls only, no fixed_stage, no datum issue,
-      a strong HLLC-vs-LI inertia discriminator — the lowest-effort second case); (c)
-      gate M4 on Test 2 alone. Specs for all three are pinned; awaiting the decision
-      before writing the second case.
+    - **EA Test 3 done — but reframed** (user picked Test 3 as the second case):
+      `validation/test_ea_test3.py`. Faithful 300×100 m / 5 m / 15 min (the report's
+      *exact* resolution + horizon — already CI-tractable), 1:200 slope, two Gaussian
+      depressions at x=150/250, inflow line on the west, closed walls, dry start.
+      **The "HLLC-vs-LI discriminator" premise was wrong** (advisor-corrected): report
+      p.105 splits *zero-inertia* packages (which don't overtop) from *with-inertia*
+      packages (which do), and **Bates local-inertial keeps `∂q/∂t`**, so LI is a
+      with-inertia scheme on the *same* side as HLLC — empirically **both overtop**.
+      So the gate is a **within-HLLC momentum-conservation test** instead: the
+      obstruction crest is fixed by an offline **scheme-free volume anchor**
+      (depression-1 capacity integrated to the crest; inflow = 0.9× it, so the static
+      equilibrium sits below the crest — no static spillover), then two HLLC runs
+      inject the **same volume** differing only in hydrograph sharpness. Gentle
+      (tb=300 s) → null: P1 settles 3.7 cm below crest, P2 **dry** (settled, P2 spread
+      0 over the last 300 s). Sharp (tb=80 s, same volume) → P1 still below crest but
+      momentum carries a splash over → P2 **wets to 6 cm** (≈ the report's ~5–6 cm).
+      Only arrival momentum differs → isolates the momentum transport Test 3 targets.
+      Crest never tuned to outcome; only hydrograph energy differs, at fixed volume.
+      A second (non-gating) context test records that **both** LI and HLLC overtop the
+      sharp pulse — the honest result explaining why HLLC-vs-LI is not a discriminator
+      here. Mass 2.1e-9 (null) / 6.7e-8 (signal); h ≥ 0; **111 tests green**.
+      ⚠️ **The claim changed** — this is a momentum-conservation reproduction of Test 3,
+      **not** a scheme discriminator. Needs a user sign-off that this satisfies Test 3
+      for M4 acceptance (vs revisiting Test 1 or gating on Test 2 alone).
+    - *(superseded fork, for the record)* §6's pick was Test 1 + Test 2, but **Test 1
+      (disconnected water body) requires a time-varying water-level (`fixed_stage`)
+      boundary** — the Dirichlet ghost deferred in step 9 (§6 open decision #1) — and
+      its ~10 m datum makes the honest route `fixed_stage` **plus** a datum-shift
+      (`z' = z − z_ref`). Test 3 was chosen as the lower-effort second case; if the
+      reframe above is unsatisfying, (a) Test 1 (build `fixed_stage` + datum-shift) or
+      (c) gate M4 on Test 2 alone remain open. Specs pinned in the EA-benchmarks memory.
 11. **Example scenario(s)** — an `scheme = "hllc_fv"` scenario; regenerate a real
     `results.zarr` + frames; **confirm checkpoint** (mass gate + rendered PNG + a
     side-by-side LI-vs-HLLC on the same scenario).
