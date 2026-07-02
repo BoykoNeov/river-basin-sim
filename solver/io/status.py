@@ -15,6 +15,15 @@ timestep or the canonical Zarr. The simulation stepping stays wall-clock-free.
 
 Writes are **atomic** (temp file + ``os.replace``) so a viewer polling the file
 never reads a half-written document.
+
+**Windows sharing race (§7.4).** The viewer polls this file a few times a second
+with a plain read, which on Windows opens it *without* ``FILE_SHARE_DELETE`` --
+so if ``os.replace`` lands mid-read the rename is denied (``PermissionError`` /
+``WinError 5``). Rename-over-an-open-file is fine on POSIX, so this only bites the
+live viewer loop, never a standalone run. The write is therefore retried with a
+short backoff (the reader holds the lock only microseconds per poll), and is
+treated as **best-effort**: a run must never die over its progress file, so if
+every retry loses the race we drop that one update rather than crash the sim.
 """
 
 from __future__ import annotations
@@ -25,6 +34,10 @@ import time
 from pathlib import Path
 
 VALID_STATES = {"starting", "running", "writing", "done", "error"}
+
+# Bounded retry for the Windows concurrent-reader rename race (see module docstring).
+_REPLACE_RETRIES = 12
+_REPLACE_BACKOFF_S = 0.005  # initial delay; doubles per attempt, capped at 0.1 s
 
 
 class StatusWriter:
@@ -74,4 +87,31 @@ class StatusWriter:
         }
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(json.dumps(record), encoding="utf-8")
-        os.replace(tmp, self.path)  # atomic on POSIX and Windows
+        self._atomic_replace(tmp)
+
+    def _atomic_replace(self, tmp: Path) -> None:
+        """Replace ``status.json`` with ``tmp``, retrying the Windows read-lock race.
+
+        A concurrent viewer poll can hold the destination open just as ``os.replace``
+        fires, denying the rename with ``PermissionError`` (``WinError 5``). The lock
+        clears in microseconds, so a short bounded retry almost always wins. If every
+        attempt loses, we drop this one update (best-effort progress, §7.4) instead of
+        crashing the run -- the next write, or process exit, recovers. The ``sleep`` is
+        wall-clock only; it never touches the state-derived timestep (determinism, §8).
+        """
+        delay = _REPLACE_BACKOFF_S
+        for attempt in range(_REPLACE_RETRIES):
+            try:
+                os.replace(tmp, self.path)  # atomic on POSIX and Windows
+                return
+            except PermissionError:
+                if attempt == _REPLACE_RETRIES - 1:
+                    break
+                time.sleep(delay)
+                delay = min(delay * 2.0, 0.1)
+        # Lost every retry: keep the run alive, clean up the temp, skip this update.
+        print(f"warning: status write lost the file race ({self.path}); skipping update")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass

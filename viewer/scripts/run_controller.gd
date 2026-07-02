@@ -71,9 +71,12 @@ func _build_command(repo_root: String, config_rel: String, out_rel: String) -> D
 	var win_root := repo_root.replace("/", "\\")
 	if OS.get_name() == "Windows":
 		var bat := repo_root.path_join("data/results/_launch_solver.bat")
+		# Capture the solver's stdout/stderr to a log next to the results: the
+		# subprocess has no console we can see, so this is what the "see console/logs"
+		# failure message points at (it's how the status.json write-race was found).
 		var lines := "@echo off\r\n"
 		lines += "cd /d \"%s\"\r\n" % win_root
-		lines += "uv run python -m solver.run --config \"%s\" --out \"%s\"\r\n" % [config_rel, out_rel]
+		lines += "uv run python -m solver.run --config \"%s\" --out \"%s\" > \"data\\results\\solver_stdout.log\" 2>&1\r\n" % [config_rel, out_rel]
 		var f := FileAccess.open(bat, FileAccess.WRITE)
 		if f == null:
 			return {}
