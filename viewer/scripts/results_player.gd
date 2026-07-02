@@ -198,6 +198,13 @@ func _read_frame_image(i: int) -> Image:
 		return Image.create(_grid_w, _grid_h, false, Image.FORMAT_RF)
 	var bytes := f.get_buffer(f.get_length())
 	f.close()
+	# Guard against a truncated/short frame (partial write, wrong grid) -- create_from_data
+	# would otherwise read past the buffer. Match _load_r32_as_rf's size check, but return
+	# the blank-Image fallback (callers don't null-check the result), not null.
+	if bytes.size() != _grid_w * _grid_h * 4:
+		push_error("River Basin viewer: frame %d byte size %d != %d"
+			% [i, bytes.size(), _grid_w * _grid_h * 4])
+		return Image.create(_grid_w, _grid_h, false, Image.FORMAT_RF)
 	return Image.create_from_data(_grid_w, _grid_h, false, Image.FORMAT_RF, bytes)
 
 

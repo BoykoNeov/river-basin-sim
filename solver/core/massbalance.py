@@ -108,6 +108,12 @@ class MassLedger:
         inflow = self._inflow.total
         outflow = self._outflow.total + state.loss_volume(self.cell_area)
         residual = inflow - outflow - (v - self.v0)
+        # M4 watch item: in a drain-to-empty run with no inflow, both abs(inflow) and
+        # abs(v) -> 0, so a tiny *absolute* residual could trip the gate via denominator
+        # collapse rather than physics. It doesn't today (M1-M3 fully-draining tests keep
+        # the residual proportionally small, so rel stays ~0), but M4's benchmark suite
+        # drains domains fully -- add a causal peak-volume floor here (max v seen so far,
+        # keeping filling runs bitwise-identical) once a drain-to-empty gate test exists.
         denom = max(abs(inflow), abs(v), 1e-12)
         rel = abs(residual) / denom
         rec = MassRecord(time, v, inflow, outflow, residual, rel)

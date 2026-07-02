@@ -38,7 +38,10 @@ func launch(repo_root: String, config_rel: String, out_rel: String) -> bool:
 		push_warning("run_controller: a run is already in progress")
 		return false
 	_repo_root = repo_root
-	_status_path = repo_root.path_join("data/results/status.json")
+	# The solver writes status.json next to the Zarr store (run.py: <out-dir>/status.json),
+	# so derive the poll path from out_rel rather than hardcoding data/results -- a caller
+	# passing a different --out would otherwise leave us polling the wrong (never-updated) file.
+	_status_path = repo_root.path_join(out_rel).get_base_dir().path_join("status.json")
 
 	# Clear any stale status so the poller can't read a previous run's "done".
 	if FileAccess.file_exists(_status_path):
