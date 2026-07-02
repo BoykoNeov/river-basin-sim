@@ -281,8 +281,10 @@ Ships as its own commit/PR, green on `ruff` + `pytest`, before touching the sche
       sharp pulse — the honest result explaining why HLLC-vs-LI is not a discriminator
       here. Mass 2.1e-9 (null) / 6.7e-8 (signal); h ≥ 0; **111 tests green**.
       ⚠️ **The claim changed** — this is a momentum-conservation reproduction of Test 3,
-      **not** a scheme discriminator. Needs a user sign-off that this satisfies Test 3
-      for M4 acceptance (vs revisiting Test 1 or gating on Test 2 alone).
+      **not** a scheme discriminator. **User signed off (2026-07-02, option (a)):** the
+      reframe satisfies Test 3 for M4 acceptance; Test 2 + Test 3-as-momentum-gate close
+      the EA subset. Test 1 (needs `fixed_stage` + datum-shift) stays a post-M4 addition,
+      not a step-10 blocker. **Step 10 CLOSED.**
     - *(superseded fork, for the record)* §6's pick was Test 1 + Test 2, but **Test 1
       (disconnected water body) requires a time-varying water-level (`fixed_stage`)
       boundary** — the Dirichlet ghost deferred in step 9 (§6 open decision #1) — and

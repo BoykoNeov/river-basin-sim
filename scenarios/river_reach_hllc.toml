@@ -1,0 +1,44 @@
+# M4 scenario (HANDOFF §7.1) -- the well-balanced HLLC finite-volume fidelity
+# scheme (scheme = "hllc_fv") on the SAME real scenario as river_reach.toml, so
+# the two runs form a like-for-like LI-vs-HLLC side-by-side (plan §3 step 11).
+#
+# Identical physics to river_reach.toml (same tile, inflow hydrograph,
+# infiltration, open south edge, rain) -- only [meta].scheme and the CFL differ.
+# HLLC's CFL is velocity-dependent (C*dx/(|u|+sqrt(g h))), so it runs at a tighter
+# alpha (0.45) than local-inertial (0.70); everything else is held fixed.
+#
+# Run: uv run python -m solver.run --config scenarios/river_reach_hllc.toml \
+#        --out data/results/river_reach_hllc.zarr --device cuda:0
+
+[meta]
+name = "river_reach_hllc"
+seed = 12345
+scheme = "hllc_fv"
+
+[grid]
+tiles_dir = "data/tiles/demo"    # dx / crs inherit from tiles.json
+
+[run]
+end_time = 3600.0                # 1 h simulated
+output_every = 300.0             # 13 frames
+cfl = 0.45                       # HLLC velocity-dependent CFL (tighter than LI's 0.7)
+dt_max = 30.0
+
+[rainfall]
+type = "uniform"
+rate_mm_hr = 30.0
+duration_s = 1800.0              # rain for the first half hour
+
+[parameters]
+manning_n = 0.04
+infiltration = 3.0               # constant-rate loss, mm/hr
+
+# A tributary entering near the top-centre of the tile: ramps to 40 m^3/s, holds,
+# then recedes. (row, col) into the 1024x1024 grid.
+[[inflow]]
+cell = [128, 512]
+hydrograph = [[0.0, 0.0], [900.0, 40.0], [2700.0, 40.0], [3600.0, 0.0]]
+
+[boundaries]
+default = "closed"
+south = "open"                   # let water route off the southern edge
