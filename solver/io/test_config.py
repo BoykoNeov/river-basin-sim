@@ -185,3 +185,39 @@ def test_manning_bool_rejected(tmp_path):
 def test_missing_file_raises_config_error(tmp_path):
     with pytest.raises(ConfigError, match="not found"):
         load_config(tmp_path / "nope.toml")
+
+
+# --- run-parameter validation (post_init, both construction paths) ----------
+
+
+@pytest.mark.parametrize(
+    ("mutation", "repl", "needle"),
+    [
+        ("output_every = 300.0", "output_every = 0.0", "output_every"),  # ZeroDivisionError guard
+        ("end_time = 1200.0", "end_time = -5.0", "end_time"),
+        ("dt_max = 20.0", "dt_max = 0.0", "dt_max"),
+        ("cfl = 0.6", "cfl = 0.0", "cfl"),
+        ("end_time = 1200.0", "end_time = 1000.0", "multiple of output_every"),  # non-divisible
+        ("manning_n = 0.03", "manning_n = -0.01", "manning_n"),
+        ("manning_n = 0.03", "infiltration = -1.0", "infiltration"),
+        ("rate_mm_hr = 40.0", "rate_mm_hr = -1.0", "rainfall rate"),
+    ],
+)
+def test_bad_run_params_rejected(tmp_path, mutation, repl, needle):
+    text = _FULL.replace(mutation, repl)
+    with pytest.raises(ConfigError, match=needle):
+        load_config(_write(tmp_path, text))
+
+
+def test_high_cfl_warns_but_loads(tmp_path):
+    with pytest.warns(UserWarning, match="stability limit"):
+        scn = load_config(_write(tmp_path, _FULL.replace("cfl = 0.6", "cfl = 5.0")))
+    assert scn.alpha == 5.0  # still loads -- a warning, not a rejection
+
+
+def test_scenario_post_init_guards_direct_construction():
+    # The bare-CLI/demo path builds a Scenario directly, bypassing load_config.
+    with pytest.raises(ValueError, match="output_every"):
+        Scenario(output_every=0.0)
+    with pytest.raises(ValueError, match="multiple of output_every"):
+        Scenario(end_time=3500.0, output_every=300.0)

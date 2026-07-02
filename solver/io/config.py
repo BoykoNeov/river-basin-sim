@@ -117,6 +117,50 @@ class Scenario:
     source_path: str | None = None  # the TOML this was loaded from (provenance)
     meta: dict = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """Validate run parameters on *every* construction path.
+
+        Runs for both the config loader (a raised ``ValueError`` is wrapped into a
+        milestone-naming :class:`ConfigError` by :func:`load_config`) and the bare
+        ``solver.run`` CLI/demo path, which builds a :class:`Scenario` directly from
+        flags (e.g. ``--output-every 0``) and never touches the loader. Only timing
+        params are checked; ``dx`` stays ``None`` until manifest resolution.
+        """
+        if self.end_time <= 0:
+            raise ValueError(f"end_time must be > 0, got {self.end_time}")
+        if self.output_every <= 0:
+            raise ValueError(f"output_every must be > 0, got {self.output_every}")
+        if self.dt_max <= 0:
+            raise ValueError(f"dt_max must be > 0, got {self.dt_max}")
+        if self.alpha <= 0:
+            raise ValueError(f"cfl must be > 0, got {self.alpha}")
+        # Frames land on output_every multiples and n_frames assumes exact division;
+        # a non-divisible pair silently drops the final state (t=end_time) and leaves
+        # an unfilled Zarr slot. Reject loudly (float-tolerant on the frame count).
+        n = self.end_time / self.output_every
+        if abs(n - round(n)) > 1e-6:
+            raise ValueError(
+                f"end_time ({self.end_time}) must be an exact multiple of output_every "
+                f"({self.output_every}); otherwise the final frame at end_time is dropped"
+            )
+        # Physical scalars are non-negative (field files are checked in solver.io.fields).
+        if self.manning_n < 0:
+            raise ValueError(f"manning_n must be >= 0, got {self.manning_n}")
+        if self.infiltration_mm_hr < 0:
+            raise ValueError(f"infiltration must be >= 0 mm/hr, got {self.infiltration_mm_hr}")
+        if self.rain_mm_hr < 0:
+            raise ValueError(f"rainfall rate must be >= 0 mm/hr, got {self.rain_mm_hr}")
+        if self.rain_duration < 0:
+            raise ValueError(f"rainfall duration must be >= 0 s, got {self.rain_duration}")
+        # The local-inertial scheme is stable only to CFL ~0.7 (Bates 2010); warn
+        # loudly above that band rather than fail (experimentation is allowed).
+        if self.alpha > 0.9:
+            warnings.warn(
+                f"cfl={self.alpha} exceeds the ~0.7 local-inertial stability limit; "
+                "the run may go unstable",
+                stacklevel=2,
+            )
+
     @property
     def rain_m_s(self) -> float:
         return self.rain_mm_hr / 1000.0 / 3600.0

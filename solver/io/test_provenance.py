@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tomllib
+from pathlib import Path
 
 import numpy as np
 
 from solver.io.config import load_config
-from solver.io.provenance import build_provenance, sha256_file, write_provenance
+from solver.io.provenance import SOLVER_VERSION, build_provenance, sha256_file, write_provenance
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _CFG = """
 [meta]
@@ -68,6 +72,17 @@ def test_provenance_captures_source_and_field_hashes(tmp_path):
     assert resolved["boundaries"]["east"] == "open"
     assert rec["solver"]["milestone"] == "M3"
     json.dumps(rec)  # must not raise
+
+
+def test_solver_version_matches_pyproject():
+    """SOLVER_VERSION is stamped into every run's provenance -- pin it to the single
+    source of truth (pyproject [project].version) so the two can't silently drift.
+
+    Read pyproject directly rather than importlib.metadata: the project runs via
+    pythonpath, not as an installed distribution, so metadata lookup would fail.
+    """
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert SOLVER_VERSION == pyproject["project"]["version"]
 
 
 def test_write_provenance_sidecar(tmp_path):

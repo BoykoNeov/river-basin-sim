@@ -40,3 +40,25 @@ def test_bool_not_treated_as_field():
     # bool is an int subclass -- must not be silently broadcast as 0/1.
     with pytest.raises((ValueError, OSError)):
         load_field(True, GRID)  # falls through to path handling -> fails
+
+
+def test_non_finite_field_is_hard_error(tmp_path):
+    src = np.full((4, 5), 0.04, dtype=np.float32)
+    src[1, 2] = np.nan
+    p = tmp_path / "nan.r32"
+    src.astype("<f4").tofile(p)
+    with pytest.raises(ValueError, match="non-finite"):
+        load_field(str(p), GRID, name="manning_n")
+
+
+def test_negative_field_rejected_when_nonneg(tmp_path):
+    # A negative rain/infiltration rate stays ledger-consistent (the sink cancels),
+    # so the mass gate can't catch it -- load_field must.
+    src = np.full((4, 5), 5.0, dtype=np.float32)
+    src[0, 0] = -1.0
+    p = tmp_path / "neg.r32"
+    src.astype("<f4").tofile(p)
+    with pytest.raises(ValueError, match="negative"):
+        load_field(str(p), GRID, name="rainfall", nonneg=True)
+    # Without nonneg the same field loads (negatives are legitimate for e.g. bed).
+    assert load_field(str(p), GRID).shape == (4, 5)

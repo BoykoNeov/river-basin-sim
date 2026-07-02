@@ -53,19 +53,40 @@ def _load_tif(path: Path, grid: Grid) -> np.ndarray:
     return np.ascontiguousarray(data, dtype=np.float32)
 
 
-def load_field(value: float | str | None, grid: Grid, *, scalar: float = 0.0) -> np.ndarray:
+def load_field(
+    value: float | str | None,
+    grid: Grid,
+    *,
+    scalar: float = 0.0,
+    name: str = "field",
+    nonneg: bool = False,
+) -> np.ndarray:
     """Resolve a scalar-or-path field spec into a ``(ny, nx)`` float32 array.
 
     ``value`` is a path (``.r32``/``.tif``) when a field is configured, else
     ``None`` -- in which case a uniform field of ``scalar`` is returned. A numeric
     ``value`` is also accepted and broadcast (uniform).
+
+    Every resolved field is checked for finiteness: a NaN/Inf in a parameter raster
+    would propagate straight into the fluxes with nothing flagging it (the mass
+    ledger sums whatever it is given). When ``nonneg`` is set the field must also be
+    ``>= 0`` -- a negative rain/infiltration rate would remove water while staying
+    ledger-consistent (the sink accounting cancels), so the mass gate can't catch
+    it. Both are hard errors, named by ``name``.
     """
     ny, nx = grid.shape
     if value is None:
-        return np.full((ny, nx), float(scalar), dtype=np.float32)
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return np.full((ny, nx), float(value), dtype=np.float32)
-    path = Path(str(value))
-    if path.suffix.lower() in (".tif", ".tiff"):
-        return _load_tif(path, grid)
-    return load_r32(path, grid)
+        arr = np.full((ny, nx), float(scalar), dtype=np.float32)
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        arr = np.full((ny, nx), float(value), dtype=np.float32)
+    else:
+        path = Path(str(value))
+        if path.suffix.lower() in (".tif", ".tiff"):
+            arr = _load_tif(path, grid)
+        else:
+            arr = load_r32(path, grid)
+    if not np.isfinite(arr).all():
+        raise ValueError(f"{name} contains non-finite values (NaN/Inf); check the source data")
+    if nonneg and float(arr.min()) < 0.0:
+        raise ValueError(f"{name} has negative values (min={float(arr.min()):.4g}); must be >= 0")
+    return arr

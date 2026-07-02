@@ -93,14 +93,22 @@ def run_simulation(
     if scenario.dx is None:
         raise ValueError("scenario.dx is unresolved; fill it from the tile manifest first")
     grid = Grid(ny=bed.shape[0], nx=bed.shape[1], dx=scenario.dx)
-    manning = load_field(scenario.manning_field, grid, scalar=scenario.manning_n)
+    manning = load_field(
+        scenario.manning_field, grid, scalar=scenario.manning_n, name="manning_n", nonneg=True
+    )
     st = State.from_bed(
         bed, dx=scenario.dx, depth=scenario.initial_depth, manning=manning, device=device
     )
 
     # --- M3 sources/sinks -------------------------------------------------------
     # Infiltration (constant-rate sink, mm/hr -> m/s); armed only when nonzero.
-    infil = load_field(scenario.infiltration_field, grid, scalar=scenario.infiltration_mm_hr)
+    infil = load_field(
+        scenario.infiltration_field,
+        grid,
+        scalar=scenario.infiltration_mm_hr,
+        name="infiltration",
+        nonneg=True,
+    )
     infil_m_s = infil / 1000.0 / 3600.0
     if scenario.infiltration_field is not None or float(infil_m_s.max()) > 0.0:
         st.set_infiltration(infil_m_s)
@@ -108,7 +116,8 @@ def run_simulation(
     rain_is_field = scenario.rain_type == "field"
     rain_field_sum_m_s = 0.0
     if rain_is_field:
-        rain_field = load_field(scenario.rain_field, grid) / 1000.0 / 3600.0
+        rain_mm_hr_field = load_field(scenario.rain_field, grid, name="rainfall", nonneg=True)
+        rain_field = rain_mm_hr_field / 1000.0 / 3600.0
         st.set_rain_field(rain_field)
         rain_field_sum_m_s = float(rain_field.astype(np.float64).sum())
     # Inflow hydrographs (prescribed discharge point sources).
