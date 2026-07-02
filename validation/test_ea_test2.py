@@ -103,7 +103,12 @@ def test_ea_test2_floodplain_depressions_fill_conservatively():
     inj = InflowInjector(inflows, st.grid, DEV)
     ledger = MassLedger.from_state(st)
 
-    t_end = 12.0 * 3600.0  # 12 h -- long enough for the depressions to fill and settle
+    # 12 h is past the transient for the assertions below (wet-count and the dry NE
+    # corner are stable from ~12 h through 24 h); the field is still slowly creeping.
+    # NB: the closed-domain mass residual grows with step count (float32 per-cell
+    # update round-off, not a limiter defect: ~1e-7/3 h, ~3e-7/12 h, ~6e-7/24 h) --
+    # re-check the gate margin before bumping this horizon or the resolution.
+    t_end = 12.0 * 3600.0
     t = 0.0
     next_rec = 1800.0
     while t < t_end - 1e-9:

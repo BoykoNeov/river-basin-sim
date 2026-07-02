@@ -262,10 +262,15 @@ Ships as its own commit/PR, green on `ruff` + `pytest`, before touching the sche
     - **Second EA case pending a scope call.** The plan's §6 pick was Test 1 + Test 2,
       but **Test 1 (disconnected water body) requires a time-varying water-level
       (`fixed_stage`) boundary** — the Dirichlet ghost BC deferred in step 9 (§6 open
-      decision #1). Options: (a) build `fixed_stage` then Test 1; (b) substitute
-      **Test 3** (momentum over a small obstruction — inflow + closed walls only, a
-      strong HLLC-vs-LI inertia discriminator); (c) gate M4 on Test 2 alone. Specs for
-      all three are pinned; awaiting the decision before writing the second case.
+      decision #1). Cost asymmetry (advisor-flagged): Test 1's bed sits at ~10 m datum,
+      where extrapolating the measured f32 datum-sensitivity (~1e-4 m/s spurious rest
+      velocity, at the lake-at-rest gate) means the honest Test-1 route is `fixed_stage`
+      **plus** a datum-shift (`z' = z − z_ref`), not just the BC. Options: (a) build
+      `fixed_stage` + datum-shift then Test 1; (b) substitute **Test 3** (momentum over
+      a small obstruction — inflow + closed walls only, no fixed_stage, no datum issue,
+      a strong HLLC-vs-LI inertia discriminator — the lowest-effort second case); (c)
+      gate M4 on Test 2 alone. Specs for all three are pinned; awaiting the decision
+      before writing the second case.
 11. **Example scenario(s)** — an `scheme = "hllc_fv"` scenario; regenerate a real
     `results.zarr` + frames; **confirm checkpoint** (mass gate + rendered PNG + a
     side-by-side LI-vs-HLLC on the same scenario).
