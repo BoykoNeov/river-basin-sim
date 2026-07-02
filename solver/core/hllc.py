@@ -40,6 +40,7 @@ from dataclasses import dataclass
 
 import warp as wp
 
+from solver.core.friction import manning_denominator
 from solver.core.grid import GRAVITY, H_DRY
 from solver.core.state import State
 
@@ -123,6 +124,23 @@ def _minmod(a: wp.float32, b: wp.float32) -> wp.float32:
 def _cget(a: wp.array2d(dtype=wp.float32), i: wp.int32, j: wp.int32, ny: wp.int32, nx: wp.int32):
     """Read a cell value with edge-clamped indices (transmissive ghost cells)."""
     return a[wp.clamp(i, 0, ny - 1), wp.clamp(j, 0, nx - 1)]
+
+
+@wp.func
+def _dryfactor(h0: wp.float32, hm: wp.float32, hp: wp.float32, dry: wp.float32) -> wp.float32:
+    """1.0 if a cell and both its stencil neighbours are wet, else 0.0.
+
+    Multiplying a MUSCL slope by this factor drops the reconstruction to
+    first-order (piecewise constant) for any cell adjacent to a dry cell. That
+    kills the spurious water/bed slope a dry neighbour injects into the minmod
+    stencil at a wet/dry front, while preserving well-balancedness: first-order
+    Audusse is exactly balanced, so zeroing the slope on both faces of a
+    shoreline cell -- consistently in the flux *and* source kernels -- cannot
+    break lake-at-rest. Fully-wet interiors are untouched (factor is 1.0).
+    """
+    if h0 <= dry or hm <= dry or hp <= dry:
+        return wp.float32(0.0)
+    return wp.float32(1.0)
 
 
 @wp.func
@@ -221,6 +239,7 @@ def _primitives(
 
 @wp.kernel
 def _flux_x(
+    h: wp.array2d(dtype=wp.float32),
     eta: wp.array2d(dtype=wp.float32),
     z: wp.array2d(dtype=wp.float32),
     uvel: wp.array2d(dtype=wp.float32),
@@ -258,15 +277,24 @@ def _flux_x(
     v2 = _cget(vvel, i, j, ny, nx)
     v3 = _cget(vvel, i, j + 1, ny, nx)
 
+    # Drop to first-order for any cell adjacent to a dry cell (see _dryfactor):
+    # kills the spurious wet/bed slope a dry neighbour injects at the shoreline.
+    h0 = _cget(h, i, j - 2, ny, nx)
+    h1 = _cget(h, i, j - 1, ny, nx)
+    h2 = _cget(h, i, j, ny, nx)
+    h3 = _cget(h, i, j + 1, ny, nx)
+    wl = _dryfactor(h1, h0, h2, dry)  # left cell (j-1)
+    wr = _dryfactor(h2, h1, h3, dry)  # right cell (j)
+
     # Left cell (j-1) reconstructed to its right face; right cell (j) to its left.
-    eta_l = e1 + 0.5 * _minmod(e1 - e0, e2 - e1)
-    eta_r = e2 - 0.5 * _minmod(e2 - e1, e3 - e2)
-    zf_l = z1 + 0.5 * _minmod(z1 - z0, z2 - z1)
-    zf_r = z2 - 0.5 * _minmod(z2 - z1, z3 - z2)
-    u_l = u1 + 0.5 * _minmod(u1 - u0, u2 - u1)
-    u_r = u2 - 0.5 * _minmod(u2 - u1, u3 - u2)
-    v_l = v1 + 0.5 * _minmod(v1 - v0, v2 - v1)
-    v_r = v2 - 0.5 * _minmod(v2 - v1, v3 - v2)
+    eta_l = e1 + 0.5 * wl * _minmod(e1 - e0, e2 - e1)
+    eta_r = e2 - 0.5 * wr * _minmod(e2 - e1, e3 - e2)
+    zf_l = z1 + 0.5 * wl * _minmod(z1 - z0, z2 - z1)
+    zf_r = z2 - 0.5 * wr * _minmod(z2 - z1, z3 - z2)
+    u_l = u1 + 0.5 * wl * _minmod(u1 - u0, u2 - u1)
+    u_r = u2 - 0.5 * wr * _minmod(u2 - u1, u3 - u2)
+    v_l = v1 + 0.5 * wl * _minmod(v1 - v0, v2 - v1)
+    v_r = v2 - 0.5 * wr * _minmod(v2 - v1, v3 - v2)
 
     h_l = wp.max(eta_l - zf_l, 0.0)
     h_r = wp.max(eta_r - zf_r, 0.0)
@@ -283,6 +311,7 @@ def _flux_x(
 
 @wp.kernel
 def _flux_y(
+    h: wp.array2d(dtype=wp.float32),
     eta: wp.array2d(dtype=wp.float32),
     z: wp.array2d(dtype=wp.float32),
     uvel: wp.array2d(dtype=wp.float32),
@@ -319,15 +348,23 @@ def _flux_y(
     v2 = _cget(vvel, i, j, ny, nx)
     v3 = _cget(vvel, i + 1, j, ny, nx)
 
-    eta_l = e1 + 0.5 * _minmod(e1 - e0, e2 - e1)
-    eta_r = e2 - 0.5 * _minmod(e2 - e1, e3 - e2)
-    zf_l = z1 + 0.5 * _minmod(z1 - z0, z2 - z1)
-    zf_r = z2 - 0.5 * _minmod(z2 - z1, z3 - z2)
+    # First-order at dry-adjacent cells (see _dryfactor); rows i-2..i+1.
+    h0 = _cget(h, i - 2, j, ny, nx)
+    h1 = _cget(h, i - 1, j, ny, nx)
+    h2 = _cget(h, i, j, ny, nx)
+    h3 = _cget(h, i + 1, j, ny, nx)
+    wl = _dryfactor(h1, h0, h2, dry)  # left cell (i-1)
+    wr = _dryfactor(h2, h1, h3, dry)  # right cell (i)
+
+    eta_l = e1 + 0.5 * wl * _minmod(e1 - e0, e2 - e1)
+    eta_r = e2 - 0.5 * wr * _minmod(e2 - e1, e3 - e2)
+    zf_l = z1 + 0.5 * wl * _minmod(z1 - z0, z2 - z1)
+    zf_r = z2 - 0.5 * wr * _minmod(z2 - z1, z3 - z2)
     # Normal velocity is v; transverse is u.
-    vn_l = v1 + 0.5 * _minmod(v1 - v0, v2 - v1)
-    vn_r = v2 - 0.5 * _minmod(v2 - v1, v3 - v2)
-    ut_l = u1 + 0.5 * _minmod(u1 - u0, u2 - u1)
-    ut_r = u2 - 0.5 * _minmod(u2 - u1, u3 - u2)
+    vn_l = v1 + 0.5 * wl * _minmod(v1 - v0, v2 - v1)
+    vn_r = v2 - 0.5 * wr * _minmod(v2 - v1, v3 - v2)
+    ut_l = u1 + 0.5 * wl * _minmod(u1 - u0, u2 - u1)
+    ut_r = u2 - 0.5 * wr * _minmod(u2 - u1, u3 - u2)
 
     h_l = wp.max(eta_l - zf_l, 0.0)
     h_r = wp.max(eta_r - zf_r, 0.0)
@@ -344,6 +381,7 @@ def _flux_y(
 
 @wp.kernel
 def _accumulate(
+    h: wp.array2d(dtype=wp.float32),
     eta: wp.array2d(dtype=wp.float32),
     z: wp.array2d(dtype=wp.float32),
     fx_h: wp.array2d(dtype=wp.float32),
@@ -361,6 +399,7 @@ def _accumulate(
     nx: wp.int32,
     dx: wp.float32,
     g: wp.float32,
+    dry: wp.float32,
 ):
     """Sum x/y flux divergences plus the centered bed-slope source -> ``dU/dt``."""
     i, j = wp.tid()
@@ -369,13 +408,23 @@ def _accumulate(
     # Mass: net flux through the four faces.
     dh[i, j] = -((fx_h[i, j + 1] - fx_h[i, j]) + (fy_h[i + 1, j] - fy_h[i, j])) * inv_dx
 
+    # Wet/dry slope gates -- read from the SAME state ``h`` the flux kernels gate on
+    # (via ``_cget(h, ...)``), so the first-order drop is byte-identical between the
+    # source and the Audusse flux corrections. Gating on ``eta - z`` instead would
+    # differ by ~ULP(z) in float32 (eta was formed as h+z), letting a marginal cell
+    # be 2nd-order in the flux but 1st-order here -> a broken telescoping and an
+    # O(0.1 m/s) residual at the shoreline. Same array => same gate, exactly.
+    hg = _cget(h, i, j, ny, nx)
+    wx = _dryfactor(hg, _cget(h, i, j - 1, ny, nx), _cget(h, i, j + 1, ny, nx), dry)
+    wy = _dryfactor(hg, _cget(h, i - 1, j, ny, nx), _cget(h, i + 1, j, ny, nx), dry)
+
     # x-momentum (hu): normal flux through x-faces + transverse flux through y-faces
     # + the x centered bed-slope source.
-    sz_x = _minmod(
+    sz_x = wx * _minmod(
         _cget(z, i, j, ny, nx) - _cget(z, i, j - 1, ny, nx),
         _cget(z, i, j + 1, ny, nx) - _cget(z, i, j, ny, nx),
     )
-    se_x = _minmod(
+    se_x = wx * _minmod(
         _cget(eta, i, j, ny, nx) - _cget(eta, i, j - 1, ny, nx),
         _cget(eta, i, j + 1, ny, nx) - _cget(eta, i, j, ny, nx),
     )
@@ -388,11 +437,11 @@ def _accumulate(
 
     # y-momentum (hv): normal flux through y-faces + transverse flux through x-faces
     # + the y centered bed-slope source.
-    sz_y = _minmod(
+    sz_y = wy * _minmod(
         _cget(z, i, j, ny, nx) - _cget(z, i - 1, j, ny, nx),
         _cget(z, i + 1, j, ny, nx) - _cget(z, i, j, ny, nx),
     )
-    se_y = _minmod(
+    se_y = wy * _minmod(
         _cget(eta, i, j, ny, nx) - _cget(eta, i - 1, j, ny, nx),
         _cget(eta, i + 1, j, ny, nx) - _cget(eta, i, j, ny, nx),
     )
@@ -466,17 +515,22 @@ def _friction(
     dt: wp.float32,
     dry: wp.float32,
 ):
-    """Semi-implicit Manning friction on the cell momentum (HANDOFF §8)."""
+    """Semi-implicit Manning friction on the cell momentum (HANDOFF §8).
+
+    Shares one definition of the denominator ``D`` with the LI scheme via
+    :func:`solver.core.friction.manning_denominator`. The two are algebraically
+    identical: LI passes discharge ``q = h*|vel|`` over ``h^(7/3)``; the cell
+    momentum magnitude ``mom = sqrt(hu^2+hv^2)`` *is* that ``q``, and
+    ``|q|/h^(7/3) = |vel|/h^(4/3)`` -- the momentum-form Manning slope.
+    """
     i, j = wp.tid()
     hh = h[i, j]
     if hh <= dry:
         hu[i, j] = 0.0
         hv[i, j] = 0.0
         return
-    mom = wp.sqrt(hu[i, j] * hu[i, j] + hv[i, j] * hv[i, j])  # h * |velocity|
-    speed = mom / hh  # |velocity|
-    nn = n[i, j]
-    denom = 1.0 + g * nn * nn * dt * speed / wp.pow(hh, 4.0 / 3.0)
+    mom = wp.sqrt(hu[i, j] * hu[i, j] + hv[i, j] * hv[i, j])  # = discharge |q| = h*|vel|
+    denom = manning_denominator(mom, hh, n[i, j], g, dt)
     hu[i, j] = hu[i, j] / denom
     hv[i, j] = hv[i, j] / denom
 
@@ -547,6 +601,7 @@ def _eval_L(state: State, h: wp.array, hu: wp.array, hv: wp.array) -> None:
         _flux_x,
         dim=g.qx_shape,
         inputs=[
+            h,
             state.eta,
             state.z,
             s.uvel,
@@ -566,6 +621,7 @@ def _eval_L(state: State, h: wp.array, hu: wp.array, hv: wp.array) -> None:
         _flux_y,
         dim=g.qy_shape,
         inputs=[
+            h,
             state.eta,
             state.z,
             s.uvel,
@@ -585,6 +641,7 @@ def _eval_L(state: State, h: wp.array, hu: wp.array, hv: wp.array) -> None:
         _accumulate,
         dim=g.shape,
         inputs=[
+            h,
             state.eta,
             state.z,
             s.fx_h,
@@ -602,6 +659,7 @@ def _eval_L(state: State, h: wp.array, hu: wp.array, hv: wp.array) -> None:
             g.nx,
             dxf,
             gf,
+            dryf,
         ],
         device=state.device,
     )

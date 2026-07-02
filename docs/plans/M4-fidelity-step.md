@@ -165,6 +165,23 @@ Ships as its own commit/PR, green on `ruff` + `pytest`, before touching the sche
 7. **Wet/dry + semi-implicit friction** — `H_DRY` handling, non-negativity guard,
    reuse `friction.py`; unit tests + a Manning normal-depth check on HLLC (parallels the
    M3 channel test, now on the fidelity scheme).
+   - **Done.** `_friction` now shares `friction.manning_denominator` with LI (same
+     Manning slope; algebraically identical). **Found and fixed a real
+     well-balancedness bug the step-6 keystone missed:** the fully-wet lake-at-rest
+     never exercised a wet/dry front, and MUSCL reconstruction across a shoreline
+     (a dry neighbour injects a spurious water/bed slope into the minmod stencil) spun
+     a smooth bowl up to ~20 m/s. Fix = drop to first-order at any cell adjacent to a
+     dry cell (`hllc._dryfactor`), applied *identically* in the flux and source kernels
+     so first-order Audusse's exact balance is preserved; fully-wet interiors are
+     bitwise-unchanged (dam-break/step-6 unaffected). New discriminating gate
+     `test_shoreline_lake_at_rest_on_bumpy_bed` (dry islands, 115 internal shorelines,
+     stays at rest to the float32 floor ~1e-5, was ~20 m/s pre-fix); plus puddle,
+     dry-bed Ritter, and friction-damping tests. **Manning normal-depth check
+     deferred to step 9** (confirmed with the user): it needs a spatially-varying
+     steady flow, which develops a boundary-driven drawdown under HLLC's
+     transmissive-on-`eta` edges (a uniform-depth flow on a slope has non-uniform
+     `eta`; extrapolating the ghost bed does not fix it). It lands with the step-9
+     inflow/open ghost-cell BCs, exactly as the M3 channel test uses.
 8. **SSP-RK2** time integration + **dam-break on HLLC** — parametrize
    `validation/test_dam_break.py` over scheme so it guards **both** LI and HLLC; HLLC
    nRMSE must match or beat LI's 0.074 and improve shock-front placement.
@@ -191,7 +208,8 @@ the store contract is scheme-agnostic).
 |---|---|---|
 | **Lake-at-rest** | analytical (stays flat) | `max|u,v|` below tol on arbitrary bed — **hard, discriminating** |
 | **Dam-break (HLLC)** | analytical Stoker | nRMSE ≤ LI's 0.074; front placement improved |
-| **Manning normal depth (HLLC)** | analytical | within ~1% (parallels M3 channel) |
+| **Manning normal depth (HLLC)** | analytical | within ~1% (parallels M3 channel) — **deferred to step 9** (needs inflow/open ghost-cell BCs; transmissive edges draw down a sloped uniform flow) |
+| **Shoreline lake-at-rest (bumpy bed, dry islands)** | analytical (stays flat) | `max|u,v|` at float32 floor — **hard, discriminating** wet/dry well-balancedness (step 7) |
 | **EA Test 1 / Test 2** | inter-model envelope | qualitative pass vs SC080035 published results |
 | **Global mass balance** | always-on | `rel_error < 1e-6` (now peak-floored, §2) |
 
