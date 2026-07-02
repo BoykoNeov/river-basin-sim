@@ -70,6 +70,10 @@ class MassLedger:
     _inflow: _Kahan = field(default_factory=_Kahan)
     _outflow: _Kahan = field(default_factory=_Kahan)
     series: list[MassRecord] = field(default_factory=list)
+    # Largest stored volume seen so far in *this* run (causal -- never a future
+    # value). Floors the relative-error denominator so a drain-to-empty run cannot
+    # trip the gate by denominator collapse (M4 §2); see :meth:`record`.
+    _peak_v: float = 0.0
 
     @classmethod
     def from_state(cls, state: State) -> MassLedger:
@@ -108,13 +112,17 @@ class MassLedger:
         inflow = self._inflow.total
         outflow = self._outflow.total + state.loss_volume(self.cell_area)
         residual = inflow - outflow - (v - self.v0)
-        # M4 watch item: in a drain-to-empty run with no inflow, both abs(inflow) and
-        # abs(v) -> 0, so a tiny *absolute* residual could trip the gate via denominator
-        # collapse rather than physics. It doesn't today (M1-M3 fully-draining tests keep
-        # the residual proportionally small, so rel stays ~0), but M4's benchmark suite
-        # drains domains fully -- add a causal peak-volume floor here (max v seen so far,
-        # keeping filling runs bitwise-identical) once a drain-to-empty gate test exists.
-        denom = max(abs(inflow), abs(v), 1e-12)
+        # Causal peak-volume floor (M4 §2). In a drain-to-empty run with no inflow,
+        # both abs(inflow) and abs(v) -> 0, so a tiny *absolute* residual (float32
+        # flux-divergence roundoff) would trip the relative gate via denominator
+        # collapse rather than physics -- and the EA benchmark suite drains domains
+        # fully. peak_v is the largest stored volume the run has actually held so far
+        # (updated *before* the denom below): it only ever *raises* denom, so
+        # rel_error only ever decreases and every `< gate` test still passes; for a
+        # monotonic-fill run peak_v == v at each record, so reported rel_error is
+        # bitwise-identical to before (M1/M2/M3 filling numbers unchanged).
+        self._peak_v = max(self._peak_v, v)
+        denom = max(abs(inflow), abs(v), self._peak_v, 1e-12)
         rel = abs(residual) / denom
         rec = MassRecord(time, v, inflow, outflow, residual, rel)
         self.series.append(rec)

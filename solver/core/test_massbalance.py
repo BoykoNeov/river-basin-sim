@@ -13,6 +13,7 @@ from solver.core.state import State
 wp.init()
 
 DEV = "cpu"
+_EAST_OPEN = {"east": "open", "west": "closed", "north": "closed", "south": "closed"}
 
 
 def test_closed_no_source_conserves_to_gate():
@@ -137,6 +138,49 @@ def test_rain_field_adds_expected_volume():
         ledger.add_inflow(rain_sum_m_s * dt * st.grid.cell_area)
     ledger.record(st, dt * nsteps)
     assert ledger.max_rel_error < MASS_GATE
+
+
+def test_drain_to_empty_holds_the_gate():
+    """A run that drains fully to empty must not trip the gate by denominator collapse.
+
+    This is the M4 §2 hardening case (the EA suite drains domains). Water starts as
+    a sheet on a bed sloping toward an open edge -- so it flows out via the flux
+    update (leaving a tiny *nonzero* float32 flux-divergence roundoff in the global
+    residual) -- and a moderate infiltration sink guarantees the domain empties to
+    ``h == 0`` (so ``sum(h) -> 0``). At that point ``abs(inflow)`` and ``abs(v)``
+    both collapse toward 0, so *without* the causal peak-volume floor the small
+    absolute residual is divided by a near-zero denominator and blows the relative
+    error past the gate -- physics fine, denominator collapse. The peak floor keeps
+    the denominator at the largest volume the run actually held, so the gate holds.
+    """
+    ny, nx, dx = 16, 24, 10.0
+    xx = np.broadcast_to(np.arange(nx), (ny, nx))
+    bed = ((nx - 1 - xx) * dx * 0.02).astype(np.float32)  # 2% slope toward east
+    st = State.from_bed(bed, dx=dx, depth=0.5, manning=0.03, device=DEV)
+    st.set_open_boundaries(_EAST_OPEN)
+    st.set_infiltration(np.full((ny, nx), 2.0e-4, dtype=np.float32))  # empties the pools
+    ledger = MassLedger.from_state(st)
+    v0 = ledger.v0
+
+    t = 0.0
+    for _ in range(4000):
+        dt = compute_dt(st, alpha=0.7, dt_max=5.0)
+        step(st, dt=dt)
+        t += dt
+        if float(st.h.numpy().max()) < 1e-9:  # fully drained
+            break
+    rec = ledger.record(st, t)
+
+    h = st.h.numpy()
+    assert np.isfinite(h).all()
+    assert float(h.max()) < 1e-6, f"did not drain to empty: h.max()={h.max():.3e}"
+    # The domain really emptied: abs(v) collapsed far below the volume it once held.
+    assert rec.volume < 1e-9 * v0
+    # ...yet the gate holds -- this is the whole point of the peak-volume floor.
+    assert ledger.max_rel_error < MASS_GATE, (
+        f"drain-to-empty tripped the gate ({ledger.max_rel_error:.2e}); "
+        "denominator collapse -- the peak-volume floor is missing or wrong"
+    )
 
 
 def test_kahan_beats_naive_sum():
