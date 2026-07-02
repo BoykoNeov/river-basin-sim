@@ -10,10 +10,17 @@ gates:
   :mod:`solver.core.grid`). A basin sloping toward the *one* open edge drains
   through *that* edge only, depth stays non-negative, and -- the load-bearing check
   -- the float64 mass gate holds, which it can only do if the banked outflow matches
-  the depth the flux divergence actually removed. Kept in the clamp-free regime
-  (every cell stays wet): the ``wp.max(h,0)`` positivity clamp is non-conservative,
-  so banking is exact *only* while it never fires (a drain-to-empty run trips it --
-  a known limitation carried to the EA cases, M4 step 10).
+  the depth the flux divergence actually removed. Kept in the wet (``h > H_DRY``)
+  regime so it isolates the *banking sign*, independent of the positivity limiter.
+
+* **Drain to empty** -- the discriminating counterpart: a tilted plane drains to
+  near-empty (~96% of cells cross below ``H_DRY``), the regime the old
+  non-conservative ``wp.max(h, 0)`` clamp broke on (~6.5e-2 relative, ~5 orders over
+  the gate). The M4 step-10 donor-cell mass limiter
+  (:func:`solver.core.hllc._mass_beta`) caps each cell's outflow and the banking
+  reads the limited flux, so the gate now holds at float32 round-off through a full
+  drain. This is the step-10 prerequisite the EA benchmark cases (which drain
+  domains) depend on.
 
 * **Closed-wall reflection** -- the discriminating test the old transmissive-
   everywhere behaviour fails: a slab thrown at a closed box piles against the wall
@@ -66,8 +73,9 @@ def test_hllc_each_open_edge_drains(edge):
 
     The per-edge banking-sign check. A wrong sign on any edge would either not
     drain (mass piles against a wall-behaving open edge) or break the mass gate
-    (banked outflow not matching the field). Stops while every cell is still wet so
-    the positivity clamp never fires and banking stays exact.
+    (banked outflow not matching the field). Stops while every cell is still wet, so
+    this isolates the banking *sign* from the positivity limiter; the full drain (and
+    the limiter it needs) is :func:`test_hllc_drains_to_empty_mass_conservative`.
     """
     ny, nx, dx = 24, 24, 10.0
     bed = _sloped_toward(ny, nx, dx, edge, slope=0.005)
@@ -90,14 +98,62 @@ def test_hllc_each_open_edge_drains(edge):
     )
     assert np.isfinite(h).all()
     assert h.min() >= 0.0, f"{edge}: depth went negative to {h.min():.3e}"
-    # Clamp-free regime => banking is exact => the mass gate is a real check here,
-    # not a bookkeeping identity (a fired clamp would break it, as a drain-to-empty
-    # run does). Assert the domain stayed wet so the guarantee is explicit.
-    assert h.min() > H_DRY, f"{edge}: a cell dried ({h.min():.3e}); clamp may have fired"
+    # Wet regime => this gates the banking *sign* alone (the full-drain positivity
+    # path is the sibling test). Assert the domain stayed wet so that intent is explicit.
+    assert h.min() > H_DRY, f"{edge}: a cell dried ({h.min():.3e}); use the drain-to-empty test"
     assert ledger.max_rel_error < MASS_GATE, f"{edge}: mass gate {ledger.max_rel_error:.2e}"
     # Water genuinely left through this edge (>half the domain volume drained out).
     assert rec.outflow_cum > 0.5 * v0, f"{edge}: only {rec.outflow_cum:.1f}/{v0:.1f} m^3 left"
     assert rec.volume < 0.5 * v0
+
+
+def test_hllc_drains_to_empty_mass_conservative():
+    """A basin drains ~fully through an open edge and the mass gate still holds.
+
+    The discriminating counterpart to :func:`test_hllc_each_open_edge_drains`, which
+    stays clamp-free (``h.min() > H_DRY``) so it never exercises the wetting-front
+    positivity path. This one drains a tilted plane to *near-empty*: almost every
+    cell crosses below ``H_DRY`` -- the exact regime the old non-conservative
+    ``wp.max(h, 0)`` clamp broke on (a full drain measured ~6.5e-2 relative, ~5
+    orders over the gate). It passes only because the M4 step-10 donor-cell limiter
+    (:func:`solver.core.hllc._mass_beta`) caps each cell's mass outflow *and* the
+    open-edge banking reads that limited flux -- so what the ledger books as leaving
+    matches the depth the divergence removed, cell by cell, even as cells dry.
+    """
+    ny, nx, dx = 24, 24, 10.0
+    bed = _sloped_toward(ny, nx, dx, "east", slope=0.02)
+    st = State.from_bed(bed, dx=dx, depth=0.4, manning=0.025, device=DEV)
+    st.set_open_boundaries({e: ("open" if e == "east" else "closed") for e in _EDGES})
+    ledger = MassLedger.from_state(st)
+    v0 = ledger.v0
+
+    t = 0.0
+    for k in range(400):
+        dt = hllc.compute_dt(st, alpha=0.45, dt_max=5.0)
+        hllc.step(st, dt=dt)
+        t += dt
+        if k % 40 == 0:  # sample the gate *during* the drain, not only at the empty end
+            ledger.record(st, t)
+    rec = ledger.record(st, t)
+
+    h = st.h.numpy()
+    n_dry = int((h < H_DRY).sum())
+    print(
+        f"\n[hllc drain-to-empty] vol/v0={rec.volume / v0:.4f} out/v0={rec.outflow_cum / v0:.4f}"
+        f" hmin={h.min():.3e} n_dry={n_dry}/{h.size} mass={ledger.max_rel_error:.2e}"
+    )
+    assert np.isfinite(h).all()
+    assert h.min() >= 0.0, f"depth went negative to {h.min():.3e}"
+    # The discriminating regime: this run *must* drive most of the domain dry -- that
+    # is what fires the wetting-front positivity path the clamp mishandled. (The step-9
+    # drain test asserts the opposite, h.min() > H_DRY, to stay clamp-free.)
+    assert n_dry > 0.5 * h.size, f"only {n_dry}/{h.size} cells dried; not a drain-to-empty run"
+    assert rec.volume < 0.05 * v0, f"basin did not empty: vol/v0={rec.volume / v0:.3f}"
+    assert rec.outflow_cum > 0.9 * v0, f"only {rec.outflow_cum:.1f}/{v0:.1f} m^3 drained out"
+    # The load-bearing check: the gate holds through a full drain. With the old clamp
+    # this was ~6.5e-2; the conservative limiter + banking keep it at float32 flux
+    # round-off (peak-volume-floored denominator, §2).
+    assert ledger.max_rel_error < MASS_GATE, f"mass gate broke on drain: {ledger.max_rel_error:.2e}"
 
 
 def test_hllc_closed_wall_reflects_and_conserves_mass():

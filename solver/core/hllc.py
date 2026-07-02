@@ -40,15 +40,27 @@ divergence is accumulated:
     pressure. At rest ``u = 0`` so the reflected flux is *identical* to the
     transmissive one -- lake-at-rest is preserved by construction, the closed wall
     only changes anything in motion.
-  * **open** edge -> transmissive (the clamped flux already computed) **plus mass
-    banking**: the depth crossing the boundary face over the SSP-RK2 step is
+  * **open** edge -> transmissive (the flux already computed) **plus mass banking**:
+    the depth crossing the boundary face over the SSP-RK2 step is
     ``0.5*dt*(F_stage1 + F_stage2)/dx`` (the Heun weights; ``loss_cum`` holds a
     per-cell depth), banked into ``state.loss_cum`` so the float64 mass ledger stays
-    balanced when water actually leaves. This is exact *provided the depth clamp
-    never fires on a
-    boundary cell*; it does not for a steady flow (gated in validation) but will in
-    a drain-to-empty run (the EA cases, M4 step 10) -- a known limitation carried
-    forward.
+    balanced when water actually leaves. The banking reads the *limited* boundary
+    flux (see below), so it stays exact even in a drain-to-empty run.
+
+**Mass-conservative positivity (M4 step 10).** A cell may not release more water
+than it holds. Instead of the old non-conservative ``wp.max(h, 0)`` clamp -- which
+invented mass every time it fired and broke the ledger/banking on a drain
+(~6.5e-2 relative on a drain-to-empty run) -- each RK stage caps the mass outflow
+with a donor-cell limiter ported from LI (:func:`_mass_beta` / :func:`_limit_fx` /
+:func:`_limit_fy`): scale each mass face by its upwind cell's ``beta = min(1, h /
+requested_outflow)``, so ``h + dt*L >= 0`` for that stage and, by the SSP convex
+combination, ``h^{n+1} >= 0``. The shared face is scaled once (by its donor) so
+mass is conserved exactly and the open-edge banking reads the same limited flux.
+Only the mass flux is scaled -- momentum flux is untouched, which keeps
+lake-at-rest exact (at rest ``fx_h == 0`` so ``beta == 1``) and in-regime runs
+bitwise. The retained ``wp.max(h, 0)`` in the RK kernels is now only a sub-ULP
+round-off net (and a diagnostic: a genuine limiter gap would surface *as* a mass
+gate failure, not a silent negative).
 
 ``fixed_stage`` (a prescribed-surface Dirichlet ghost) is additive to this
 structure but needs a numeric per-edge config extension; deferred (plan §6,
@@ -548,6 +560,102 @@ def _bank_y_south(
     loss_cum[ny - 1, j] = loss_cum[ny - 1, j] + wt * wp.float64(fy_h[ny, j])
 
 
+# --------------------------------------------------------------------------- #
+# Mass-conservative positivity limiter (M4 step 10). Ported from the LI donor-  #
+# cell beta (local_inertial.compute_outflow_beta + limit_qx/qy): a cell may not #
+# release more water than it holds, so scale each *mass* face by its single      #
+# donor (upwind) cell's beta = min(1, h / requested_outflow_depth). Because the  #
+# shared face is scaled once, by its donor, both neighbours see the same value   #
+# -> mass is conserved exactly and the open-boundary banking (which reads the    #
+# limited flux) stays exact. This *replaces* the non-conservative wp.max(h,0)    #
+# clamp as the positivity mechanism: the clamp invented mass every time it fired #
+# (breaking the ledger/banking on a drain-to-empty run, ~6.5e-2); the limiter    #
+# keeps h + dt*L >= 0 per RK stage so the clamp is now only a sub-ULP net.        #
+#                                                                               #
+# Only the mass flux fx_h/fy_h is scaled -- NOT the momentum flux (fx_mn/fx_mt). #
+# That mirrors LI (whose qx/qy *is* the mass flux) and is what keeps the scheme   #
+# well-balanced: at rest fx_h == 0 -> beta == 1 -> nothing is scaled, so         #
+# lake-at-rest and in-regime dam-break stay bitwise (x1.0f is exact). Momentum    #
+# telescopes regardless of beta, so conservation is unaffected; the only cost is  #
+# a possible velocity spike where a draining donor's momentum flux outruns its    #
+# capped mass flux (self-limited near dry by hydrostatic reconstruction).        #
+# --------------------------------------------------------------------------- #
+@wp.kernel
+def _mass_beta(
+    h: wp.array2d(dtype=wp.float32),
+    fx_h: wp.array2d(dtype=wp.float32),
+    fy_h: wp.array2d(dtype=wp.float32),
+    dx: wp.float32,
+    dt: wp.float32,
+    beta: wp.array2d(dtype=wp.float32),
+):
+    """Per-cell outflow-limiter factor ``beta in [0,1]`` from the four mass faces.
+
+    Sums the magnitudes of the *outgoing* mass fluxes (left face outgoing when
+    ``fx_h[i,j] < 0``, right when ``fx_h[i,j+1] > 0``; top/bottom likewise on
+    ``fy_h``) into a requested outflow depth ``dt/dx * Q_out`` and returns
+    ``min(1, h/Q_out_depth)`` (1.0 if the cell has no net outflow). Boundary faces
+    are included -- an open edge's transmissive face is a real outflow to cap.
+    """
+    i, j = wp.tid()
+    q_out = wp.float32(0.0)
+    fl = fx_h[i, j]  # left x-face: outgoing (-x) when negative
+    if fl < 0.0:
+        q_out = q_out - fl
+    fr = fx_h[i, j + 1]  # right x-face: outgoing (+x) when positive
+    if fr > 0.0:
+        q_out = q_out + fr
+    ft = fy_h[i, j]  # top y-face: outgoing (-y) when negative
+    if ft < 0.0:
+        q_out = q_out - ft
+    fb = fy_h[i + 1, j]  # bottom y-face: outgoing (+y) when positive
+    if fb > 0.0:
+        q_out = q_out + fb
+
+    out_depth = dt / dx * q_out
+    if out_depth > 0.0:
+        beta[i, j] = wp.clamp(h[i, j] / out_depth, 0.0, 1.0)
+    else:
+        beta[i, j] = 1.0
+
+
+@wp.kernel
+def _limit_fx(fx_h: wp.array2d(dtype=wp.float32), beta: wp.array2d(dtype=wp.float32), nx: wp.int32):
+    """Scale each x mass face by its donor cell's beta. Launched over (ny, nx+1).
+
+    Donor = the upwind cell: ``+fx_h`` flows +x so its donor is the left cell
+    ``(i, j-1)``, ``-fx_h`` the right cell ``(i, j)``. Boundary faces are handled by
+    the bounds guards: a face whose donor is the (nonexistent) ghost across the edge
+    is an *inflow* and is left unscaled (no interior cell drains through it).
+    """
+    i, j = wp.tid()
+    q = fx_h[i, j]
+    if q > 0.0:
+        if j >= 1:  # donor is interior cell (i, j-1); j==0 is inflow from the west ghost
+            fx_h[i, j] = q * beta[i, j - 1]
+    elif q < 0.0:
+        if j <= nx - 1:  # donor is interior cell (i, j); j==nx is inflow from the east ghost
+            fx_h[i, j] = q * beta[i, j]
+
+
+@wp.kernel
+def _limit_fy(fy_h: wp.array2d(dtype=wp.float32), beta: wp.array2d(dtype=wp.float32), ny: wp.int32):
+    """Scale each y mass face by its donor cell's beta. Launched over (ny+1, nx).
+
+    Donor = the upwind cell: ``+fy_h`` flows +y so its donor is the top cell
+    ``(i-1, j)``, ``-fy_h`` the bottom cell ``(i, j)``. Bounds guards leave the
+    boundary *inflow* faces (donor across the edge) unscaled, as in :func:`_limit_fx`.
+    """
+    i, j = wp.tid()
+    q = fy_h[i, j]
+    if q > 0.0:
+        if i >= 1:  # donor is interior cell (i-1, j); i==0 is inflow from the north ghost
+            fy_h[i, j] = q * beta[i - 1, j]
+    elif q < 0.0:
+        if i <= ny - 1:  # donor is interior cell (i, j); i==ny is inflow from the south ghost
+            fy_h[i, j] = q * beta[i, j]
+
+
 @wp.kernel
 def _accumulate(
     h: wp.array2d(dtype=wp.float32),
@@ -636,7 +744,12 @@ def _rk_stage1(
     dt: wp.float32,
     dry: wp.float32,
 ):
-    """Euler predictor ``U1 = U^n + dt L(U^n)`` (clamp h>=0, zero dry momentum)."""
+    """Euler predictor ``U1 = U^n + dt L(U^n)`` (zero dry momentum).
+
+    ``L`` is already positivity-limited for this ``dt`` (:func:`_eval_L`), so
+    ``h + dt*dh >= 0`` up to float round-off; the ``wp.max(., 0)`` is only a sub-ULP
+    net (it no longer invents mass -- that was the pre-step-10 clamp).
+    """
     i, j = wp.tid()
     hh = wp.max(h[i, j] + dt * dh[i, j], 0.0)
     h1[i, j] = hh
@@ -662,7 +775,12 @@ def _rk_stage2(
     dt: wp.float32,
     dry: wp.float32,
 ):
-    """Heun corrector ``U^{n+1} = 1/2 (U^n + U1 + dt L(U1))`` (in place on U^n)."""
+    """Heun corrector ``U^{n+1} = 1/2 (U^n + U1 + dt L(U1))`` (in place on U^n).
+
+    ``L(U1)`` is positivity-limited from ``h1`` (:func:`_eval_L`), so
+    ``h1 + dt*dh >= 0``; with ``h^n >= 0`` the half-sum is ``>= 0`` and the
+    ``wp.max(., 0)`` is only a sub-ULP net (SSP convex-combination positivity).
+    """
     i, j = wp.tid()
     hh = wp.max(0.5 * (h[i, j] + h1[i, j] + dt * dh[i, j]), 0.0)
     h[i, j] = hh
@@ -832,16 +950,27 @@ def _bank_open_outflow(state: State, wt: float) -> None:
         )
 
 
-def _eval_L(state: State, h: wp.array, hu: wp.array, hv: wp.array) -> None:
+def _eval_L(state: State, h: wp.array, hu: wp.array, hv: wp.array, dt: float) -> None:
     """Evaluate the spatial operator ``L(U) = dU/dt`` from (h, hu, hv) into scratch.
 
     Closed-edge walls are applied to the boundary face fluxes before the divergence
     (:func:`_apply_walls`); open edges keep the transmissive flux and are banked by
     the caller after this returns (:func:`_bank_open_outflow`).
+
+    **The mass divergence is limited to be positivity-preserving for this stage.**
+    After the fluxes (interior + walls) are formed, the donor-cell limiter
+    (:func:`_mass_beta` / :func:`_limit_fx` / :func:`_limit_fy`) scales each mass face
+    by its donor's ``beta`` so that ``h + dt*dh >= 0`` for the given ``h``/``dt`` --
+    which is why ``L`` now takes ``dt`` (it is a forward-Euler-safe operator, not the
+    pure continuum ``dU/dt``). The limiter runs *before* :func:`_accumulate`, so both
+    the mass divergence and the open-edge banking (:func:`_bank_open_outflow`, called
+    by :func:`step` after this returns) read the limited flux. It is inert
+    (``beta == 1``, bitwise) whenever no cell is over-drained -- at rest and in
+    regime. Momentum flux is left unlimited (mass-only; see the limiter kernel note).
     """
     g = state.grid
     s: _HllcScratch = state.hllc
-    dxf, gf, dryf = float(g.dx), float(GRAVITY), float(H_DRY)
+    dxf, dtf, gf, dryf = float(g.dx), float(dt), float(GRAVITY), float(H_DRY)
     wp.launch(
         _primitives,
         dim=g.shape,
@@ -891,6 +1020,19 @@ def _eval_L(state: State, h: wp.array, hu: wp.array, hv: wp.array) -> None:
     # Closed-edge reflective walls overwrite their boundary face fluxes; open edges
     # keep the transmissive flux computed above (banked by the caller).
     _apply_walls(state, h)
+    # Mass-conservative positivity limiter (M4 step 10): cap each cell's mass
+    # outflow to what it holds, so h + dt*dh >= 0 this stage (replaces the
+    # non-conservative wp.max(h,0) clamp). Scales fx_h/fy_h in place before the
+    # divergence; the banking after _eval_L reads the limited flux. Inert (beta==1)
+    # in regime, so lake-at-rest / dam-break are bitwise-unchanged.
+    wp.launch(
+        _mass_beta,
+        dim=g.shape,
+        inputs=[h, s.fx_h, s.fy_h, dxf, dtf, state.beta],
+        device=state.device,
+    )
+    wp.launch(_limit_fx, dim=g.qx_shape, inputs=[s.fx_h, state.beta, g.nx], device=state.device)
+    wp.launch(_limit_fy, dim=g.qy_shape, inputs=[s.fy_h, state.beta, g.ny], device=state.device)
     wp.launch(
         _accumulate,
         dim=g.shape,
@@ -948,7 +1090,7 @@ def step(
     # 0.5*dt*(fx_h*inv_dx) over the two Heun stages, so the stage weight is
     # 0.5*dt/dx (NOT *dx -- that would over-bank by dx^2).
     wt = 0.5 * dtf / dxf
-    _eval_L(state, state.h, state.hu, state.hv)
+    _eval_L(state, state.h, state.hu, state.hv, dtf)
     _bank_open_outflow(state, wt)
     wp.launch(
         _rk_stage1,
@@ -956,7 +1098,7 @@ def step(
         inputs=[state.h, state.hu, state.hv, s.dh, s.dhu, s.dhv, s.h1, s.hu1, s.hv1, dtf, dryf],
         device=state.device,
     )
-    _eval_L(state, s.h1, s.hu1, s.hv1)
+    _eval_L(state, s.h1, s.hu1, s.hv1, dtf)
     _bank_open_outflow(state, wt)
     wp.launch(
         _rk_stage2,
