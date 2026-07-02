@@ -38,8 +38,10 @@ milestone build order — lives in [`HANDOFF.md`](./HANDOFF.md).
 - **Well-balanced Godunov finite-volume with HLLC** (later) — correct shocks and
   transcritical flow; the validatable gold standard.
 - float32 GPU fields with a **float64 / Kahan mass-balance accumulator** as the
-  honest "is this still physical?" gauge. Validated against dam-break (analytical),
-  lake-at-rest (well-balancedness), and the UK EA 2D benchmark suite.
+  honest "is this still physical?" gauge. Validated so far against **dam-break**
+  (analytical Stoker/Ritter) and **channel normal depth** (Manning, within 1%).
+  Lake-at-rest well-balancedness and the UK EA 2D benchmark suite are **planned**
+  (M4), not yet run.
 
 ## Requirements
 
@@ -62,9 +64,13 @@ for your GPU, and round-trips data through Zarr/xarray).
 
 ## Status
 
-**M0 — Foundation, in progress.** The toolchain is proven; the DEM pipeline and a
-static Godot terrain scene are next. See [`docs/plans/`](./docs/plans/) for the
-roadmap (M0–M7) and current milestone plan.
+**M3 — Real scenarios: acceptance met.** The full loop is live end to end —
+configure a scenario (spatially-varying roughness/infiltration fields, spatial
+rainfall, inflow hydrographs, open/free-outflow boundaries), run the GPU
+local-inertial solver with float64/Kahan mass accounting, and explore results in
+the Godot viewer. M0 (DEM pipeline + static terrain), M1 (the solver: water
+moves), and M2 (the file-coupled loop closes) are done. See
+[`docs/plans/`](./docs/plans/) for the roadmap (M0–M7) and per-milestone plans.
 
 ## License
 

@@ -31,7 +31,7 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   scenario into `.zattrs` + a `<store>.provenance.json` sidecar. **Validated:** a
   mild steady channel reaches **Manning normal depth within 1%**; a steep basin
   drains with `h.min() >= 0`. Two GPU demos green (`river_reach` mass 1.24e-7,
-  `spatial_fields` 7.57e-8). 65 tests green. See `docs/plans/M3-real-scenarios.md`.
+  `spatial_fields` 7.57e-8). 82 tests green. See `docs/plans/M3-real-scenarios.md`.
 - **M2 — The loop closes: done.** The §7 contracts
   are live end to end: **§7.1 config-in** (`solver/io/config.py` — TOML → `Scenario`,
   parses the full schema but *rejects* M4/M5 features with a milestone-naming

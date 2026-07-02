@@ -171,9 +171,13 @@ The M3 demo is driven from configs + the validation harness.
       `h.min() >= 0`** (the discriminating check a boundary-face impl would fail).
 - [x] Provenance record round-trips: source + field hashes stable, resolved
       scenario complete; Zarr `.zattrs` + sidecar.
-- [x] `ruff` + `ruff format` clean; `pytest` green (**69 tests**; new field /
+- [x] `ruff` + `ruff format` clean; `pytest` green (**82 tests**; new field /
       infiltration / inflow / open-BC / per-edge / provenance / channel tests, plus
-      inflow-race guard, M3-path determinism, and rate/conversion checks).
+      inflow-race guard, M3-path determinism, and rate/conversion checks). The final
+      13 are post-M3 review hardening: run-parameter validation (positivity +
+      end_time/output_every divisibility, guarded on both the config and bare-CLI
+      construction paths), field NaN/Inf + non-negativity checks, and a
+      SOLVER_VERSION↔pyproject sync test.
 - **Stop and confirm before M4.** ← we are here.
 
 ### Key correction during build (open boundaries)
