@@ -238,6 +238,34 @@ Ships as its own commit/PR, green on `ruff` + `pytest`, before touching the sche
     geometry + tolerances **pinned from SC080035 at implementation** (the EA cases are
     mostly inter-model comparisons, not analytical — assert against the published
     results envelope / qualitative pass criteria, plus the always-on mass gate).
+    - **In progress.** *Prerequisite done* (commit 688b294): the memory-flagged blocker
+      was a non-conservative positivity clamp — the HLLC scheme kept depth ≥ 0 with
+      `wp.max(h, 0)` in the RK stages, which invents mass whenever it fires and breaks
+      the mass ledger / open-boundary banking on any run that drains a cell to dry
+      (a full drain-to-empty measured ~6.5e-2, ~5 orders over the gate). Fixed by
+      porting LI's donor-cell β to the HLLC **mass** flux (`hllc._mass_beta` /
+      `_limit_fx` / `_limit_fy`): each mass face is scaled by its upwind cell's
+      `β = min(1, h/out_depth)`, so `h + dt·L ≥ 0` per RK stage (SSP ⇒ `h^{n+1} ≥ 0`),
+      mass is conserved exactly (shared face scaled once, by its donor), and the
+      banking reads the limited flux. Mass-only (momentum untouched) → lake-at-rest
+      exact, in-regime dam-break bitwise. New gate
+      `test_hllc_drains_to_empty_mass_conservative` drains a plane to 0.4% of V0 with
+      ~96% of cells below `H_DRY` (the clamp regime) → mass 3.0e-8.
+    - **EA Test 2 done** (commit b2fb267): `validation/test_ea_test2.py` — a faithful
+      "flattened egg-box" (2000×2000 m, 4×4 ~0.5 m depressions on a 1:1500/1:3000
+      slope), corner inflow hydrograph (20 m³/s, ~85 min), closed walls, dry start.
+      CI-tractable **40 m / 12 h** (report is 20 m / 48 h). Qualitative + mass gates
+      per §5: mass 2.9e-7 (closed ⇒ stored = injected exactly), non-negative through
+      wetting/drying, depressions fill (11/16 wet, deepest SE 0.28 m), and the
+      up-slope **top-right (NE) depressions stay dry** (the report's points-15/16
+      finding). The full 20 m / 48 h run is deferred to a step-11 GPU demo.
+    - **Second EA case pending a scope call.** The plan's §6 pick was Test 1 + Test 2,
+      but **Test 1 (disconnected water body) requires a time-varying water-level
+      (`fixed_stage`) boundary** — the Dirichlet ghost BC deferred in step 9 (§6 open
+      decision #1). Options: (a) build `fixed_stage` then Test 1; (b) substitute
+      **Test 3** (momentum over a small obstruction — inflow + closed walls only, a
+      strong HLLC-vs-LI inertia discriminator); (c) gate M4 on Test 2 alone. Specs for
+      all three are pinned; awaiting the decision before writing the second case.
 11. **Example scenario(s)** — an `scheme = "hllc_fv"` scenario; regenerate a real
     `results.zarr` + frames; **confirm checkpoint** (mass gate + rendered PNG + a
     side-by-side LI-vs-HLLC on the same scenario).
