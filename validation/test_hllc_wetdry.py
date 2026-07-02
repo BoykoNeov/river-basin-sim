@@ -21,13 +21,12 @@ between -- the ones that turn a Riemann solver into a robust flood scheme:
   toward rest without sign reversal (semi-implicit stability); a frictionless
   control does not decay.
 
-**Deferred to step 9:** the *Manning normal-depth* check (the fidelity analogue of
-the M3 local-inertial channel test). It needs a spatially-varying steady flow, which
-develops a boundary-driven drawdown under HLLC's transmissive-on-``eta`` edges (a
-uniform-depth flow on a slope has non-uniform ``eta``, so zero-gradient at the edge
-is wrong there -- extrapolating the ghost bed does not fix it). The M3 channel test
-sidesteps this with inflow + open ghost-cell BCs; the HLLC parallel lands with those
-in step 9.
+The *Manning normal-depth* fidelity check (the analogue of the M3 local-inertial
+channel test) was deferred from here to step 9 -- it needs the inflow + open
+ghost-cell BCs, without which a sloped steady flow backs up / draws down at the
+transmissive edge. It now lives in
+:mod:`validation.test_hllc_boundaries` alongside the per-edge drain and
+closed-wall-reflection gates.
 """
 
 from __future__ import annotations
@@ -203,13 +202,21 @@ def test_friction_damps_moving_slab_monotonically():
     Semi-implicit Manning divides momentum by ``D >= 1`` each step, so the interior
     velocity is strictly decreasing and never changes sign. The ``n=0`` control
     keeps its velocity: friction is the only thing removing momentum here.
+
+    Open (transmissive) edges are used deliberately -- a uniform slab has zero
+    surface gradient, so transmissive BCs pass it straight through and the only
+    momentum sink is friction. Under the default *closed* walls (§9) the slab would
+    slosh off the downstream wall and decelerate even frictionless, which is real
+    physics but not what this test isolates.
     """
     ny, nx, dx = 4, 40, 10.0
     h0, u0 = 0.5, 2.0
     bed = np.zeros((ny, nx), dtype=np.float32)
+    all_open = {e: "open" for e in ("north", "south", "east", "west")}
 
     def run(n: float) -> list[float]:
         st = State.from_bed(bed, dx=dx, depth=h0, manning=n, device=DEV)
+        st.set_open_boundaries(all_open)
         hllc.arm_hllc(st)
         st.hu.assign(np.full((ny, nx), h0 * u0, dtype=np.float32))
         us = []

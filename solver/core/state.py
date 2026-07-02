@@ -24,12 +24,15 @@ Scratch:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import warp as wp
 
 from solver.core.grid import Grid
+
+# Domain-edge names (row-major (y, x) raster; see solver.core.grid docstring).
+_EDGES = ("north", "south", "east", "west")
 
 
 @dataclass
@@ -59,7 +62,15 @@ class State:
     # (infiltration, open-boundary outflow); summed at output cadence -> outflow.
     loss_cum: wp.array | None = None
     # Names of open (free-outflow) domain edges, subset of {north,south,east,west}.
+    # The local-inertial scheme reads this (its post-interior sink is open-only).
     open_edges: frozenset[str] = frozenset()
+    # Full per-edge boundary map {north,south,east,west} -> "closed"|"open". The
+    # HLLC scheme needs *both* types: a closed edge is a reflective ghost-cell wall
+    # (no through-flux), an open edge is transmissive + mass-banked. Defaults to an
+    # all-closed box, so a State built directly by `from_bed` (dam-break, the
+    # validation harness) is walled without any config call. `set_open_boundaries`
+    # overwrites it from the resolved scenario.
+    boundaries: dict[str, str] = field(default_factory=lambda: {e: "closed" for e in _EDGES})
 
     def set_infiltration(self, infil: np.ndarray) -> None:
         """Attach an infiltration-rate field (m/s) and arm the loss accumulator."""
@@ -77,12 +88,16 @@ class State:
         self.rain = wp.array(np.ascontiguousarray(rain, dtype=np.float32), device=self.device)
 
     def set_open_boundaries(self, boundaries: dict[str, str]) -> None:
-        """Mark which edges are open (free-outflow) and arm the loss accumulator.
+        """Record the per-edge boundary map and arm the loss accumulator if needed.
 
         ``boundaries`` maps edge name -> "closed"|"open" (per :func:`solver.io.config`).
-        Only the open edges are recorded; if none are open this is a no-op.
+        The full map is stored on ``self.boundaries`` (the HLLC scheme walls closed
+        edges and banks open ones); ``open_edges`` is the open subset the LI sink
+        reads. Arming ``loss_cum`` is triggered by any open edge (both schemes bank
+        their outflow there).
         """
-        self.open_edges = frozenset(e for e, v in boundaries.items() if v == "open")
+        self.boundaries = {e: boundaries.get(e, "closed") for e in _EDGES}
+        self.open_edges = frozenset(e for e, v in self.boundaries.items() if v == "open")
         if self.open_edges:
             self._ensure_loss_cum()
 

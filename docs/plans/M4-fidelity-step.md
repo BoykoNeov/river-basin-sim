@@ -202,6 +202,38 @@ Ships as its own commit/PR, green on `ruff` + `pytest`, before touching the sche
      green.
 9. **Ghost-cell BCs** — transmissive + closed for HLLC; **`fixed_stage`** if confirmed
    in scope (§6). Per-edge, mirroring the M3 `[boundaries]` config.
+   - **Done.** HLLC now reads the full per-edge map from `state.boundaries` (added
+     alongside `open_edges`; `State` defaults to an all-closed box so `from_bed`
+     runs are walled without a config call). The interior flux kernels still compute
+     every face transmissively (edge-clamped ghost); two **post-flux per-edge
+     corrections** (not a halo/shape rewrite) then run inside `_eval_L` before the
+     divergence: **closed** = a reflective-wall flux recomputed from an explicit
+     ghost with the normal velocity negated (`hllc._wall_x_west/_east`,
+     `_wall_y_north/_south`) — by antisymmetry the mass **and** transverse flux are
+     exactly 0 and the normal-momentum flux is the wall pressure; **at rest `u=0` so
+     it is identical to transmissive → lake-at-rest preserved by construction** (the
+     wall only bites in motion). **Open** = transmissive + **mass banking**: each
+     SSP-RK2 stage banks `0.5*dt*(F_boundary)/dx` (the Heun weight; `loss_cum` is a
+     per-cell *depth*) into `state.loss_cum`, so the float64 mass ledger stays
+     balanced when water actually leaves. **This banking is exact only while the
+     `wp.max(h,0)` positivity clamp never fires** — true for steady flow, but a
+     drain-to-empty run trips it (a known limitation carried to the EA cases, step
+     10). `fixed_stage` deferred (§6, non-gating; needs a numeric per-edge config
+     extension + re-opens float32 datum-sensitivity). **Manning normal-depth check
+     (deferred from step 7) now lands** (see step 7): a steady head-inflow /
+     open-toe channel on a moderately steep (transcritical, Fr~1.1) bed settles to
+     the analytical wide-channel normal depth to **0.59%** across a dead-uniform
+     interior — far tighter than LI's [0.5, 2.0] band, because HLLC carries the full
+     momentum balance. New gates in `validation/test_hllc_boundaries.py`:
+     per-edge open-drain (parametrized ×4, banking-sign + mass gate, clamp-free),
+     closed-wall reflection (pile-up + velocity reversal + exact mass, with an
+     all-open through-flow contrast), and the Manning channel. Existing HLLC suite
+     unchanged: dam-break stays **bitwise-equal** in the scored region (nRMSE
+     0.0076, front 0.0101 — waves never reach the walls, so reflective vs
+     transmissive is inert there), lake-at-rest 8.5e-6. The frictionless moving-slab
+     control in `test_hllc_wetdry` was switched to explicit open edges (its intent
+     is to isolate friction; under the new default walls it would slosh). 107 tests
+     green.
 10. **EA benchmark subset** — `validation/test_ea_*.py` for the confirmed cases (§6);
     geometry + tolerances **pinned from SC080035 at implementation** (the EA cases are
     mostly inter-model comparisons, not analytical — assert against the published
@@ -223,7 +255,8 @@ the store contract is scheme-agnostic).
 |---|---|---|
 | **Lake-at-rest** | analytical (stays flat) | `max|u,v|` below tol on arbitrary bed — **hard, discriminating** |
 | **Dam-break (HLLC)** | analytical Stoker | nRMSE ≤ LI's 0.074; front placement improved |
-| **Manning normal depth (HLLC)** | analytical | within ~1% (parallels M3 channel) — **deferred to step 9** (needs inflow/open ghost-cell BCs; transmissive edges draw down a sloped uniform flow) |
+| **Manning normal depth (HLLC)** | analytical | within ~1% (parallels M3 channel) — **done (step 9)**: 0.59% on a transcritical channel, `validation/test_hllc_boundaries.py` |
+| **HLLC closed wall / per-edge open drain** | reflection + mass | wall reflects & conserves mass; each open edge drains with the gate holding (step 9) |
 | **Shoreline lake-at-rest (bumpy bed, dry islands)** | analytical (stays flat) | `max|u,v|` at float32 floor — **hard, discriminating** wet/dry well-balancedness (step 7) |
 | **EA Test 1 / Test 2** | inter-model envelope | qualitative pass vs SC080035 published results |
 | **Global mass balance** | always-on | `rel_error < 1e-6` (now peak-floored, §2) |
