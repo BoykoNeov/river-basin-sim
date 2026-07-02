@@ -46,6 +46,12 @@ class State:
     eta: wp.array
     beta: wp.array  # (ny, nx) per-cell outflow-limiter factor in [0, 1]
     h_max: wp.array  # (1,) float32 scratch for the timestep reduction
+    # M4 optional cell-centred conservative momentum (armed only by the HLLC FV
+    # scheme; the local-inertial scheme leaves these None and uses qx/qy). See
+    # solver.core.hllc.arm_hllc, which also attaches scheme scratch to ``hllc``.
+    hu: wp.array | None = None  # (ny, nx) x-momentum h*u
+    hv: wp.array | None = None  # (ny, nx) y-momentum h*v
+    hllc: object | None = None  # HLLC scheme scratch (solver.core.hllc._HllcScratch)
     # M3 optional source/sink fields (None unless the scenario needs them):
     infil: wp.array | None = None  # (ny, nx) infiltration rate, m/s
     rain: wp.array | None = None  # (ny, nx) spatial rainfall rate, m/s (temporally scaled)
@@ -149,20 +155,25 @@ class State:
     def velocities_numpy(self) -> tuple[np.ndarray, np.ndarray]:
         """Cell-centred ``(u, v)`` for output, guarded to 0 where ``h < H_DRY``.
 
-        Reconstructs velocity by averaging the two bounding face discharges and
-        dividing by depth (HANDOFF §7.2 emits cell-centred ``u, v``). Never
-        divides by an unguarded depth.
+        Scheme-aware (HANDOFF §7.2 emits cell-centred ``u, v`` regardless of the
+        interior layout): the HLLC scheme stores cell-centred momentum, so
+        ``u = hu/h``, ``v = hv/h``; the local-inertial scheme reconstructs from the
+        two bounding face discharges. Never divides by an unguarded depth.
         """
         from solver.core.grid import H_DRY
 
         h = self.h.numpy()
-        qx = self.qx.numpy()
-        qy = self.qy.numpy()
-        qx_c = 0.5 * (qx[:, :-1] + qx[:, 1:])  # -> (ny, nx)
-        qy_c = 0.5 * (qy[:-1, :] + qy[1:, :])  # -> (ny, nx)
         wet = h >= H_DRY
         u = np.zeros_like(h)
         v = np.zeros_like(h)
-        np.divide(qx_c, h, out=u, where=wet)
-        np.divide(qy_c, h, out=v, where=wet)
+        if self.hu is not None:  # HLLC FV: cell-centred conservative momentum
+            np.divide(self.hu.numpy(), h, out=u, where=wet)
+            np.divide(self.hv.numpy(), h, out=v, where=wet)
+        else:  # local-inertial: average the two bounding face discharges
+            qx = self.qx.numpy()
+            qy = self.qy.numpy()
+            qx_c = 0.5 * (qx[:, :-1] + qx[:, 1:])  # -> (ny, nx)
+            qy_c = 0.5 * (qy[:-1, :] + qy[1:, :])  # -> (ny, nx)
+            np.divide(qx_c, h, out=u, where=wet)
+            np.divide(qy_c, h, out=v, where=wet)
         return u.astype(np.float32), v.astype(np.float32)

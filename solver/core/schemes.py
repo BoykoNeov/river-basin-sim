@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from types import ModuleType
 
-from solver.core import local_inertial
+from solver.core import hllc, local_inertial
 
 # Scheme names the config schema recognises (config.py validates against this;
 # availability -- whether a known scheme is actually implemented yet -- is decided
@@ -45,8 +45,5 @@ def get_scheme(name: str) -> ModuleType:
     if name == "local_inertial":
         return local_inertial
     if name == "hllc_fv":
-        raise NotImplementedError(
-            "scheme='hllc_fv' (well-balanced HLLC finite volume) is not yet "
-            "implemented; M4 is building it. Use 'local_inertial' for now."
-        )
+        return hllc
     raise ValueError(f"unknown scheme '{name}'; known schemes: {list(KNOWN_SCHEMES)}")
