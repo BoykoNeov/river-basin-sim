@@ -185,6 +185,21 @@ Ships as its own commit/PR, green on `ruff` + `pytest`, before touching the sche
 8. **SSP-RK2** time integration + **dam-break on HLLC** — parametrize
    `validation/test_dam_break.py` over scheme so it guards **both** LI and HLLC; HLLC
    nRMSE must match or beat LI's 0.074 and improve shock-front placement.
+   - **Done.** SSP-RK2 (Heun predictor/corrector, `_rk_stage1`/`_rk_stage2`) already
+     landed with the step-5/6 2D update — this step's incremental work is the
+     **dam-break consolidation**: `test_dam_break.py` now dispatches through
+     `schemes.get_scheme` and is parametrized over `{local_inertial, hllc_fv}` with
+     per-scheme CFL α (0.7 / 0.45) and per-scheme shape bands (LI loose 0.10/0.15;
+     HLLC tight 0.03/0.05 — a band LI cannot meet). One `MassLedger` gate (`<1e-6`)
+     now guards **both** schemes, wet- and dry-bed; the old looser `1e-5` in
+     `test_hllc_2d.py` was just conservative — HLLC actually lands at **8.0e-10**
+     (wet) / **1.2e-8** (dry, through the `wp.max(h,0)` wetting-front clamp).
+     **Results:** LI stays bitwise-identical (nRMSE 0.0740, front 0.0953, mass
+     2.46e-9); HLLC beats it on shape *and* front (nRMSE **0.0076**, front
+     **0.0101**). The redundant `test_wet_bed_dam_break_beats_li` was removed from
+     `test_hllc_2d.py` (that file keeps lake-at-rest + determinism); the dam-break
+     shock gate now lives only in the parametrized `test_dam_break.py`. 101 tests
+     green.
 9. **Ghost-cell BCs** — transmissive + closed for HLLC; **`fixed_stage`** if confirmed
    in scope (§6). Per-edge, mirroring the M3 `[boundaries]` config.
 10. **EA benchmark subset** — `validation/test_ea_*.py` for the confirmed cases (§6);
