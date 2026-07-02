@@ -117,6 +117,14 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   building M0's pipeline on it; WhiteboxTools is the no-Python-coupling fallback.
 - **Windows console encoding:** keep script `print()` output ASCII (no em-dashes) —
   the default code page mangles unicode and clutters logs.
+- **Windows atomic-write vs concurrent reader:** `os.replace(tmp, dst)` onto a file
+  the viewer holds open for a plain read fails with `PermissionError`/`WinError 5`
+  (Godot's `FileAccess` read locks without `FILE_SHARE_DELETE`). This bit
+  `status.json` in the M2 loop — retry the replace with a short backoff and treat
+  the write as best-effort (`solver/io/status.py`). It's fine on POSIX and invisible
+  to standalone runs, so **only the live viewer loop reproduces it** — verify file
+  handoffs with `--rblaunch`, not just standalone/`pytest`. Applies to any file the
+  viewer reads while the solver writes (frame tiles, `manifest.json`).
 - **Warp JIT cache** lives under `%LOCALAPPDATA%\NVIDIA\warp\Cache`, not the repo;
   first kernel launch pays a ~0.7 s compile, then it's cached.
 - **Don't reintroduce real-time** as a primary mode, cross-vendor GPU support, or
