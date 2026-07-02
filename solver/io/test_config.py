@@ -50,6 +50,7 @@ def test_full_config_maps_every_field(tmp_path):
     scn = load_config(_write(tmp_path, _FULL))
     assert scn.name == "cfg_test"
     assert scn.seed == 7
+    assert scn.scheme == "local_inertial"
     assert scn.tiles_dir == "data/tiles/demo"
     assert scn.dx == 25.0
     assert scn.crs == "EPSG:32617"
@@ -159,7 +160,6 @@ def test_open_boundaries_default_and_per_edge(tmp_path):
 @pytest.mark.parametrize(
     ("mutation", "repl", "needle"),
     [
-        ('scheme = "local_inertial"', 'scheme = "hllc_fv"', "M4"),  # HLLC
         ('type = "uniform"', 'type = "storm_cells"', "later"),  # temporal rain
         ('default = "closed"', 'default = "fixed_stage"', "M4"),  # fixed-stage BC
     ],
@@ -167,6 +167,22 @@ def test_open_boundaries_default_and_per_edge(tmp_path):
 def test_scope_gate_names_the_milestone(tmp_path, mutation, repl, needle):
     text = _FULL.replace(mutation, repl)
     with pytest.raises(ConfigError, match=needle):
+        load_config(_write(tmp_path, text))
+
+
+def test_hllc_scheme_is_accepted(tmp_path):
+    """M4 wired up scheme='hllc_fv': config parses it (availability is decided at
+    dispatch, not here) and records it on the scenario."""
+    scn = load_config(
+        _write(tmp_path, _FULL.replace('scheme = "local_inertial"', 'scheme = "hllc_fv"'))
+    )
+    assert scn.scheme == "hllc_fv"
+
+
+def test_unknown_scheme_rejected(tmp_path):
+    """An unknown scheme name is a config error naming the known set."""
+    text = _FULL.replace('scheme = "local_inertial"', 'scheme = "quantum_flux"')
+    with pytest.raises(ConfigError, match="known scheme"):
         load_config(_write(tmp_path, text))
 
 

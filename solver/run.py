@@ -23,8 +23,8 @@ import numpy as np
 import warp as wp
 
 from solver.core.grid import Grid
-from solver.core.local_inertial import compute_dt, step
 from solver.core.massbalance import MASS_GATE, MassLedger
+from solver.core.schemes import get_scheme
 from solver.core.state import State
 from solver.io.config import Scenario, load_config
 from solver.io.fields import load_field
@@ -92,6 +92,10 @@ def run_simulation(
     """
     if scenario.dx is None:
         raise ValueError("scenario.dx is unresolved; fill it from the tile manifest first")
+    # Scheme dispatch (plan §1.1): the run loop stays scheme-agnostic -- it calls
+    # the scheme-owned compute_dt/step pair. LI is the default coverage scheme;
+    # hllc_fv is the M4 fidelity option (raises NotImplementedError until wired up).
+    scheme = get_scheme(scenario.scheme)
     grid = Grid(ny=bed.shape[0], nx=bed.shape[1], dx=scenario.dx)
     manning = load_field(
         scenario.manning_field, grid, scalar=scenario.manning_n, name="manning_n", nonneg=True
@@ -129,7 +133,7 @@ def run_simulation(
 
     n_frames = int(round(scenario.end_time / scenario.output_every)) + 1
     attrs = {
-        "scheme": "local_inertial",
+        "scheme": scenario.scheme,
         "crs": scenario.crs,
         "dx": scenario.dx,
         "units": {"depth": "m", "u": "m/s", "v": "m/s", "time": "s", "bed": "m"},
@@ -160,7 +164,7 @@ def run_simulation(
     events = output_times + [scenario.rain_duration, scenario.end_time] + inflow_events
 
     while t < scenario.end_time - EPS_T:
-        dt = compute_dt(st, alpha=scenario.alpha, dt_max=scenario.dt_max)
+        dt = scheme.compute_dt(st, alpha=scenario.alpha, dt_max=scenario.dt_max)
         dt = min(dt, _next_event_time(t, events) - t)
 
         # Inject inflow hydrographs for this step (midpoint discharge -> volume).
@@ -170,12 +174,12 @@ def run_simulation(
         raining = t < scenario.rain_duration - EPS_T
 
         if rain_is_field:
-            step(st, dt=dt, rain_scale=(1.0 if raining else 0.0))
+            scheme.step(st, dt=dt, rain_scale=(1.0 if raining else 0.0))
             if raining:
                 ledger.add_inflow(rain_field_sum_m_s * dt * grid.cell_area)
         else:
             rain = scenario.rain_m_s if raining else 0.0
-            step(st, dt=dt, rain=rain)
+            scheme.step(st, dt=dt, rain=rain)
             if rain > 0.0:
                 ledger.add_rain_step(rain, dt, grid.n_cells)
         t += dt

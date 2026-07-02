@@ -141,9 +141,14 @@ def test_infiltration_mm_hr_conversion(tmp_path):
 
 def test_main_writes_error_status_on_bad_config(tmp_path):
     """A scope-gate ConfigError must be reported via status.json, not a silent exit
-    (else the viewer polls forever). The error is written *and* re-raised."""
+    (else the viewer polls forever). The error is written *and* re-raised.
+
+    Uses ``[[structures]]`` (deferred to M5) as the rejected feature: since M4
+    wired up ``scheme='hllc_fv'`` (no longer a config scope-gate error), the
+    structures gate is the stable stand-in for "config asks for a deferred feature".
+    """
     cfg = tmp_path / "bad.toml"
-    cfg.write_text('[meta]\nscheme = "hllc_fv"\n', encoding="utf-8")  # M4, rejected in M2
+    cfg.write_text("[[structures]]\nkind = 'dam'\n", encoding="utf-8")  # M5, rejected now
     status_path = tmp_path / "status.json"
 
     with pytest.raises(ConfigError):
@@ -160,4 +165,4 @@ def test_main_writes_error_status_on_bad_config(tmp_path):
 
     rec = json.loads(status_path.read_text(encoding="utf-8"))
     assert rec["state"] == "error"
-    assert "hllc_fv" in rec["message"]
+    assert "structures" in rec["message"]

@@ -21,8 +21,12 @@ rainfall, inflow hydrographs, and open boundaries (§9 M3). Field paths are raw
 little-endian float32 ``.r32`` aligned to the terrain tile (an optional ``.tif``
 is accepted when rasterio is available -- see :mod:`solver.io.fields`).
 
-Rejected until a later milestone: ``scheme="hllc_fv"`` and ``fixed_stage``/
-``inflow`` boundary *types* (M4), temporal rainfall ``timeseries``/``storm_cells``
+M4 adds: ``scheme="hllc_fv"`` (the well-balanced HLLC finite-volume scheme) and
+the ``fixed_stage`` boundary *type* (HLLC-only). The scheme name is validated
+against the known set here; whether a known scheme is wired up is decided at
+dispatch (:mod:`solver.core.schemes`).
+
+Rejected until a later milestone: temporal rainfall ``timeseries``/``storm_cells``
 (later), ``[[structures]]`` (M5). Field paths are resolved relative to the TOML
 file's directory.
 """
@@ -33,6 +37,8 @@ import tomllib
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from solver.core.schemes import KNOWN_SCHEMES
 
 # Rainfall types this milestone honours (spatial only; temporal rain deferred).
 _RAIN_TYPES = {"uniform", "field"}
@@ -91,6 +97,7 @@ class Scenario:
 
     name: str = "demo_basin_rain"
     seed: int = 0
+    scheme: str = "local_inertial"  # "local_inertial" (M1) | "hllc_fv" (M4)
     tiles_dir: str = "data/tiles/demo"
     dx: float | None = None  # metres; None -> take from the tile manifest
     crs: str = ""  # "" -> take from the tile manifest
@@ -312,11 +319,16 @@ def load_config(path: str | Path) -> Scenario:
         _warn_unknown(name, table)
 
     # --- scope gate: reject deferred features loudly ---------------------------
+    # Scheme selection is validated against the known set here; whether a known
+    # scheme is actually wired up is decided at dispatch (solver.core.schemes),
+    # so an unknown name is a config error but a known-but-unbuilt scheme is a
+    # NotImplementedError at run time.
     scheme = meta.get("scheme", "local_inertial")
-    if scheme != "local_inertial":
+    if scheme not in KNOWN_SCHEMES:
         raise ConfigError(
-            f"[meta] scheme='{scheme}' is not supported yet; the solver runs only "
-            "'local_inertial'. The HLLC FV scheme arrives in M4."
+            f"[meta] scheme='{scheme}' is not a known scheme; choose one of "
+            f"{list(KNOWN_SCHEMES)} ('local_inertial' is M1; 'hllc_fv' is the M4 "
+            "well-balanced HLLC finite-volume scheme)."
         )
 
     rain_type = rainfall.get("type", "uniform")
@@ -353,6 +365,7 @@ def load_config(path: str | Path) -> Scenario:
         return Scenario(
             name=str(meta.get("name", defaults.name)),
             seed=int(meta.get("seed", defaults.seed)),
+            scheme=scheme,
             tiles_dir=str(grid.get("tiles_dir", defaults.tiles_dir)),
             dx=(float(grid["dx"]) if "dx" in grid else None),
             crs=str(grid.get("crs", "")),
