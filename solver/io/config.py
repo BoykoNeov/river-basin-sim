@@ -21,14 +21,14 @@ rainfall, inflow hydrographs, and open boundaries (§9 M3). Field paths are raw
 little-endian float32 ``.r32`` aligned to the terrain tile (an optional ``.tif``
 is accepted when rasterio is available -- see :mod:`solver.io.fields`).
 
-M4 adds: ``scheme="hllc_fv"`` (the well-balanced HLLC finite-volume scheme) and
-the ``fixed_stage`` boundary *type* (HLLC-only). The scheme name is validated
-against the known set here; whether a known scheme is wired up is decided at
-dispatch (:mod:`solver.core.schemes`).
+M4 adds: ``scheme="hllc_fv"`` (the well-balanced HLLC finite-volume scheme). The
+scheme name is validated against the known set here; whether a known scheme is
+wired up is decided at dispatch (:mod:`solver.core.schemes`).
 
 Rejected until a later milestone: temporal rainfall ``timeseries``/``storm_cells``
-(later), ``[[structures]]`` (M5). Field paths are resolved relative to the TOML
-file's directory.
+(later), ``[[structures]]`` (M5), and the ``fixed_stage``/``inflow`` boundary
+*types* (deferred out of M4 -- see the M4 plan §6.1 -- so they now carry M5).
+Field paths are resolved relative to the TOML file's directory.
 """
 
 from __future__ import annotations
@@ -266,8 +266,8 @@ def _parse_boundaries(boundaries: dict) -> dict[str, str]:
     default = boundaries.get("default", "closed")
     if default not in _BC_TYPES:
         raise ConfigError(
-            f"[boundaries] default='{default}' is not supported; M3 has "
-            "'closed' or 'open'. 'fixed_stage'/'inflow' boundary types arrive in M4."
+            f"[boundaries] default='{default}' is not supported; use "
+            "'closed' or 'open'. 'fixed_stage'/'inflow' boundary types arrive in M5."
         )
     resolved = {}
     for edge in _EDGES:
@@ -275,7 +275,7 @@ def _parse_boundaries(boundaries: dict) -> dict[str, str]:
         if val not in _BC_TYPES:
             raise ConfigError(
                 f"[boundaries] {edge}='{val}' is not supported; use 'closed' or "
-                "'open'. 'fixed_stage'/'inflow' boundary types arrive in M4."
+                "'open'. 'fixed_stage'/'inflow' boundary types arrive in M5."
             )
         resolved[edge] = val
     return resolved

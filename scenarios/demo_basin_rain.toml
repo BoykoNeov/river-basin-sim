@@ -30,4 +30,4 @@ duration_s = 1800.0              # rain falls for the first half hour
 manning_n = 0.035                # scalar (M2); parameter-field rasters arrive in M3
 
 [boundaries]
-default = "closed"               # closed (M2) | open/inflow/fixed_stage (M3)
+default = "closed"               # closed (M2) | open (M3); inflow/fixed_stage -> M5
