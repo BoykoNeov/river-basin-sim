@@ -9,6 +9,12 @@ extends Node3D
 ##
 ## Byte conventions match M0/viewer_export.py exactly: tiles are raw little-endian
 ## float32, row-major, metres -> a Godot FORMAT_RF image, no rescale, no transpose.
+##
+## M6 (reach scale): the results geometry comes from the frame manifest, not from
+## the terrain tile -- a run may cover a tile *mosaic* and/or be coarsened, so its
+## depth field need not share the terrain tile's shape or cell size -- and a frame
+## may arrive as a row-major `tile_grid` of `.raw` tiles, blitted into one image.
+## A small domain still exports one file per frame and takes the same path as M2.
 
 const TILES_SUBPATH := "data/tiles/demo"
 const RESULTS_SUBPATH := "data/results"
@@ -36,6 +42,15 @@ var _depth_tex: ImageTexture = null
 
 var _manifest: Dictionary = {}
 var _frames: Array = []
+# Results-grid geometry, from the frame manifest rather than the terrain tile: at
+# reach scale (M6) a run may cover a tile *mosaic* and/or be coarsened, so the
+# depth field's shape and cell size need not match the terrain tile the viewer
+# renders. Defaults to the terrain grid until a manifest says otherwise.
+var _res_w := 0
+var _res_h := 0
+var _res_dx := 1.0
+# Per-frame tile geometry (M6, §7.3 tile_grid). Empty => one file per frame.
+var _res_tiles: Array = []
 var _frame := 0
 var _playing := false
 var _play_accum := 0.0
@@ -87,6 +102,10 @@ func _load_terrain() -> bool:
 	var tile: Dictionary = manifest["tiles"][0]
 	_grid_w = int(tile["width"])
 	_grid_h = int(tile["height"])
+	# Until a results manifest says otherwise, the results grid is the terrain grid.
+	_res_w = _grid_w
+	_res_h = _grid_h
+	_res_dx = _dx
 	_bed_img = _load_r32_as_rf(tiles_dir.path_join(String(tile["file"])), _grid_w, _grid_h)
 	if _bed_img == null:
 		return false
@@ -170,6 +189,17 @@ func _load_results(manifest_path: String) -> void:
 		_set_status("results manifest has no frames")
 		return
 
+	# Take the results geometry from the manifest (M6): mosaic domains and coarsened
+	# runs both produce a depth field that is not the terrain tile's shape.
+	var mgrid: Dictionary = _manifest.get("grid", {})
+	_res_w = int(mgrid.get("width", _grid_w))
+	_res_h = int(mgrid.get("height", _grid_h))
+	_res_dx = float(_manifest.get("dx", _dx))
+	_res_tiles = _manifest.get("tile_grid", {}).get("tiles", [])
+	if _res_tiles.size() <= 1:
+		_res_tiles = []          # one file per frame -- the M2 path
+	_fit_water_to_results()
+
 	var gdepth: Dictionary = _manifest.get("global", {}).get("depth", {})
 	var p99 := float(gdepth.get("p99", 1.0))
 	_water_mat.set_shader_parameter("depth_max", maxf(p99, 1e-3))
@@ -188,24 +218,83 @@ func _load_results(manifest_path: String) -> void:
 	print("River Basin viewer: loaded %d result frames" % _frames.size())
 
 
-func _read_frame_image(i: int) -> Image:
-	var fr: Dictionary = _frames[i]
-	var rel := String(fr["files"]["depth"])
-	var path := _repo_root.path_join(RESULTS_SUBPATH).path_join("frames").path_join(rel)
+func _fit_water_to_results() -> void:
+	## Resize/reposition the water plane onto the results extent (M6).
+	##
+	## Through M5 the results grid was always the terrain tile, so the plane built in
+	## `_build_water` already fitted. A mosaic or coarsened run breaks that, and a
+	## water sheet stretched over the wrong extent is a silently wrong picture.
+	if _water == null or _res_w <= 0 or _res_h <= 0:
+		return
+	var span_x := _res_w * _res_dx
+	var span_z := _res_h * _res_dx
+	var plane := _water.mesh as PlaneMesh
+	if plane:
+		plane.size = Vector2(span_x, span_z)
+		var seg := mini(WATER_SEGMENTS, maxi(_res_w, _res_h))
+		plane.subdivide_width = seg
+		plane.subdivide_depth = seg
+	_water.position = Vector3(span_x * 0.5, 0.0, span_z * 0.5)
+	_water.custom_aabb = AABB(
+		Vector3(-span_x, -10000.0, -span_z),
+		Vector3(2.0 * span_x, 20000.0, 2.0 * span_z)
+	)
+
+
+func _frames_dir() -> String:
+	return _repo_root.path_join(RESULTS_SUBPATH).path_join("frames")
+
+
+func _read_raw(path: String, expect_floats: int) -> PackedByteArray:
+	## Read a .raw payload, or an empty buffer if it is missing or the wrong size.
+	##
+	## The size check is the guard against a partial write (the solver may still be
+	## writing) or a manifest/grid mismatch: `create_from_data` would read past the
+	## buffer, and `blit_rect` would place garbage.
 	var f := FileAccess.open(path, FileAccess.READ)
 	if f == null:
 		push_error("River Basin viewer: frame not found: " + path)
-		return Image.create(_grid_w, _grid_h, false, Image.FORMAT_RF)
+		return PackedByteArray()
 	var bytes := f.get_buffer(f.get_length())
 	f.close()
-	# Guard against a truncated/short frame (partial write, wrong grid) -- create_from_data
-	# would otherwise read past the buffer. Match _load_r32_as_rf's size check, but return
-	# the blank-Image fallback (callers don't null-check the result), not null.
-	if bytes.size() != _grid_w * _grid_h * 4:
-		push_error("River Basin viewer: frame %d byte size %d != %d"
-			% [i, bytes.size(), _grid_w * _grid_h * 4])
-		return Image.create(_grid_w, _grid_h, false, Image.FORMAT_RF)
-	return Image.create_from_data(_grid_w, _grid_h, false, Image.FORMAT_RF, bytes)
+	if bytes.size() != expect_floats * 4:
+		push_error("River Basin viewer: %s byte size %d != %d"
+			% [path.get_file(), bytes.size(), expect_floats * 4])
+		return PackedByteArray()
+	return bytes
+
+
+func _read_frame_image(i: int) -> Image:
+	var fr: Dictionary = _frames[i]
+	var blank := Image.create(maxi(_res_w, 1), maxi(_res_h, 1), false, Image.FORMAT_RF)
+	if _res_tiles.is_empty():
+		# One file per frame (small domains; the M2 shape, unchanged).
+		var rel := String(fr.get("files", {}).get("depth", ""))
+		if rel.is_empty():
+			push_error("River Basin viewer: frame %d has no depth file" % i)
+			return blank
+		var bytes := _read_raw(_frames_dir().path_join(rel), _res_w * _res_h)
+		if bytes.is_empty():
+			return blank
+		return Image.create_from_data(_res_w, _res_h, false, Image.FORMAT_RF, bytes)
+
+	# Reach scale (M6): the frame is a row-major tile grid; blit each tile into place.
+	var names: Array = fr.get("tiles", {}).get("depth", [])
+	if names.size() != _res_tiles.size():
+		push_error("River Basin viewer: frame %d lists %d tiles, manifest geometry has %d"
+			% [i, names.size(), _res_tiles.size()])
+		return blank
+	var full := blank
+	for t in range(_res_tiles.size()):
+		var geom: Dictionary = _res_tiles[t]
+		var tw := int(geom["width"])
+		var th := int(geom["height"])
+		var tbytes := _read_raw(_frames_dir().path_join(String(names[t])), tw * th)
+		if tbytes.is_empty():
+			continue                      # a bad tile leaves a hole, not a crash
+		var tile_img := Image.create_from_data(tw, th, false, Image.FORMAT_RF, tbytes)
+		full.blit_rect(tile_img, Rect2i(0, 0, tw, th), Vector2i(int(geom["x"]), int(geom["y"])))
+	return full
 
 
 func _apply_frame(i: int) -> void:
@@ -408,8 +497,8 @@ func _verify_then_quit() -> void:
 	var wet := 0
 	if not _frames.is_empty():
 		var img := _read_frame_image(_frames.size() - 1)
-		for y in range(0, _grid_h, 8):
-			for x in range(0, _grid_w, 8):
+		for y in range(0, _res_h, 8):
+			for x in range(0, _res_w, 8):
 				if img.get_pixel(x, y).r >= 0.001:
 					wet += 1
 	print("River Basin viewer: headless verify %s (frames=%d, wet_samples=%d)"
