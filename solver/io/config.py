@@ -36,8 +36,14 @@ It is **HLLC-only** (M5 plan §1.4) and rejected with the local-inertial scheme.
 
 M6 adds: ``[grid] tiles`` (``"all"`` -- the domain is the whole tile mosaic -- or
 ``"first"``, the pre-M6 single-tile behaviour) and ``[grid] window``, an inclusive
-``[row0, col0, row1, col1]`` sub-window in mosaic coordinates. Both are resolved by
-:mod:`solver.io.mosaic`.
+``[row0, col0, row1, col1]`` sub-window in mosaic coordinates (both resolved by
+:mod:`solver.io.mosaic`), plus **sub-grid channels**::
+
+    [channels]   width = <scalar OR field path>    # m, 0 < w <= dx
+                 depth = <scalar OR field path>    # m below the floodplain bed
+                 manning = <scalar OR field path>  # default: the floodplain value
+
+Channels are **local-inertial-only** (M6 plan §0) and rejected with ``hllc_fv``.
 
 Rejected until a later milestone: temporal rainfall ``timeseries``/``storm_cells``
 (later) and the ``inflow`` boundary *type* (deferred indefinitely -- ``[[inflow]]``
@@ -271,6 +277,16 @@ class Scenario:
     # Infiltration loss (mm/hr): scalar OR a field path (0 = none).
     infiltration_mm_hr: float = 0.0
     infiltration_field: str | None = None
+    # Sub-grid channels (M6, solver.core.channels): a channel narrower than a cell,
+    # carried as per-cell geometry. Each is a scalar OR a field path; a run has
+    # channels iff a width is given (scalar > 0 or a field). Local-inertial only.
+    channel_width_m: float = 0.0
+    channel_width_field: str | None = None
+    channel_depth_m: float = 0.0
+    channel_depth_field: str | None = None
+    # None -> the channel inherits the floodplain roughness.
+    channel_manning: float | None = None
+    channel_manning_field: str | None = None
     # Rainfall: "uniform" (scalar rate) or "field" (rate raster).
     rain_type: str = "uniform"
     rain_mm_hr: float = 50.0
@@ -352,6 +368,27 @@ class Scenario:
             raise ValueError(
                 f"unknown boundary type(s): {', '.join(bad_bc)}; use {sorted(_BC_ALL)}"
             )
+        # Sub-grid channels are local-inertial-only (M6 plan §0), the mirror image of
+        # fixed_stage being HLLC-only: the channel model is a conveyance/storage
+        # parameterization that fits LI's face-flux structure, while HLLC's Riemann
+        # solver acts on one cell-average conservative state over a reconstructed
+        # bed -- a second flow path inside that average has no honest expression
+        # there. Loud, not a silent no-op.
+        if self.has_channels and self.scheme != "local_inertial":
+            raise ValueError(
+                f"[channels] requires scheme='local_inertial'; the '{self.scheme}' scheme "
+                "has no sub-grid channel model (M6 plan §0). Run the reach with the "
+                "coverage scheme, or resolve the channel and drop [channels]."
+            )
+        if self.channel_width_field is None and self.channel_width_m < 0:
+            raise ValueError(f"[channels] width must be >= 0, got {self.channel_width_m}")
+        if self.has_channels and self.channel_depth_field is None and self.channel_depth_m <= 0:
+            raise ValueError(
+                "[channels] a width without a bank-full depth is not a channel; set "
+                "[channels] depth (a scalar or a field)"
+            )
+        if self.channel_manning is not None and self.channel_manning <= 0:
+            raise ValueError(f"[channels] manning must be > 0, got {self.channel_manning}")
         stage_edges = sorted(e for e, v in self.boundaries.items() if v == "fixed_stage")
         if stage_edges and self.scheme != "hllc_fv":
             raise ValueError(
@@ -370,6 +407,11 @@ class Scenario:
                 "the run may go unstable",
                 stacklevel=2,
             )
+
+    @property
+    def has_channels(self) -> bool:
+        """Whether the scenario carries sub-grid channel geometry (M6)."""
+        return self.channel_width_field is not None or self.channel_width_m > 0.0
 
     @property
     def rain_m_s(self) -> float:
@@ -392,6 +434,9 @@ class Scenario:
                 ("manning", self.manning_field),
                 ("infiltration", self.infiltration_field),
                 ("rain", self.rain_field),
+                ("channel_width", self.channel_width_field),
+                ("channel_depth", self.channel_depth_field),
+                ("channel_manning", self.channel_manning_field),
             )
             if p
         }
@@ -407,6 +452,7 @@ _KNOWN_TABLES = {
     "boundaries",
     "inflow",
     "structures",
+    "channels",
 }
 _KNOWN_KEYS = {
     "meta": {"name", "seed", "scheme"},
@@ -415,6 +461,7 @@ _KNOWN_KEYS = {
     "rainfall": {"type", "rate_mm_hr", "field", "duration_s"},
     "parameters": {"manning_n", "infiltration"},
     "boundaries": {"default", *_EDGES},
+    "channels": {"width", "depth", "manning"},
 }
 
 
@@ -431,19 +478,19 @@ def _resolve_path(base_dir: Path, value: str) -> str:
 
 
 def _parse_field_param(
-    parameters: dict, key: str, base_dir: Path, *, default_scalar: float
+    parameters: dict, key: str, base_dir: Path, *, default_scalar: float, table: str = "parameters"
 ) -> tuple[float, str | None]:
     """Parse a ``scalar OR path`` parameter -> (scalar, field_path_or_None)."""
     if key not in parameters:
         return default_scalar, None
     val = parameters[key]
     if isinstance(val, bool):  # bool is an int subclass -- reject explicitly
-        raise ConfigError(f"[parameters] {key} must be a number or a field path, got {val!r}")
+        raise ConfigError(f"[{table}] {key} must be a number or a field path, got {val!r}")
     if isinstance(val, (int, float)):
         return float(val), None
     if isinstance(val, str):
         return default_scalar, _resolve_path(base_dir, val)
-    raise ConfigError(f"[parameters] {key} must be a number or a field path, got {val!r}")
+    raise ConfigError(f"[{table}] {key} must be a number or a field path, got {val!r}")
 
 
 def _parse_inflows(doc: dict, ny_nx: tuple[int, int] | None = None) -> list[Inflow]:
@@ -704,6 +751,20 @@ def load_config(path: str | Path) -> Scenario:
     inflows = _parse_inflows(doc)
     structures = _parse_structures(doc)
 
+    # Sub-grid channels (M6): each entry is a scalar or a field path, exactly like
+    # [parameters]. `manning` unset means the channel inherits the floodplain value.
+    channels = doc.get("channels", {})
+    _warn_unknown("channels", channels)
+    chan_width, chan_width_field = _parse_field_param(
+        channels, "width", base_dir, default_scalar=0.0, table="channels"
+    )
+    chan_depth, chan_depth_field = _parse_field_param(
+        channels, "depth", base_dir, default_scalar=0.0, table="channels"
+    )
+    chan_n, chan_n_field = _parse_field_param(
+        channels, "manning", base_dir, default_scalar=0.0, table="channels"
+    )
+
     # Domain selection (M6): which tiles of the manifest, and which sub-window.
     tiles_select = grid.get("tiles", Scenario().tiles)
     if not isinstance(tiles_select, str) or tiles_select not in TILE_SELECTIONS:
@@ -744,6 +805,12 @@ def load_config(path: str | Path) -> Scenario:
             rain_type=rain_type,
             rain_mm_hr=float(rainfall.get("rate_mm_hr", defaults.rain_mm_hr)),
             rain_field=rain_field,
+            channel_width_m=chan_width,
+            channel_width_field=chan_width_field,
+            channel_depth_m=chan_depth,
+            channel_depth_field=chan_depth_field,
+            channel_manning=(chan_n if (chan_n > 0.0 or chan_n_field) else None),
+            channel_manning_field=chan_n_field,
             rain_duration=float(rainfall.get("duration_s", defaults.rain_duration)),
             inflows=inflows,
             structures=structures,

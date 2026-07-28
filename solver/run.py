@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
+from solver.core.channels import arm_channels
 from solver.core.datum import resolve_datum, shift_bed, unshift_bed
 from solver.core.grid import Grid
 from solver.core.massbalance import MASS_GATE, MassLedger
@@ -162,6 +163,39 @@ def run_simulation(
         bed_sim, dx=scenario.dx, depth=scenario.initial_depth, manning=manning, device=device
     )
 
+    # --- M6 sub-grid channels ---------------------------------------------------
+    # A channel narrower than a cell, as per-cell geometry: what keeps a coarse
+    # reach-scale run from erasing the river (plan §1.2). Armed only when the
+    # scenario carries a width; unarmed, the LI kernels are the M1 ones untouched.
+    channels = None
+    if scenario.has_channels:
+        chan_w = load_field(
+            scenario.channel_width_field,
+            grid,
+            scalar=scenario.channel_width_m,
+            name="channel width",
+            nonneg=True,
+        )
+        chan_d = load_field(
+            scenario.channel_depth_field,
+            grid,
+            scalar=scenario.channel_depth_m,
+            name="channel depth",
+            nonneg=True,
+        )
+        chan_n = None
+        if scenario.channel_manning_field is not None or scenario.channel_manning is not None:
+            chan_n = load_field(
+                scenario.channel_manning_field,
+                grid,
+                scalar=(scenario.channel_manning or 0.0),
+                name="channel manning",
+                nonneg=True,
+            )
+        channels = arm_channels(st, chan_w, chan_d, chan_n)
+        if verbose:
+            print(f"  channels      : {channels.summary()}")
+
     # --- M3 sources/sinks -------------------------------------------------------
     # Infiltration (constant-rate sink, mm/hr -> m/s); armed only when nonzero.
     infil = load_field(
@@ -213,12 +247,19 @@ def run_simulation(
         # Static provenance (§2): source hash + resolved scenario -> reproducible.
         "provenance": write_provenance(scenario, out_path),
     }
+    if channels is not None:
+        attrs["channels"] = channels.as_attrs()
     if domain is not None:
         # How the domain was assembled from the tile set (M6): origin, tile count and
         # any uncovered cells, so a stored result says which patch of the world it is.
         attrs["domain"] = domain.as_attrs()
     writer = ZarrWriter(out_path, grid, n_frames, attrs)
     writer.write_bed(unshift_bed(bed_sim, z_ref))  # §7.2 stores true elevations
+    if channels is not None:
+        # The bed alone no longer describes what the run stepped on: store the
+        # channel geometry beside it so a result is self-describing (§7.2).
+        writer.write_static("channel_width", channels.w.numpy())
+        writer.write_static("channel_depth", channels.d.numpy())
 
     # Frame at t = 0 (baseline).
     u0, v0 = st.velocities_numpy()

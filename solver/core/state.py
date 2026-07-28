@@ -55,6 +55,11 @@ class State:
     hu: wp.array | None = None  # (ny, nx) x-momentum h*u
     hv: wp.array | None = None  # (ny, nx) y-momentum h*v
     hllc: object | None = None  # HLLC scheme scratch (solver.core.hllc._HllcScratch)
+    # M6 optional sub-grid channel geometry + split face discharges
+    # (solver.core.channels.ChannelState). Armed only when a scenario carries
+    # channel fields; unarmed, the local-inertial scheme runs its M1 kernels
+    # untouched, so pre-M6 runs are bitwise-identical.
+    channels: object | None = None
     # M3 optional source/sink fields (None unless the scenario needs them):
     infil: wp.array | None = None  # (ny, nx) infiltration rate, m/s
     rain: wp.array | None = None  # (ny, nx) spatial rainfall rate, m/s (temporally scaled)

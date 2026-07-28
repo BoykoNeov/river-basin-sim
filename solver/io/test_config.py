@@ -443,3 +443,44 @@ def test_bad_domain_selection_is_rejected(tmp_path):
     text = _FULL.replace('tiles_dir = "data/tiles/demo"', 'tiles_dir = "d"\nwindow = [9, 0, 5, 5]')
     with pytest.raises(ConfigError, match="inclusive"):
         load_config(_write(tmp_path, text))
+
+
+_CHANNELS = """
+[channels]
+width = 25.0
+depth = 3.0
+manning = 0.028
+"""
+
+
+def test_channels_parse_as_scalars_or_fields(tmp_path):
+    scn = load_config(_write(tmp_path, _FULL + _CHANNELS))
+    assert scn.has_channels
+    assert scn.channel_width_m == 25.0
+    assert scn.channel_depth_m == 3.0
+    assert scn.channel_manning == 0.028
+    assert scn.channel_width_field is None
+
+    text = _FULL + '\n[channels]\nwidth = "w.r32"\ndepth = "d.r32"\n'
+    scn = load_config(_write(tmp_path, text))
+    assert scn.has_channels
+    assert scn.channel_width_field.endswith("w.r32")
+    assert scn.channel_manning is None  # inherits the floodplain roughness
+    assert "channel_width" in scn.field_paths()
+
+
+def test_no_channels_section_means_no_channels(tmp_path):
+    assert not load_config(_write(tmp_path, _FULL)).has_channels
+
+
+def test_channels_are_rejected_on_the_hllc_scheme(tmp_path):
+    """Sub-grid channels are local-inertial-only (M6 plan §0) -- loudly."""
+    text = _FULL.replace('scheme = "local_inertial"', 'scheme = "hllc_fv"') + _CHANNELS
+    with pytest.raises(ConfigError, match="requires scheme='local_inertial'"):
+        load_config(_write(tmp_path, text))
+
+
+def test_a_channel_width_without_a_depth_is_rejected(tmp_path):
+    text = _FULL + "\n[channels]\nwidth = 25.0\n"
+    with pytest.raises(ConfigError, match="bank-full depth"):
+        load_config(_write(tmp_path, text))

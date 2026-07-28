@@ -32,7 +32,8 @@ import math
 import warp as wp
 
 from solver.core.boundaries import apply_closed_bc, apply_open_outflow
-from solver.core.friction import manning_denominator
+from solver.core.channels import column_depth, eta_subgrid
+from solver.core.friction import manning_denominator, manning_denominator_radius
 from solver.core.grid import GRAVITY, H_DRY
 from solver.core.state import State
 
@@ -253,6 +254,244 @@ def limit_qy(qy: wp.array2d(dtype=wp.float32), beta: wp.array2d(dtype=wp.float32
         qy[i, j] = q * beta[i, j]
 
 
+# --- M6 sub-grid channels ---------------------------------------------------
+# A cell may carry a channel narrower than itself (solver.core.channels). Three
+# things change and nothing else does: eta comes from the storage curve, a face
+# carries two flows instead of one, and the timestep is set by the water *column*
+# rather than the cell-mean depth. Continuity, the limiter's beta, the boundaries
+# and the ledger are untouched -- the two components are recombined into exactly
+# the same total per-cell-width flux `qx`/`qy` those already speak.
+
+
+@wp.kernel
+def compute_eta_channels(
+    h: wp.array2d(dtype=wp.float32),
+    z: wp.array2d(dtype=wp.float32),
+    chan_w: wp.array2d(dtype=wp.float32),
+    chan_d: wp.array2d(dtype=wp.float32),
+    dx: wp.float32,
+    eta: wp.array2d(dtype=wp.float32),
+):
+    """``eta`` through the sub-grid storage curve (``w = 0`` -> ``h + z``)."""
+    i, j = wp.tid()
+    eta[i, j] = eta_subgrid(h[i, j], z[i, j], chan_w[i, j], chan_d[i, j], dx)
+
+
+@wp.func
+def _channel_flux(
+    q_prev: wp.float32,
+    eta_max: wp.float32,
+    slope: wp.float32,
+    w_face: wp.float32,
+    z_bank: wp.float32,
+    z_ch: wp.float32,
+    n_ch: wp.float32,
+    dt: wp.float32,
+    g: wp.float32,
+) -> wp.float32:
+    """Bates update for the channel component, per unit **channel** width.
+
+    The channel carries the water between the channel bed ``z_ch`` and the bank
+    ``z_bank`` (the floodplain bed at the face); anything above that is the
+    floodplain component's, so the two never double-count. Hydraulic radius is
+    ``A/P``, not the depth -- see :func:`solver.core.friction.manning_denominator_radius`.
+    """
+    if w_face <= 0.0:
+        return 0.0
+    surface = wp.min(eta_max, z_bank)  # channel flow saturates at bank full
+    h_ch = surface - z_ch
+    if h_ch < H_DRY:
+        return 0.0
+    radius = w_face * h_ch / (w_face + 2.0 * h_ch)
+    num = q_prev - g * h_ch * dt * slope
+    den = manning_denominator_radius(q_prev, h_ch, radius, n_ch, g, dt)
+    return num / den
+
+
+@wp.func
+def _floodplain_flux(
+    q_prev: wp.float32,
+    eta_max: wp.float32,
+    slope: wp.float32,
+    z_bank: wp.float32,
+    n_fp: wp.float32,
+    dt: wp.float32,
+    g: wp.float32,
+) -> wp.float32:
+    """Bates update for the floodplain component -- the M1 face update verbatim."""
+    h_fp = eta_max - z_bank
+    if h_fp < H_DRY:
+        return 0.0
+    num = q_prev - g * h_fp * dt * slope
+    den = manning_denominator(q_prev, h_fp, n_fp, g, dt)
+    return num / den
+
+
+@wp.kernel
+def update_qx_channels(
+    qx: wp.array2d(dtype=wp.float32),
+    qx_ch: wp.array2d(dtype=wp.float32),
+    qx_fp: wp.array2d(dtype=wp.float32),
+    eta: wp.array2d(dtype=wp.float32),
+    z: wp.array2d(dtype=wp.float32),
+    n: wp.array2d(dtype=wp.float32),
+    chan_w: wp.array2d(dtype=wp.float32),
+    chan_d: wp.array2d(dtype=wp.float32),
+    chan_n: wp.array2d(dtype=wp.float32),
+    dx: wp.float32,
+    dt: wp.float32,
+    g: wp.float32,
+):
+    """Two-component interior x-face update. Launched over ``(ny, nx-1)``."""
+    i, jj = wp.tid()
+    j = jj + 1
+
+    eta_l = eta[i, j - 1]
+    eta_r = eta[i, j]
+    eta_max = wp.max(eta_l, eta_r)
+    slope = (eta_r - eta_l) / dx
+    z_bank = wp.max(z[i, j - 1], z[i, j])
+
+    q_fp = _floodplain_flux(
+        qx_fp[i, j], eta_max, slope, z_bank, 0.5 * (n[i, j - 1] + n[i, j]), dt, g
+    )
+    # A channel conveys only where it is continuous across the face; the narrower
+    # section controls, and the higher channel bed is the sill.
+    w_face = wp.min(chan_w[i, j - 1], chan_w[i, j])
+    z_ch = wp.max(z[i, j - 1] - chan_d[i, j - 1], z[i, j] - chan_d[i, j])
+    q_ch = _channel_flux(
+        qx_ch[i, j],
+        eta_max,
+        slope,
+        w_face,
+        z_bank,
+        z_ch,
+        0.5 * (chan_n[i, j - 1] + chan_n[i, j]),
+        dt,
+        g,
+    )
+
+    qx_fp[i, j] = q_fp
+    qx_ch[i, j] = q_ch
+    frac = w_face / dx
+    qx[i, j] = q_fp * (1.0 - frac) + q_ch * frac
+
+
+@wp.kernel
+def update_qy_channels(
+    qy: wp.array2d(dtype=wp.float32),
+    qy_ch: wp.array2d(dtype=wp.float32),
+    qy_fp: wp.array2d(dtype=wp.float32),
+    eta: wp.array2d(dtype=wp.float32),
+    z: wp.array2d(dtype=wp.float32),
+    n: wp.array2d(dtype=wp.float32),
+    chan_w: wp.array2d(dtype=wp.float32),
+    chan_d: wp.array2d(dtype=wp.float32),
+    chan_n: wp.array2d(dtype=wp.float32),
+    dx: wp.float32,
+    dt: wp.float32,
+    g: wp.float32,
+):
+    """Two-component interior y-face update. Launched over ``(ny-1, nx)``."""
+    ii, j = wp.tid()
+    i = ii + 1
+
+    eta_t = eta[i - 1, j]
+    eta_b = eta[i, j]
+    eta_max = wp.max(eta_t, eta_b)
+    slope = (eta_b - eta_t) / dx
+    z_bank = wp.max(z[i - 1, j], z[i, j])
+
+    q_fp = _floodplain_flux(
+        qy_fp[i, j], eta_max, slope, z_bank, 0.5 * (n[i - 1, j] + n[i, j]), dt, g
+    )
+    w_face = wp.min(chan_w[i - 1, j], chan_w[i, j])
+    z_ch = wp.max(z[i - 1, j] - chan_d[i - 1, j], z[i, j] - chan_d[i, j])
+    q_ch = _channel_flux(
+        qy_ch[i, j],
+        eta_max,
+        slope,
+        w_face,
+        z_bank,
+        z_ch,
+        0.5 * (chan_n[i - 1, j] + chan_n[i, j]),
+        dt,
+        g,
+    )
+
+    qy_fp[i, j] = q_fp
+    qy_ch[i, j] = q_ch
+    frac = w_face / dx
+    qy[i, j] = q_fp * (1.0 - frac) + q_ch * frac
+
+
+@wp.kernel
+def limit_qx_channels(
+    qx: wp.array2d(dtype=wp.float32),
+    qx_ch: wp.array2d(dtype=wp.float32),
+    qx_fp: wp.array2d(dtype=wp.float32),
+    beta: wp.array2d(dtype=wp.float32),
+):
+    """Scale an x-face and *both* its components by the total flux's donor beta.
+
+    The donor is chosen from the **total** flux, which is what continuity moves and
+    what ``beta`` was computed against; scaling both components by the same factor
+    keeps ``q = q_fp·(1-frac) + q_ch·frac`` exact, so the M1 guarantee (one face,
+    scaled once, by its donor cell) survives unchanged.
+    """
+    i, jj = wp.tid()
+    j = jj + 1
+    q = qx[i, j]
+    if q == 0.0:
+        return
+    b = beta[i, j - 1]
+    if q < 0.0:
+        b = beta[i, j]
+    qx[i, j] = q * b
+    qx_ch[i, j] = qx_ch[i, j] * b
+    qx_fp[i, j] = qx_fp[i, j] * b
+
+
+@wp.kernel
+def limit_qy_channels(
+    qy: wp.array2d(dtype=wp.float32),
+    qy_ch: wp.array2d(dtype=wp.float32),
+    qy_fp: wp.array2d(dtype=wp.float32),
+    beta: wp.array2d(dtype=wp.float32),
+):
+    """Scale a y-face and both its components by the total flux's donor beta."""
+    ii, j = wp.tid()
+    i = ii + 1
+    q = qy[i, j]
+    if q == 0.0:
+        return
+    b = beta[i - 1, j]
+    if q < 0.0:
+        b = beta[i, j]
+    qy[i, j] = q * b
+    qy_ch[i, j] = qy_ch[i, j] * b
+    qy_fp[i, j] = qy_fp[i, j] * b
+
+
+@wp.kernel
+def reduce_column_max(
+    h: wp.array2d(dtype=wp.float32),
+    chan_w: wp.array2d(dtype=wp.float32),
+    chan_d: wp.array2d(dtype=wp.float32),
+    dx: wp.float32,
+    out_max: wp.array(dtype=wp.float32),
+):
+    """Atomic-max of the water *column* depth -- the wave speed a channel really has.
+
+    ``h`` is a cell mean; a channel concentrates it by ``dx/w``, so reducing over
+    ``h`` would under-resolve the timestep by exactly that factor (a 0.1 m mean over
+    a 20 m channel in a 200 m cell is a **1 m** column). Without channels this is
+    identical to :func:`reduce_hmax`.
+    """
+    i, j = wp.tid()
+    wp.atomic_max(out_max, 0, column_depth(h[i, j], chan_w[i, j], chan_d[i, j], dx))
+
+
 @wp.kernel
 def reduce_hmax(h: wp.array2d(dtype=wp.float32), out_max: wp.array(dtype=wp.float32)):
     """Atomic-max of the depth field into ``out_max[0]``.
@@ -272,9 +511,24 @@ def compute_dt(state: State, alpha: float = 0.7, dt_max: float = 30.0) -> float:
     ``dt_max``. ``h_max`` comes from the atomic-max reduction. When the domain is
     effectively dry (``h_max <= H_DRY``) there is nothing to move, so ``dt_max`` is
     returned. The result depends only on field values, so runs reproduce exactly.
+
+    With sub-grid channels armed (M6) the reduction is over the water **column**
+    (:func:`reduce_column_max`) rather than the cell mean, since that is the depth
+    the wave actually sees.
     """
     state.h_max.zero_()
-    wp.launch(reduce_hmax, dim=state.grid.shape, inputs=[state.h, state.h_max], device=state.device)
+    chan = state.channels
+    if chan is not None:
+        wp.launch(
+            reduce_column_max,
+            dim=state.grid.shape,
+            inputs=[state.h, chan.w, chan.d, float(state.grid.dx), state.h_max],
+            device=state.device,
+        )
+    else:
+        wp.launch(
+            reduce_hmax, dim=state.grid.shape, inputs=[state.h, state.h_max], device=state.device
+        )
     h_max = float(state.h_max.numpy()[0])
     if h_max <= H_DRY:
         return dt_max
@@ -309,6 +563,12 @@ def step(
     scheme has no time-dependent boundary forcing -- ``fixed_stage`` is HLLC-only
     (M5 plan §1.4) -- and its rainfall gating is done by the caller.
 
+    ``state.channels`` (M6, :mod:`solver.core.channels`) switches the eta, face and
+    limiter launches onto their sub-grid counterparts: ``eta`` comes from the
+    storage curve and each face carries a channel flow plus a floodplain flow,
+    recombined into the same total ``qx``/``qy`` continuity already reads. Unarmed,
+    none of that code is launched, so pre-M6 runs are bitwise-identical.
+
     ``limit`` enables the per-cell donor limiter that keeps depths non-negative
     when the scheme is pushed out of regime (steep thin-sheet flow). It is
     inactive (``beta == 1``) whenever no cell is over-drained, so it does not
@@ -316,22 +576,53 @@ def step(
     """
     g = state.grid
     dxf, dtf, gf = float(g.dx), float(dt), float(GRAVITY)
+    chan = state.channels  # M6 sub-grid channels; None -> the M1 kernels, untouched
 
-    wp.launch(compute_eta, dim=g.shape, inputs=[state.h, state.z, state.eta], device=state.device)
-    if g.nx > 1:
+    if chan is None:
         wp.launch(
-            update_qx,
-            dim=(g.ny, g.nx - 1),
-            inputs=[state.qx, state.eta, state.z, state.n, dxf, dtf, gf],
+            compute_eta, dim=g.shape, inputs=[state.h, state.z, state.eta], device=state.device
+        )
+        if g.nx > 1:
+            wp.launch(
+                update_qx,
+                dim=(g.ny, g.nx - 1),
+                inputs=[state.qx, state.eta, state.z, state.n, dxf, dtf, gf],
+                device=state.device,
+            )
+        if g.ny > 1:
+            wp.launch(
+                update_qy,
+                dim=(g.ny - 1, g.nx),
+                inputs=[state.qy, state.eta, state.z, state.n, dxf, dtf, gf],
+                device=state.device,
+            )
+    else:
+        wp.launch(
+            compute_eta_channels,
+            dim=g.shape,
+            inputs=[state.h, state.z, chan.w, chan.d, dxf, state.eta],
             device=state.device,
         )
-    if g.ny > 1:
-        wp.launch(
-            update_qy,
-            dim=(g.ny - 1, g.nx),
-            inputs=[state.qy, state.eta, state.z, state.n, dxf, dtf, gf],
-            device=state.device,
-        )
+        if g.nx > 1:
+            wp.launch(
+                update_qx_channels,
+                dim=(g.ny, g.nx - 1),
+                inputs=[
+                    state.qx, chan.qx_ch, chan.qx_fp, state.eta, state.z, state.n,
+                    chan.w, chan.d, chan.n, dxf, dtf, gf,
+                ],
+                device=state.device,
+            )  # fmt: skip
+        if g.ny > 1:
+            wp.launch(
+                update_qy_channels,
+                dim=(g.ny - 1, g.nx),
+                inputs=[
+                    state.qy, chan.qy_ch, chan.qy_fp, state.eta, state.z, state.n,
+                    chan.w, chan.d, chan.n, dxf, dtf, gf,
+                ],
+                device=state.device,
+            )  # fmt: skip
     apply_closed_bc(state)
 
     if limit:
@@ -342,13 +633,35 @@ def step(
             device=state.device,
         )
         if g.nx > 1:
-            wp.launch(
-                limit_qx, dim=(g.ny, g.nx - 1), inputs=[state.qx, state.beta], device=state.device
-            )
+            if chan is None:
+                wp.launch(
+                    limit_qx,
+                    dim=(g.ny, g.nx - 1),
+                    inputs=[state.qx, state.beta],
+                    device=state.device,
+                )
+            else:
+                wp.launch(
+                    limit_qx_channels,
+                    dim=(g.ny, g.nx - 1),
+                    inputs=[state.qx, chan.qx_ch, chan.qx_fp, state.beta],
+                    device=state.device,
+                )
         if g.ny > 1:
-            wp.launch(
-                limit_qy, dim=(g.ny - 1, g.nx), inputs=[state.qy, state.beta], device=state.device
-            )
+            if chan is None:
+                wp.launch(
+                    limit_qy,
+                    dim=(g.ny - 1, g.nx),
+                    inputs=[state.qy, state.beta],
+                    device=state.device,
+                )
+            else:
+                wp.launch(
+                    limit_qy_channels,
+                    dim=(g.ny - 1, g.nx),
+                    inputs=[state.qy, chan.qy_ch, chan.qy_fp, state.beta],
+                    device=state.device,
+                )
 
     wp.launch(
         update_h,
