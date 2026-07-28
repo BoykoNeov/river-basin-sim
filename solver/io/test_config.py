@@ -412,3 +412,34 @@ def test_outlet_overlapping_the_pool_is_rejected(tmp_path):
     )  # rows 4.. hit the pool
     with pytest.raises(ConfigError, match="overlaps the pool"):
         load_config(_write(tmp_path, text))
+
+
+def test_domain_selection_defaults_to_the_whole_mosaic(tmp_path):
+    """M6: the domain is the tile set unless the scenario says otherwise."""
+    scn = load_config(_write(tmp_path, _FULL))
+    assert scn.tiles == "all"
+    assert scn.window is None
+
+
+def test_domain_selection_parses_tiles_and_window(tmp_path):
+    text = _FULL.replace(
+        'tiles_dir = "data/tiles/demo"',
+        'tiles_dir = "data/tiles/demo"\ntiles = "first"\nwindow = [0, 0, 63, 127]',
+    )
+    scn = load_config(_write(tmp_path, text))
+    assert scn.tiles == "first"
+    assert scn.window == (0, 0, 63, 127)
+
+
+def test_bad_domain_selection_is_rejected(tmp_path):
+    text = _FULL.replace('tiles_dir = "data/tiles/demo"', 'tiles_dir = "d"\ntiles = "some"')
+    with pytest.raises(ConfigError, match=r"\[grid\] tiles"):
+        load_config(_write(tmp_path, text))
+
+    text = _FULL.replace('tiles_dir = "data/tiles/demo"', 'tiles_dir = "d"\nwindow = [0, 0, 5]')
+    with pytest.raises(ConfigError, match=r"\[grid\] window"):
+        load_config(_write(tmp_path, text))
+
+    text = _FULL.replace('tiles_dir = "data/tiles/demo"', 'tiles_dir = "d"\nwindow = [9, 0, 5, 5]')
+    with pytest.raises(ConfigError, match="inclusive"):
+        load_config(_write(tmp_path, text))

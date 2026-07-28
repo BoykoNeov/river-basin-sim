@@ -16,7 +16,6 @@ CLI::
 from __future__ import annotations
 
 import argparse
-import json
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -30,6 +29,7 @@ from solver.core.schemes import get_scheme
 from solver.core.state import State
 from solver.io.config import Scenario, Structure, load_config
 from solver.io.fields import load_field
+from solver.io.mosaic import Mosaic, assemble_mosaic
 from solver.io.provenance import write_provenance
 from solver.io.status import StatusWriter
 from solver.io.viewer_export import export_frames
@@ -48,14 +48,25 @@ def load_r32_bed(tiles_dir: str | Path) -> tuple[np.ndarray, dict]:
 
     Returns the ``(ny, nx)`` float32 bed (metres) plus the manifest dict (for dx,
     CRS, bounds). The ``.r32`` is raw little-endian row-major float32 (HANDOFF §7).
+
+    Kept as the single-tile shorthand (and for callers that predate M6); the run
+    path assembles the whole tile set through :func:`solver.io.mosaic.assemble_mosaic`.
     """
-    tiles_dir = Path(tiles_dir)
-    manifest = json.loads((tiles_dir / "tiles.json").read_text())
-    t0 = manifest["tiles"][0]
-    h, w = int(t0["height"]), int(t0["width"])
-    raw = np.fromfile(tiles_dir / t0["file"], dtype="<f4", count=h * w)
-    bed = raw.reshape(h, w).astype(np.float32)
-    return bed, manifest
+    m = assemble_mosaic(tiles_dir, select="first")
+    return m.bed, m.manifest
+
+
+def field_memory_mb(shape: tuple[int, int]) -> float:
+    """Rough device memory for one run's float32 state fields, in MB (M6 §4).
+
+    Counts the local-inertial working set -- ``h, z, n, eta, beta`` at cell centres
+    plus ``qx, qy`` on faces, i.e. ~7 arrays of ``ny*nx`` float32 -- so a reach-scale
+    domain's cost is printed *before* stepping rather than discovered as a CUDA
+    out-of-memory. Optional fields (momentum, channels, loss ledger) add to this;
+    the number is an order-of-magnitude guide, and says so.
+    """
+    ny, nx = shape
+    return 7 * 4 * ny * nx / (1024.0 * 1024.0)
 
 
 def pick_device(requested: str | None) -> str:
@@ -112,6 +123,7 @@ def run_simulation(
     device: str = "cpu",
     verbose: bool = True,
     status: StatusWriter | None = None,
+    domain: Mosaic | None = None,
 ) -> MassLedger:
     """Run the selected scheme and stream results to a Zarr store.
 
@@ -201,6 +213,10 @@ def run_simulation(
         # Static provenance (§2): source hash + resolved scenario -> reproducible.
         "provenance": write_provenance(scenario, out_path),
     }
+    if domain is not None:
+        # How the domain was assembled from the tile set (M6): origin, tile count and
+        # any uncovered cells, so a stored result says which patch of the world it is.
+        attrs["domain"] = domain.as_attrs()
     writer = ZarrWriter(out_path, grid, n_frames, attrs)
     writer.write_bed(unshift_bed(bed_sim, z_ref))  # §7.2 stores true elevations
 
@@ -292,10 +308,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _resolve_scenario(args: argparse.Namespace) -> tuple[Scenario, np.ndarray]:
-    """Build the run Scenario (from --config or the demo flags) and load its bed.
+def _resolve_scenario(args: argparse.Namespace) -> tuple[Scenario, Mosaic]:
+    """Build the run Scenario (from --config or the demo flags) and its domain.
 
-    ``dx``/``crs`` unset by the config inherit from the tile manifest (§7.1).
+    The domain is the assembled **tile mosaic** (M6, :mod:`solver.io.mosaic`) --
+    ``[grid] tiles`` selects the whole set or just tile 0, ``[grid] window`` clips a
+    reach out of it. ``dx``/``crs`` unset by the config inherit from the tile
+    manifest (§7.1).
     """
     if args.config:
         scenario = load_config(args.config)
@@ -309,12 +328,12 @@ def _resolve_scenario(args: argparse.Namespace) -> tuple[Scenario, np.ndarray]:
             rain_mm_hr=args.rain_mm_hr,
             rain_duration=args.rain_duration,
         )
-    bed, manifest = load_r32_bed(scenario.tiles_dir)
+    mosaic = assemble_mosaic(scenario.tiles_dir, select=scenario.tiles, window=scenario.window)
     if scenario.dx is None:
-        scenario.dx = float(manifest["dx_m"])
+        scenario.dx = mosaic.dx
     if not scenario.crs:
-        scenario.crs = manifest.get("crs", "")
-    return scenario, bed
+        scenario.crs = mosaic.crs
+    return scenario, mosaic
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -332,15 +351,22 @@ def main(argv: list[str] | None = None) -> None:
     status.write("starting", message="resolving scenario")
     try:
         device = pick_device(args.device)
-        scenario, bed = _resolve_scenario(args)
+        scenario, mosaic = _resolve_scenario(args)
+        bed = mosaic.bed
         status.end_time = scenario.end_time
         print(
-            f"River Basin M2 solver | device={device} | grid={bed.shape} "
-            f"dx={scenario.dx:.2f}m | scenario={scenario.name}"
+            f"River Basin solver | device={device} | scenario={scenario.name} | "
+            f"scheme={scenario.scheme}"
         )
-        status.write("starting", message=f"{scenario.name}: {bed.shape} @ dx={scenario.dx:.2f}m")
+        print(f"  domain        : {mosaic.summary()}")
+        print(f"  field memory  : ~{field_memory_mb(bed.shape):.1f} MB (float32 state fields)")
+        if mosaic.gap_cells:
+            print(f"  WARNING: {mosaic.gap_cells} cells are not covered by any tile (filled flat)")
+        status.write("starting", message=f"{scenario.name}: {mosaic.summary()}")
 
-        ledger = run_simulation(scenario, bed, out_path, device=device, status=status)
+        ledger = run_simulation(
+            scenario, bed, out_path, device=device, status=status, domain=mosaic
+        )
         if not args.no_frames:
             status.write("writing", sim_time=scenario.end_time, message="exporting viewer frames")
             manifest = export_frames(out_path, frames_dir)

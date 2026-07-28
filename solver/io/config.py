@@ -9,7 +9,8 @@ config never silently means less than it says.
 Supported now (through M3)::
 
     [meta]       name, seed, scheme="local_inertial"
-    [grid]       tiles_dir, dx?, crs?             (dx/crs default from the manifest)
+    [grid]       tiles_dir, tiles?, window?, dx?, crs?, datum?
+                 (dx/crs default from the manifest)
     [run]        end_time, output_every, cfl, dt_max
     [rainfall]   type="uniform"|"field", rate_mm_hr, field?, duration_s
     [parameters] manning_n = <scalar OR field path>, infiltration = <scalar OR path>
@@ -33,6 +34,11 @@ M5 adds: ``[grid] datum`` (vertical datum shift, :mod:`solver.core.datum`) and t
 piecewise-linear in time, written as a per-edge table because it carries a level.
 It is **HLLC-only** (M5 plan §1.4) and rejected with the local-inertial scheme.
 
+M6 adds: ``[grid] tiles`` (``"all"`` -- the domain is the whole tile mosaic -- or
+``"first"``, the pre-M6 single-tile behaviour) and ``[grid] window``, an inclusive
+``[row0, col0, row1, col1]`` sub-window in mosaic coordinates. Both are resolved by
+:mod:`solver.io.mosaic`.
+
 Rejected until a later milestone: temporal rainfall ``timeseries``/``storm_cells``
 (later) and the ``inflow`` boundary *type* (deferred indefinitely -- ``[[inflow]]``
 cell sources cover prescribed discharge and their mass accounting is exact).
@@ -47,6 +53,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from solver.core.schemes import KNOWN_SCHEMES
+from solver.io.mosaic import TILE_SELECTIONS
 
 # Rainfall types this milestone honours (spatial only; temporal rain deferred).
 _RAIN_TYPES = {"uniform", "field"}
@@ -243,6 +250,12 @@ class Scenario:
     seed: int = 0
     scheme: str = "local_inertial"  # "local_inertial" (M1) | "hllc_fv" (M4)
     tiles_dir: str = "data/tiles/demo"
+    # Tile-set selection (M6, solver.io.mosaic): "all" -> the domain is the whole
+    # mosaic; "first" -> tile 0 only (the pre-M6 behaviour). Identical for the
+    # single-tile manifests every in-tree scenario points at.
+    tiles: str = "all"
+    # Optional inclusive [row0, col0, row1, col1] sub-window in mosaic coordinates.
+    window: tuple[int, int, int, int] | None = None
     dx: float | None = None  # metres; None -> take from the tile manifest
     crs: str = ""  # "" -> take from the tile manifest
     # Vertical datum shift (M5): None = no shift, "auto" = floor(min(bed)), or an
@@ -303,6 +316,22 @@ class Scenario:
                 f"end_time ({self.end_time}) must be an exact multiple of output_every "
                 f"({self.output_every}); otherwise the final frame at end_time is dropped"
             )
+        # Domain selection (M6): validated here so the bare-CLI path is covered too.
+        if self.tiles not in TILE_SELECTIONS:
+            raise ValueError(
+                f"[grid] tiles must be one of {list(TILE_SELECTIONS)}, got {self.tiles!r}"
+            )
+        if self.window is not None:
+            if len(self.window) != 4:
+                raise ValueError(
+                    f"[grid] window must be [row0, col0, row1, col1], got {self.window!r}"
+                )
+            r0, c0, r1, c1 = self.window
+            if min(r0, c0) < 0 or r1 < r0 or c1 < c0:
+                raise ValueError(
+                    f"[grid] window {list(self.window)} must be a non-negative, non-empty "
+                    "inclusive [row0, col0, row1, col1] box in mosaic coordinates"
+                )
         # Physical scalars are non-negative (field files are checked in solver.io.fields).
         if self.manning_n < 0:
             raise ValueError(f"manning_n must be >= 0, got {self.manning_n}")
@@ -381,7 +410,7 @@ _KNOWN_TABLES = {
 }
 _KNOWN_KEYS = {
     "meta": {"name", "seed", "scheme"},
-    "grid": {"tiles_dir", "dx", "crs", "datum"},
+    "grid": {"tiles_dir", "tiles", "window", "dx", "crs", "datum"},
     "run": {"end_time", "output_every", "cfl", "dt_max"},
     "rainfall": {"type", "rate_mm_hr", "field", "duration_s"},
     "parameters": {"manning_n", "infiltration"},
@@ -675,6 +704,22 @@ def load_config(path: str | Path) -> Scenario:
     inflows = _parse_inflows(doc)
     structures = _parse_structures(doc)
 
+    # Domain selection (M6): which tiles of the manifest, and which sub-window.
+    tiles_select = grid.get("tiles", Scenario().tiles)
+    if not isinstance(tiles_select, str) or tiles_select not in TILE_SELECTIONS:
+        raise ConfigError(
+            f"[grid] tiles={tiles_select!r} is not supported; use 'all' (the domain is "
+            "the whole tile mosaic) or 'first' (tile 0 only, the pre-M6 behaviour)."
+        )
+    window = grid.get("window")
+    if window is not None:
+        if not (isinstance(window, list) and len(window) == 4):
+            raise ConfigError(
+                f"[grid] window must be [row0, col0, row1, col1] (inclusive, in mosaic "
+                f"coordinates), got {window!r}"
+            )
+        window = tuple(int(v) for v in window)
+
     # --- build the Scenario ----------------------------------------------------
     defaults = Scenario()
     try:
@@ -683,6 +728,8 @@ def load_config(path: str | Path) -> Scenario:
             seed=int(meta.get("seed", defaults.seed)),
             scheme=scheme,
             tiles_dir=str(grid.get("tiles_dir", defaults.tiles_dir)),
+            tiles=tiles_select,
+            window=window,
             dx=(float(grid["dx"]) if "dx" in grid else None),
             crs=str(grid.get("crs", "")),
             datum=(datum if isinstance(datum, str) or datum is None else float(datum)),
