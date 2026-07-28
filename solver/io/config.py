@@ -9,12 +9,16 @@ config never silently means less than it says.
 Supported now (through M3)::
 
     [meta]       name, seed, scheme="local_inertial"
-    [grid]       tiles_dir, dx?, crs?             (dx/crs default from the manifest)
+    [grid]       tiles_dir, tiles?, window?, dx?, crs?, datum?
+                 (dx/crs default from the manifest)
     [run]        end_time, output_every, cfl, dt_max
     [rainfall]   type="uniform"|"field", rate_mm_hr, field?, duration_s
     [parameters] manning_n = <scalar OR field path>, infiltration = <scalar OR path>
     [[inflow]]   cell = [i, j], hydrograph = [[t, Q], ...]      (m^3/s)
-    [boundaries] default="closed"|"open", north/south/east/west = "closed"|"open"
+    [boundaries] default="closed"|"open"
+                 north/south/east/west = "closed" | "open"
+                                       | { type="fixed_stage", level=<m> }
+                                       | { type="fixed_stage", stage=[[t, level], ...] }
 
 M3 adds: spatially-varying ``manning_n`` / ``infiltration`` fields, ``field``
 rainfall, inflow hydrographs, and open boundaries (§9 M3). Field paths are raw
@@ -25,9 +29,25 @@ M4 adds: ``scheme="hllc_fv"`` (the well-balanced HLLC finite-volume scheme). The
 scheme name is validated against the known set here; whether a known scheme is
 wired up is decided at dispatch (:mod:`solver.core.schemes`).
 
+M5 adds: ``[grid] datum`` (vertical datum shift, :mod:`solver.core.datum`) and the
+``fixed_stage`` boundary type -- a prescribed water surface, constant or
+piecewise-linear in time, written as a per-edge table because it carries a level.
+It is **HLLC-only** (M5 plan §1.4) and rejected with the local-inertial scheme.
+
+M6 adds: ``[grid] tiles`` (``"all"`` -- the domain is the whole tile mosaic -- or
+``"first"``, the pre-M6 single-tile behaviour) and ``[grid] window``, an inclusive
+``[row0, col0, row1, col1]`` sub-window in mosaic coordinates (both resolved by
+:mod:`solver.io.mosaic`), plus **sub-grid channels**::
+
+    [channels]   width = <scalar OR field path>    # m, 0 < w <= dx
+                 depth = <scalar OR field path>    # m below the floodplain bed
+                 manning = <scalar OR field path>  # default: the floodplain value
+
+Channels are **local-inertial-only** (M6 plan §0) and rejected with ``hllc_fv``.
+
 Rejected until a later milestone: temporal rainfall ``timeseries``/``storm_cells``
-(later), ``[[structures]]`` (M5), and the ``fixed_stage``/``inflow`` boundary
-*types* (deferred out of M4 -- see the M4 plan §6.1 -- so they now carry M5).
+(later) and the ``inflow`` boundary *type* (deferred indefinitely -- ``[[inflow]]``
+cell sources cover prescribed discharge and their mass accounting is exact).
 Field paths are resolved relative to the TOML file's directory.
 """
 
@@ -39,11 +59,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from solver.core.schemes import KNOWN_SCHEMES
+from solver.io.mosaic import TILE_SELECTIONS
 
 # Rainfall types this milestone honours (spatial only; temporal rain deferred).
 _RAIN_TYPES = {"uniform", "field"}
-# Per-edge boundary behaviours this milestone honours.
+# Per-edge boundary behaviours writable as a bare string.
 _BC_TYPES = {"closed", "open"}
+# ... plus "fixed_stage" (M5), which needs a table because it carries a level.
+_BC_ALL = _BC_TYPES | {"fixed_stage"}
 # Edge names -> which domain face they map to (see solver.core.grid docstring).
 _EDGES = ("north", "south", "east", "west")
 
@@ -82,6 +105,140 @@ class Inflow:
         return hg[-1][1]
 
 
+_STRUCTURE_KINDS = {"dam", "levee"}
+_RELEASE_RULES = {"none", "fixed", "target_stage"}
+# Default slow-clock cadence for a release rule: 15 simulated minutes. Small enough
+# that the feedback in `target_stage` is meaningful, coarse enough that the split is
+# genuinely multi-rate against a flood step of seconds (M5 plan §4).
+_DEFAULT_RELEASE_INTERVAL_S = 900.0
+_STRUCTURE_KEYS = {
+    "name",
+    "type",
+    "cell",
+    "cells",
+    "crest_m",
+    "release_rule",
+    "release_m3_s",
+    "target_stage_m",
+    "release_max_m3_s",
+    "pool",
+    "outlet",
+    "interval_s",
+}
+
+
+@dataclass
+class Structure:
+    """A dam or levee with an optional release rule (M5, §7.1 ``[[structures]]``).
+
+    A structure is **barrier geometry plus a rule** (M5 plan §1.2), not a new
+    momentum term:
+
+    * ``cells`` + ``crest_m`` raise the bed to the crest, so impoundment and
+      overtopping are ordinary shallow-water physics the validated scheme already
+      handles. A ``levee`` is exactly this and nothing more.
+    * a ``dam`` may additionally carry a **release rule**, evaluated on the slow
+      clock (``interval_s``) by :mod:`solver.processes.reservoir`, which moves water
+      from the ``pool`` region to the ``outlet`` cell.
+
+    ``pool`` is an inclusive ``(row0, col0, row1, col1)`` box. Elevations
+    (``crest_m``, ``target_stage_m``) are absolute and shift with ``[grid] datum``.
+    """
+
+    name: str = "dam"
+    kind: str = "dam"
+    cells: list[tuple[int, int]] = field(default_factory=list)
+    crest_m: float = 0.0
+    release_rule: str = "none"
+    release_m3_s: float = 0.0  # "fixed": the constant release
+    target_stage_m: float | None = None  # "target_stage": the level to draw down to
+    release_max_m3_s: float = 0.0  # "target_stage": cap on the release
+    pool: tuple[int, int, int, int] | None = None
+    # Inclusive (row0, col0, row1, col1) box the release is delivered into. A single
+    # cell is written as [row, col] in the TOML and normalised to a 1x1 box here.
+    # It is worth using a *reach* rather than one cell: operator splitting delivers a
+    # whole interval's release in one instant, so a single 40 m cell can receive
+    # metres of water at once -- physically absurd as a state even though it drains.
+    outlet: tuple[int, int, int, int] | None = None
+    interval_s: float = _DEFAULT_RELEASE_INTERVAL_S  # slow-clock cadence (sim seconds)
+
+    def __post_init__(self) -> None:
+        if self.kind not in _STRUCTURE_KINDS:
+            raise ValueError(
+                f"structure '{self.name}': type must be one of {sorted(_STRUCTURE_KINDS)}"
+            )
+        if not self.cells:
+            raise ValueError(f"structure '{self.name}': needs at least one barrier cell")
+        if self.release_rule not in _RELEASE_RULES:
+            raise ValueError(
+                f"structure '{self.name}': release_rule must be one of {sorted(_RELEASE_RULES)}"
+            )
+        if self.kind == "levee" and self.release_rule != "none":
+            raise ValueError(
+                f"structure '{self.name}': a levee is barrier geometry only; use type='dam' "
+                "for a release rule"
+            )
+        if self.interval_s <= 0:
+            raise ValueError(f"structure '{self.name}': interval_s must be > 0")
+        if self.release_rule == "none":
+            return
+        if self.pool is None or self.outlet is None:
+            raise ValueError(
+                f"structure '{self.name}': release_rule='{self.release_rule}' needs both a "
+                "'pool' box and an 'outlet' cell (where the released water is delivered)"
+            )
+        r0, c0, r1, c1 = self.pool
+        if r1 < r0 or c1 < c0:
+            raise ValueError(f"structure '{self.name}': pool must be [row0, col0, row1, col1]")
+        o0, p0, o1, p1 = self.outlet
+        if o1 < o0 or p1 < p0:
+            raise ValueError(
+                f"structure '{self.name}': outlet must be [row, col] or [row0, col0, row1, col1]"
+            )
+        if not (o1 < r0 or o0 > r1 or p1 < c0 or p0 > c1):
+            raise ValueError(
+                f"structure '{self.name}': the outlet {self.outlet} overlaps the pool "
+                f"{self.pool}; the release would just shuffle water within the reservoir"
+            )
+        if self.release_rule == "fixed" and self.release_m3_s <= 0:
+            raise ValueError(
+                f"structure '{self.name}': release_rule='fixed' needs release_m3_s > 0"
+            )
+        if self.release_rule == "target_stage":
+            if self.target_stage_m is None:
+                raise ValueError(
+                    f"structure '{self.name}': release_rule='target_stage' needs target_stage_m"
+                )
+            if self.release_max_m3_s <= 0:
+                raise ValueError(
+                    f"structure '{self.name}': release_rule='target_stage' needs "
+                    "release_max_m3_s > 0 (the cap the proportional rule scales toward)"
+                )
+            if self.target_stage_m >= self.crest_m:
+                raise ValueError(
+                    f"structure '{self.name}': target_stage_m ({self.target_stage_m}) must be "
+                    f"below crest_m ({self.crest_m}) -- the rule ramps between the two"
+                )
+
+    def discharge_at(self, stage: float | None) -> float:
+        """Release discharge (m^3/s) the rule asks for at the given pool stage.
+
+        ``fixed`` is open-loop (a constant). ``target_stage`` is the closed-loop
+        rule -- and the one that makes the sync-point feedback path load-bearing:
+        the release ramps proportionally from 0 at the target level to
+        ``release_max_m3_s`` at the crest, so the pool is drawn down toward the
+        target and the release shuts off once it is reached. ``stage is None``
+        (a dry pool) always means no release.
+        """
+        if self.release_rule == "none" or stage is None:
+            return 0.0
+        if self.release_rule == "fixed":
+            return float(self.release_m3_s)
+        span = self.crest_m - float(self.target_stage_m)
+        frac = (stage - float(self.target_stage_m)) / span
+        return float(self.release_max_m3_s) * min(max(frac, 0.0), 1.0)
+
+
 @dataclass
 class Scenario:
     """Solver run configuration (§7.1).
@@ -99,8 +256,20 @@ class Scenario:
     seed: int = 0
     scheme: str = "local_inertial"  # "local_inertial" (M1) | "hllc_fv" (M4)
     tiles_dir: str = "data/tiles/demo"
+    # Tile-set selection (M6, solver.io.mosaic): "all" -> the domain is the whole
+    # mosaic; "first" -> tile 0 only (the pre-M6 behaviour). Identical for the
+    # single-tile manifests every in-tree scenario points at.
+    tiles: str = "all"
+    # Optional inclusive [row0, col0, row1, col1] sub-window in mosaic coordinates.
+    window: tuple[int, int, int, int] | None = None
+    # Run k times coarser than the tiles (M6, solver.io.coarsen): dx' = k*dx, with
+    # every input field aggregated once, before stepping. 1 = run at tile resolution.
+    coarsen: int = 1
     dx: float | None = None  # metres; None -> take from the tile manifest
     crs: str = ""  # "" -> take from the tile manifest
+    # Vertical datum shift (M5): None = no shift, "auto" = floor(min(bed)), or an
+    # explicit reference elevation. See solver.core.datum for why it exists.
+    datum: str | float | None = None
     end_time: float = 3600.0  # simulated seconds
     output_every: float = 300.0
     alpha: float = 0.7  # CFL-like coefficient for the adaptive timestep (TOML: cfl)
@@ -111,6 +280,16 @@ class Scenario:
     # Infiltration loss (mm/hr): scalar OR a field path (0 = none).
     infiltration_mm_hr: float = 0.0
     infiltration_field: str | None = None
+    # Sub-grid channels (M6, solver.core.channels): a channel narrower than a cell,
+    # carried as per-cell geometry. Each is a scalar OR a field path; a run has
+    # channels iff a width is given (scalar > 0 or a field). Local-inertial only.
+    channel_width_m: float = 0.0
+    channel_width_field: str | None = None
+    channel_depth_m: float = 0.0
+    channel_depth_field: str | None = None
+    # None -> the channel inherits the floodplain roughness.
+    channel_manning: float | None = None
+    channel_manning_field: str | None = None
     # Rainfall: "uniform" (scalar rate) or "field" (rate raster).
     rain_type: str = "uniform"
     rain_mm_hr: float = 50.0
@@ -118,8 +297,14 @@ class Scenario:
     rain_duration: float = 1800.0  # seconds rain falls for
     # Inflow hydrographs (point sources).
     inflows: list[Inflow] = field(default_factory=list)
-    # Per-edge boundary behaviour: {north, south, east, west} -> "closed"|"open".
+    # Dams / levees with optional slow-clock release rules (M5).
+    structures: list[Structure] = field(default_factory=list)
+    # Per-edge boundary behaviour: {north,south,east,west} -> "closed"|"open"|"fixed_stage".
     boundaries: dict[str, str] = field(default_factory=lambda: {e: "closed" for e in _EDGES})
+    # Water-level curve for each "fixed_stage" edge (M5): piecewise-linear
+    # [(t_s, level_m), ...], held at its end values outside the range. A constant
+    # level is a one-point curve. Absolute elevations -- shifted with the datum.
+    stage_curves: dict[str, list[tuple[float, float]]] = field(default_factory=dict)
     initial_depth: float = 0.0
     source_path: str | None = None  # the TOML this was loaded from (provenance)
     meta: dict = field(default_factory=dict)
@@ -150,6 +335,24 @@ class Scenario:
                 f"end_time ({self.end_time}) must be an exact multiple of output_every "
                 f"({self.output_every}); otherwise the final frame at end_time is dropped"
             )
+        # Domain selection (M6): validated here so the bare-CLI path is covered too.
+        if self.tiles not in TILE_SELECTIONS:
+            raise ValueError(
+                f"[grid] tiles must be one of {list(TILE_SELECTIONS)}, got {self.tiles!r}"
+            )
+        if self.window is not None:
+            if len(self.window) != 4:
+                raise ValueError(
+                    f"[grid] window must be [row0, col0, row1, col1], got {self.window!r}"
+                )
+            r0, c0, r1, c1 = self.window
+            if min(r0, c0) < 0 or r1 < r0 or c1 < c0:
+                raise ValueError(
+                    f"[grid] window {list(self.window)} must be a non-negative, non-empty "
+                    "inclusive [row0, col0, row1, col1] box in mosaic coordinates"
+                )
+        if self.coarsen < 1:
+            raise ValueError(f"[grid] coarsen must be an integer >= 1, got {self.coarsen}")
         # Physical scalars are non-negative (field files are checked in solver.io.fields).
         if self.manning_n < 0:
             raise ValueError(f"manning_n must be >= 0, got {self.manning_n}")
@@ -159,6 +362,48 @@ class Scenario:
             raise ValueError(f"rainfall rate must be >= 0 mm/hr, got {self.rain_mm_hr}")
         if self.rain_duration < 0:
             raise ValueError(f"rainfall duration must be >= 0 s, got {self.rain_duration}")
+        # fixed_stage is HLLC-only (M5 plan §1.4): the local-inertial scheme has no
+        # boundary faces to impose a surface on -- its BCs are a zeroed edge face
+        # (closed) plus a post-interior self-capping sink (open), because the M1
+        # donor limiter never scales edge faces. A pressure-driven edge flux there
+        # would be exactly the unprotected case that shape exists to avoid. So this
+        # is a hard error on both construction paths, not a silent approximation.
+        bad_bc = sorted(f"{e}={v!r}" for e, v in self.boundaries.items() if v not in _BC_ALL)
+        if bad_bc:
+            raise ValueError(
+                f"unknown boundary type(s): {', '.join(bad_bc)}; use {sorted(_BC_ALL)}"
+            )
+        # Sub-grid channels are local-inertial-only (M6 plan §0), the mirror image of
+        # fixed_stage being HLLC-only: the channel model is a conveyance/storage
+        # parameterization that fits LI's face-flux structure, while HLLC's Riemann
+        # solver acts on one cell-average conservative state over a reconstructed
+        # bed -- a second flow path inside that average has no honest expression
+        # there. Loud, not a silent no-op.
+        if self.has_channels and self.scheme != "local_inertial":
+            raise ValueError(
+                f"[channels] requires scheme='local_inertial'; the '{self.scheme}' scheme "
+                "has no sub-grid channel model (M6 plan §0). Run the reach with the "
+                "coverage scheme, or resolve the channel and drop [channels]."
+            )
+        if self.channel_width_field is None and self.channel_width_m < 0:
+            raise ValueError(f"[channels] width must be >= 0, got {self.channel_width_m}")
+        if self.has_channels and self.channel_depth_field is None and self.channel_depth_m <= 0:
+            raise ValueError(
+                "[channels] a width without a bank-full depth is not a channel; set "
+                "[channels] depth (a scalar or a field)"
+            )
+        if self.channel_manning is not None and self.channel_manning <= 0:
+            raise ValueError(f"[channels] manning must be > 0, got {self.channel_manning}")
+        stage_edges = sorted(e for e, v in self.boundaries.items() if v == "fixed_stage")
+        if stage_edges and self.scheme != "hllc_fv":
+            raise ValueError(
+                f"boundary type 'fixed_stage' ({', '.join(stage_edges)}) requires "
+                f"scheme='hllc_fv'; the '{self.scheme}' scheme has no boundary faces to "
+                "prescribe a water surface on (M5 plan §1.4)"
+            )
+        for edge in stage_edges:
+            if not self.stage_curves.get(edge):
+                raise ValueError(f"boundary '{edge}' is fixed_stage but carries no stage curve")
         # The local-inertial scheme is stable only to CFL ~0.7 (Bates 2010); warn
         # loudly above that band rather than fail (experimentation is allowed).
         if self.alpha > 0.9:
@@ -169,12 +414,22 @@ class Scenario:
             )
 
     @property
+    def has_channels(self) -> bool:
+        """Whether the scenario carries sub-grid channel geometry (M6)."""
+        return self.channel_width_field is not None or self.channel_width_m > 0.0
+
+    @property
     def rain_m_s(self) -> float:
         return self.rain_mm_hr / 1000.0 / 3600.0
 
     @property
     def has_open_boundary(self) -> bool:
         return any(v == "open" for v in self.boundaries.values())
+
+    @property
+    def stage_events(self) -> list[float]:
+        """Stage-curve knot times -- sync points so a step never straddles a slope."""
+        return sorted({t for curve in self.stage_curves.values() for t, _ in curve})
 
     def field_paths(self) -> dict[str, str]:
         """Referenced field files by role (for provenance hashing)."""
@@ -184,6 +439,9 @@ class Scenario:
                 ("manning", self.manning_field),
                 ("infiltration", self.infiltration_field),
                 ("rain", self.rain_field),
+                ("channel_width", self.channel_width_field),
+                ("channel_depth", self.channel_depth_field),
+                ("channel_manning", self.channel_manning_field),
             )
             if p
         }
@@ -199,14 +457,16 @@ _KNOWN_TABLES = {
     "boundaries",
     "inflow",
     "structures",
+    "channels",
 }
 _KNOWN_KEYS = {
     "meta": {"name", "seed", "scheme"},
-    "grid": {"tiles_dir", "dx", "crs"},
+    "grid": {"tiles_dir", "tiles", "window", "coarsen", "dx", "crs", "datum"},
     "run": {"end_time", "output_every", "cfl", "dt_max"},
     "rainfall": {"type", "rate_mm_hr", "field", "duration_s"},
     "parameters": {"manning_n", "infiltration"},
     "boundaries": {"default", *_EDGES},
+    "channels": {"width", "depth", "manning"},
 }
 
 
@@ -223,19 +483,19 @@ def _resolve_path(base_dir: Path, value: str) -> str:
 
 
 def _parse_field_param(
-    parameters: dict, key: str, base_dir: Path, *, default_scalar: float
+    parameters: dict, key: str, base_dir: Path, *, default_scalar: float, table: str = "parameters"
 ) -> tuple[float, str | None]:
     """Parse a ``scalar OR path`` parameter -> (scalar, field_path_or_None)."""
     if key not in parameters:
         return default_scalar, None
     val = parameters[key]
     if isinstance(val, bool):  # bool is an int subclass -- reject explicitly
-        raise ConfigError(f"[parameters] {key} must be a number or a field path, got {val!r}")
+        raise ConfigError(f"[{table}] {key} must be a number or a field path, got {val!r}")
     if isinstance(val, (int, float)):
         return float(val), None
     if isinstance(val, str):
         return default_scalar, _resolve_path(base_dir, val)
-    raise ConfigError(f"[parameters] {key} must be a number or a field path, got {val!r}")
+    raise ConfigError(f"[{table}] {key} must be a number or a field path, got {val!r}")
 
 
 def _parse_inflows(doc: dict, ny_nx: tuple[int, int] | None = None) -> list[Inflow]:
@@ -261,24 +521,158 @@ def _parse_inflows(doc: dict, ny_nx: tuple[int, int] | None = None) -> list[Infl
     return inflows
 
 
-def _parse_boundaries(boundaries: dict) -> dict[str, str]:
-    """Resolve per-edge boundary behaviour, applying ``default`` to unset edges."""
-    default = boundaries.get("default", "closed")
-    if default not in _BC_TYPES:
+_STAGE_EXAMPLE = '{ type = "fixed_stage", level = 10.0 }'
+
+
+def _parse_stage_curve(edge: str, table: dict) -> list[tuple[float, float]]:
+    """Parse a ``fixed_stage`` edge table into a piecewise-linear stage curve.
+
+    Either ``level = <m>`` (constant, stored as a one-point curve) or
+    ``stage = [[t_s, level_m], ...]`` (piecewise-linear, held at its end values
+    outside the range -- a water level does not vanish the way a hydrograph does).
+    """
+    has_level, has_curve = "level" in table, "stage" in table
+    if has_level == has_curve:
         raise ConfigError(
-            f"[boundaries] default='{default}' is not supported; use "
-            "'closed' or 'open'. 'fixed_stage'/'inflow' boundary types arrive in M5."
+            f"[boundaries] {edge}: fixed_stage needs exactly one of 'level' "
+            f"(constant, e.g. {_STAGE_EXAMPLE}) or 'stage' (a [[t, level]] curve)"
         )
-    resolved = {}
+    if has_level:
+        lvl = table["level"]
+        if isinstance(lvl, bool) or not isinstance(lvl, (int, float)):
+            raise ConfigError(f"[boundaries] {edge}: fixed_stage 'level' must be a number")
+        return [(0.0, float(lvl))]
+    raw = table["stage"]
+    if not (isinstance(raw, list) and raw and all(len(pt) == 2 for pt in raw)):
+        raise ConfigError(
+            f"[boundaries] {edge}: fixed_stage 'stage' must be a non-empty list of "
+            "[t_s, level_m] pairs"
+        )
+    pts = [(float(t), float(lv)) for t, lv in raw]
+    times = [t for t, _ in pts]
+    if any(b < a for a, b in zip(times, times[1:], strict=False)):
+        raise ConfigError(f"[boundaries] {edge}: fixed_stage 'stage' times must be non-decreasing")
+    return pts
+
+
+def _cell_pair(value: object, what: str) -> tuple[int, int]:
+    if not (isinstance(value, list) and len(value) == 2):
+        raise ConfigError(f"{what} must be [row, col], got {value!r}")
+    return (int(value[0]), int(value[1]))
+
+
+def _parse_structures(doc: dict) -> list[Structure]:
+    """Parse the ``[[structures]]`` array into validated :class:`Structure` records.
+
+    Barrier cells may be given as a single ``cell = [i, j]`` or a ``cells`` list;
+    both forms end up in ``Structure.cells``.
+    """
+    raw = doc.get("structures", [])
+    if isinstance(raw, dict):  # a single [structures] table rather than [[structures]]
+        raw = [raw]
+    out: list[Structure] = []
+    for k, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ConfigError(f"[[structures]] #{k}: must be a table")
+        unknown = set(entry) - _STRUCTURE_KEYS
+        if unknown:
+            warnings.warn(
+                f"[[structures]] #{k}: unknown key(s) {sorted(unknown)} ignored", stacklevel=3
+            )
+        name = str(entry.get("name", f"structure_{k}"))
+        cells: list[tuple[int, int]] = []
+        if "cell" in entry:
+            cells.append(_cell_pair(entry["cell"], f"[[structures]] #{k}: 'cell'"))
+        for c in entry.get("cells", []):
+            cells.append(_cell_pair(c, f"[[structures]] #{k}: each entry of 'cells'"))
+        if "crest_m" not in entry:
+            raise ConfigError(f"[[structures]] #{k} ('{name}'): 'crest_m' is required")
+        pool = entry.get("pool")
+        if pool is not None:
+            if not (isinstance(pool, list) and len(pool) == 4):
+                raise ConfigError(
+                    f"[[structures]] #{k} ('{name}'): 'pool' must be [row0, col0, row1, col1]"
+                )
+            pool = tuple(int(v) for v in pool)
+        outlet = entry.get("outlet")
+        if outlet is not None:
+            if not (isinstance(outlet, list) and len(outlet) in (2, 4)):
+                raise ConfigError(
+                    f"[[structures]] #{k} ('{name}'): 'outlet' must be [row, col] or "
+                    "[row0, col0, row1, col1]"
+                )
+            vals = tuple(int(v) for v in outlet)
+            outlet = (vals[0], vals[1], vals[0], vals[1]) if len(vals) == 2 else vals
+        try:
+            out.append(
+                Structure(
+                    name=name,
+                    kind=str(entry.get("type", "dam")),
+                    cells=cells,
+                    crest_m=float(entry["crest_m"]),
+                    release_rule=str(entry.get("release_rule", "none")),
+                    release_m3_s=float(entry.get("release_m3_s", 0.0)),
+                    target_stage_m=(
+                        float(entry["target_stage_m"]) if "target_stage_m" in entry else None
+                    ),
+                    release_max_m3_s=float(entry.get("release_max_m3_s", 0.0)),
+                    pool=pool,
+                    outlet=outlet,
+                    interval_s=float(entry.get("interval_s", _DEFAULT_RELEASE_INTERVAL_S)),
+                )
+            )
+        except (TypeError, ValueError) as e:
+            raise ConfigError(f"[[structures]] #{k} ('{name}'): {e}") from e
+    return out
+
+
+def _parse_boundaries(
+    boundaries: dict,
+) -> tuple[dict[str, str], dict[str, list[tuple[float, float]]]]:
+    """Resolve per-edge boundary behaviour, applying ``default`` to unset edges.
+
+    Returns ``(types, stage_curves)``: the per-edge type map and, for every
+    ``fixed_stage`` edge, its water-level curve. A bare string is ``"closed"`` or
+    ``"open"``; ``fixed_stage`` is a table because it carries a level (M5).
+    """
+    default = boundaries.get("default", "closed")
+    if not isinstance(default, str) or default not in _BC_TYPES:
+        raise ConfigError(
+            f"[boundaries] default={default!r} is not supported; use 'closed' or 'open'. "
+            f"A fixed_stage edge is per-edge and needs a level: north = {_STAGE_EXAMPLE}."
+        )
+    resolved: dict[str, str] = {}
+    curves: dict[str, list[tuple[float, float]]] = {}
     for edge in _EDGES:
         val = boundaries.get(edge, default)
-        if val not in _BC_TYPES:
+        if isinstance(val, str):
+            if val not in _BC_TYPES:
+                raise ConfigError(
+                    f"[boundaries] {edge}='{val}' is not supported; use 'closed', 'open', or a "
+                    f"fixed_stage table ({edge} = {_STAGE_EXAMPLE}). The 'inflow' boundary "
+                    "*type* stays deferred -- use [[inflow]] cell sources, which are exact."
+                )
+            resolved[edge] = val
+            continue
+        if not isinstance(val, dict):
             raise ConfigError(
-                f"[boundaries] {edge}='{val}' is not supported; use 'closed' or "
-                "'open'. 'fixed_stage'/'inflow' boundary types arrive in M5."
+                f"[boundaries] {edge}={val!r} must be 'closed', 'open', or a fixed_stage "
+                f"table ({edge} = {_STAGE_EXAMPLE})"
             )
-        resolved[edge] = val
-    return resolved
+        kind = val.get("type")
+        if kind == "inflow":
+            raise ConfigError(
+                f"[boundaries] {edge}: the 'inflow' boundary *type* is deferred -- use "
+                "[[inflow]] cell sources (M3), whose mass accounting is exact by construction."
+            )
+        if kind != "fixed_stage":
+            raise ConfigError(
+                f"[boundaries] {edge}: unknown boundary type {kind!r}; the table form is "
+                f"only for fixed_stage ({edge} = {_STAGE_EXAMPLE})"
+            )
+        resolved[edge] = "fixed_stage"
+        curves[edge] = _parse_stage_curve(edge, val)
+    return resolved, curves
 
 
 def load_config(path: str | Path) -> Scenario:
@@ -344,13 +738,15 @@ def load_config(path: str | Path) -> Scenario:
             raise ConfigError("[rainfall] type='field' requires a 'field' path")
         rain_field = _resolve_path(base_dir, str(rainfall["field"]))
 
-    if "structures" in doc:
-        raise ConfigError(
-            "[[structures]] (dams/levees) are not supported yet; structures and "
-            "release rules arrive in M5."
-        )
+    datum = grid.get("datum")
+    if datum is not None and not isinstance(datum, (int, float, str)):
+        raise ConfigError(f"[grid] datum must be a number or 'auto', got {datum!r}")
+    if isinstance(datum, str) and datum != "auto":
+        raise ConfigError(f"[grid] datum must be a number or 'auto', got {datum!r}")
+    if isinstance(datum, bool):  # bool is an int subclass -- reject explicitly
+        raise ConfigError(f"[grid] datum must be a number or 'auto', got {datum!r}")
 
-    bc = _parse_boundaries(boundaries)
+    bc, stage_curves = _parse_boundaries(boundaries)
     manning_n, manning_field = _parse_field_param(
         parameters, "manning_n", base_dir, default_scalar=Scenario().manning_n
     )
@@ -358,6 +754,43 @@ def load_config(path: str | Path) -> Scenario:
         parameters, "infiltration", base_dir, default_scalar=0.0
     )
     inflows = _parse_inflows(doc)
+    structures = _parse_structures(doc)
+
+    # Sub-grid channels (M6): each entry is a scalar or a field path, exactly like
+    # [parameters]. `manning` unset means the channel inherits the floodplain value.
+    channels = doc.get("channels", {})
+    _warn_unknown("channels", channels)
+    chan_width, chan_width_field = _parse_field_param(
+        channels, "width", base_dir, default_scalar=0.0, table="channels"
+    )
+    chan_depth, chan_depth_field = _parse_field_param(
+        channels, "depth", base_dir, default_scalar=0.0, table="channels"
+    )
+    chan_n, chan_n_field = _parse_field_param(
+        channels, "manning", base_dir, default_scalar=0.0, table="channels"
+    )
+
+    # Domain selection (M6): which tiles of the manifest, and which sub-window.
+    tiles_select = grid.get("tiles", Scenario().tiles)
+    if not isinstance(tiles_select, str) or tiles_select not in TILE_SELECTIONS:
+        raise ConfigError(
+            f"[grid] tiles={tiles_select!r} is not supported; use 'all' (the domain is "
+            "the whole tile mosaic) or 'first' (tile 0 only, the pre-M6 behaviour)."
+        )
+    window = grid.get("window")
+    if window is not None:
+        if not (isinstance(window, list) and len(window) == 4):
+            raise ConfigError(
+                f"[grid] window must be [row0, col0, row1, col1] (inclusive, in mosaic "
+                f"coordinates), got {window!r}"
+            )
+        window = tuple(int(v) for v in window)
+    coarsen = grid.get("coarsen", 1)
+    if isinstance(coarsen, bool) or not isinstance(coarsen, int) or coarsen < 1:
+        raise ConfigError(
+            f"[grid] coarsen={coarsen!r} must be an integer >= 1 (the factor by which the "
+            "run grid is coarser than the tiles; 1 runs at tile resolution)"
+        )
 
     # --- build the Scenario ----------------------------------------------------
     defaults = Scenario()
@@ -367,8 +800,12 @@ def load_config(path: str | Path) -> Scenario:
             seed=int(meta.get("seed", defaults.seed)),
             scheme=scheme,
             tiles_dir=str(grid.get("tiles_dir", defaults.tiles_dir)),
+            tiles=tiles_select,
+            window=window,
+            coarsen=coarsen,
             dx=(float(grid["dx"]) if "dx" in grid else None),
             crs=str(grid.get("crs", "")),
+            datum=(datum if isinstance(datum, str) or datum is None else float(datum)),
             end_time=float(run.get("end_time", defaults.end_time)),
             output_every=float(run.get("output_every", defaults.output_every)),
             alpha=float(run.get("cfl", defaults.alpha)),
@@ -380,9 +817,17 @@ def load_config(path: str | Path) -> Scenario:
             rain_type=rain_type,
             rain_mm_hr=float(rainfall.get("rate_mm_hr", defaults.rain_mm_hr)),
             rain_field=rain_field,
+            channel_width_m=chan_width,
+            channel_width_field=chan_width_field,
+            channel_depth_m=chan_depth,
+            channel_depth_field=chan_depth_field,
+            channel_manning=(chan_n if (chan_n > 0.0 or chan_n_field) else None),
+            channel_manning_field=chan_n_field,
             rain_duration=float(rainfall.get("duration_s", defaults.rain_duration)),
             inflows=inflows,
+            structures=structures,
             boundaries=bc,
+            stage_curves=stage_curves,
             source_path=str(path),
             meta={"scheme": scheme, "boundaries": bc, "rain_type": rain_type},
         )

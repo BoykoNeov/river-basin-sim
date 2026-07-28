@@ -15,7 +15,79 @@ A faithful research/education sandbox validated against benchmarks — **not a
 regulatory-certification tool**. State that honestly anywhere it matters.
 
 ## Status
-- **M4 — Fidelity step: acceptance met; confirm before M5.** A second, higher-fidelity
+- **M6 — Reach: acceptance met; confirm before M7.** Reach is bought by **choosing the
+  resolution** and putting the lost river back, not by nesting grids. Three pieces:
+  **`solver/io/mosaic.py`** makes the domain the whole **tile mosaic** (`[grid] tiles`
+  = `all`/`first`, `[grid] window` = an inclusive box in mosaic coords; only the tiles a
+  window touches are memmapped; uncovered cells are filled flat **and counted**);
+  **`solver/io/coarsen.py`** runs `k`× coarser (`[grid] coarsen`, `dx' = k·dx`) with every
+  field aggregated **once, before any water moves** — block **mean** for the bed and the
+  rate fields (volume-preserving), block **max** for channel width/depth (a river crosses
+  a block; a mean thins it away) — and cell indices mapped `i // k`, refused if they leave
+  the domain; and **`solver/core/channels.py`** carries a **channel narrower than its
+  cell**. That last is the milestone: `h` keeps its meaning (volume per unit plan area,
+  so continuity, the donor limiter and the ledger are untouched and **mass conservation
+  stays exact by construction**), and the channel enters only through the **storage
+  curve** `h → η` (below bank full `η = z − d + h·dx/w`; above it `η = z + (h − h_bf)`;
+  `w = 0` collapses to `z + h` bit for bit) and a **two-component face update** — channel
+  flow with hydraulic radius `A/P` **not** the depth, plus the M1 floodplain flow,
+  recombined into the same total flux. The CFL reduces over the water **column**, since a
+  channel concentrates depth by `dx/w`. **Local-inertial only, loudly** (the mirror of
+  M5's HLLC-only `fixed_stage`). **Validated:** normal depth in a 20 m channel inside 50 m
+  cells is **−0.1%** off its own analytical section (1.296 vs 1.298 m); overbank spill
+  conserves mass (3.6e-8); and the **reach claim** — the same 2 km reach resolved at 10 m
+  (2000 cells) versus sub-grid at 100 m (20 cells) — agrees to **0.1%** in depth. §7.3's
+  `tile_grid` is real now (frames > 512 split row-major; an untiled export is byte-identical
+  to M2's), and the Godot reader takes its grid from the manifest and blits tiles —
+  **written but unverified, no Godot/GPU in that session**. Demo
+  `scenarios/reach_basin.toml`: a **6×6 mosaic, 76.8 km square**, run at 768² @ 100 m with
+  2232 channel cells, mass **2.79e-7**. **228 tests green.** **One loud carried finding:**
+  the mass gate is now a *precision envelope* — the same demo at `coarsen = 4` **exceeds**
+  it (1.8e-6) and does so identically with channels off, i.e. float32 accumulation of
+  rain into a thin sheet (§12's drift-at-scale, measured). Check storm depth / cell count /
+  step count before calling a reach-scale gate failure a bug. See `docs/plans/M6-reach.md`.
+- **M5 — Multi-physics: done.** The locked time-integration
+  decision (HANDOFF §2/§8) is now real code. **`solver/scheduler.py`** owns the single
+  simulated clock and *only* that: the fast scheme still computes its own state-derived
+  `Δt`; the scheduler clamps it so a step never crosses a **sync point** (output cadence,
+  forcing breakpoints, `end_time`, **slow-process activations**) and yields a `Tick`.
+  It is a **clock, not a driver** — `run.py` keeps state/stepping/forcing/accounting/IO,
+  which is what makes the sync-point algebra unit-testable with a stub `dt_fn` and no GPU.
+  With no slow processes the event set and its arithmetic are unchanged, so **pre-M5 runs
+  are bitwise-identical** (verified against stored LI/M3/HLLC baselines; guarded in-tree
+  by a test that replays the pre-M5 inline loop as an executable reference).
+  Exercised by **reservoir operations** (`[[structures]]` + `solver/processes/reservoir.py`):
+  a structure is **barrier geometry plus a rule** — cells' bed raised to `crest_m` (so
+  impoundment and overtopping are ordinary solver physics, nothing to re-validate) plus
+  an optional release rule (`fixed` open-loop, `target_stage` proportional draw-down)
+  evaluated **only at slow-clock activations** while the flood scheme sub-cycles freely.
+  The pool→outlet transfer is **mass-exact** (withdrawal banks the actual f32 depth
+  change in f64, the request is capped by what the pool holds, delivery banks its
+  rounding); the outlet is a **box**, because splitting hands over a whole interval at
+  once and 54,000 m³ into one 40 m cell is a 34 m column. Also lands the two M4
+  deferrals: **`fixed_stage`** — a prescribed-surface Dirichlet ghost, the third member
+  of M4's per-edge ghost family, constant or piecewise-linear in time, banked in *both*
+  directions, **HLLC-only and loudly so** (LI has no boundary face to prescribe a surface
+  on) — and the **datum shift** (`[grid] datum`, `z' = z − z_ref`), which protects float32
+  `η = h + z` at altitude and un-shifts the bed on the way out. **Validated:** stage edge
+  leaves a lake at rest (1.2e-5 m/s, nothing crosses), per-edge fill ×4 settles exactly at
+  the prescribed level, a stage drain to 90% dry cells still banks exactly (7.3e-8);
+  release transfer moves 300.000 m³ with a 0.0 residual, `target_stage` converges
+  3.76→3.002 m with Q easing 3.04→0.01 m³/s, activations are bit-identical at `dt_max`
+  5.0 and 1.0; and **EA SC080035 Test 1** (disconnected water body) — the far pond floods
+  to 0.393 m and still holds 0.317 m after 5 h at the 10.10 m ridge crest while the
+  connected pond returns exactly to the 9.700 m boundary. Demo
+  `scenarios/reservoir_release.toml` fills a valley reservoir to 0.52 Mm³ then draws it
+  down under proportional control (Q easing 40.6 → 12.7 m³/s as the stage falls toward
+  its target), mass 4.6e-7. **189 tests green.**
+  **Two carried honesty notes:** EA Test 1's SC080035 figures were not reachable from
+  this session, so its geometry is *faithful in form, reconstructed in detail* (the
+  docstring separates pinned from reconstructed; the gate is the qualitative finding
+  plus the mass gate); and M4's expectation that Test 1 *needs* the datum shift **does
+  not hold** — parametrized over both datums, the runs agree to three decimals and both
+  clear the gate (the shift earns its keep at ~500 m+, measured ~1600× at 5000 m).
+  See `docs/plans/M5-multi-physics.md`.
+- **M4 — Fidelity step: done.** A second, higher-fidelity
   scheme now coexists with LI by **selection, not replacement** (HANDOFF §2 — LI stays
   the permanent coverage scheme): a **well-balanced Godunov HLLC finite-volume solver**
   (`solver/core/hllc.py`, `scheme = "hllc_fv"`) — MUSCL/minmod on η, **hydrostatic
@@ -117,6 +189,18 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   open boundary, self-contained) and `scenarios/spatial_fields.toml` (Manning +
   infiltration `.r32` fields — generate them first with
   `uv run python scripts/make_demo_fields.py`).
+- M6 scenario: `scenarios/reach_basin.toml` — a 6x6 tile mosaic (1536^2 @ 50 m = 76.8 km
+  square) run at `coarsen = 2` (768^2 @ 100 m) with the river carried by sub-grid
+  channels. Generate its synthetic basin + channel fields first with
+  `uv run python scripts/make_reach_demo.py`. For a real DEM, derive the channel fields
+  from the M0 flow accumulation: `uv run python -m pipeline.channels --src <conditioned>
+  --tiles <tiles> --out <fields>` (its hydraulic-geometry coefficients are **regional
+  calibration inputs**, recorded beside the fields).
+- M5 scenario: `scenarios/reservoir_release.toml` — a dam with a `target_stage` release
+  rule on the slow clock, a tidal `fixed_stage` southern edge, and inflow hydrographs
+  filling the reservoir. Generate its synthetic valley tile first with
+  `uv run python scripts/make_reservoir_demo.py` (the dam is placed by cell index and
+  crest elevation, so it needs terrain whose valley is known, not arbitrary DEM).
 - M4 scenario: `scenarios/river_reach_hllc.toml` — the HLLC fidelity scheme on the
   *same* scenario as `river_reach.toml` (only `[meta].scheme` and the CFL differ), so
   running both gives a like-for-like LI-vs-HLLC side-by-side. Pick the scheme per
@@ -169,6 +253,32 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   just the flat-lake test — and the first-order drop near dry cells (`hllc._dryfactor`)
   must be applied **identically in the flux and source kernels**, or Audusse's exact
   balance breaks.
+- **The mass gate is a *conditioning* gauge as well as a correctness one.** A
+  centimetre-thin sheet on a bed at ~1 m loses enough of `h` inside float32
+  `η = h + z` that a few hundred steps of accumulated round-off drifts a *closed*
+  domain past the 1e-6 gate — with nothing wrong in the physics. Before treating a
+  gate failure as a bug, check the depth-to-elevation ratio and step count; the fix is
+  usually `[grid] datum` or a better-scaled test, not a change to the scheme. (M4's EA
+  Test 2 note is the same effect measured on horizon length.)
+- **A slow process hands over a whole interval at once — that is the splitting, not a
+  bug, but it has a scale.** 60 m³/s over a 900 s reservoir interval is 54,000 m³; into
+  a single 40 m cell that is a 34 m instantaneous column. Deliver over a *reach* (the
+  `outlet` box), and sanity-check `Q · interval_s / (area · cells)` before believing a
+  release-driven result.
+- **At reach scale the mass gate is a *precision envelope*, not a margin.** A
+  rain-on-grid run over hundreds of thousands of cells accumulates float32 round-off in
+  `h` while it rains: M6's demo is 2.8e-7 at 15 mm/hr but the *same* scenario at
+  `coarsen = 4` trips the gate at 1.8e-6 — **identically with sub-grid channels disabled**,
+  so it is the source accumulation, not the new code (HANDOFF §12's drift-at-scale). The
+  residual is roughly fixed in absolute terms and stops growing when the rain stops, so the
+  relative error *falls* as the basin fills. Diagnose a reach-scale failure by storm depth,
+  cell count and step count before suspecting the scheme; the real fix (compensated or
+  float64 source accumulation) is a precision pass, and it should land before M7 adds
+  sediment to the same fields.
+- **A sub-grid channel conveys only where it is continuous.** `w_face = min(w_L, w_R)`, so
+  a channel band that steps sideways faster than it is wide has a wall across it and
+  nothing in the depth field says so. Check connectivity when authoring channel geometry
+  (`scripts/make_reach_demo.py::check_continuity` exists because the first demo did this).
 - **Never keep depth non-negative with a bare `max(h, 0)`.** It invents mass and
   silently breaks the ledger and any boundary banking (M4 measured ~6.5e-2 on a full
   drain, five orders over the gate). Both schemes use a **donor-cell β mass-flux

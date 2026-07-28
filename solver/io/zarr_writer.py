@@ -67,6 +67,17 @@ class ZarrWriter:
         """Write the static bed field once (call any time before finalize)."""
         self._bed[:] = np.ascontiguousarray(bed, dtype=np.float32)
 
+    def write_static(self, name: str, field: np.ndarray) -> None:
+        """Write an extra static ``(Y, X)`` field into the store (§7.2 extensible).
+
+        Used by M6 for sub-grid channel geometry (``channel_width``,
+        ``channel_depth``): the bed alone no longer describes the terrain the run
+        actually stepped on, so a stored result that used channels carries them.
+        """
+        ny, nx = self.grid.shape
+        arr = self.root.create_array(name, shape=(ny, nx), dtype="f4", dimension_names=("y", "x"))
+        arr[:] = np.ascontiguousarray(field, dtype=np.float32)
+
     def append(self, time: float, depth: np.ndarray, u: np.ndarray, v: np.ndarray) -> None:
         """Append one output frame at the next time index."""
         if self._i >= self.n_frames:

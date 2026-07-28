@@ -16,29 +16,39 @@ CLI::
 from __future__ import annotations
 
 import argparse
-import json
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
 import warp as wp
 
+from solver.core.channels import arm_channels
+from solver.core.datum import resolve_datum, shift_bed, unshift_bed
 from solver.core.grid import Grid
 from solver.core.massbalance import MASS_GATE, MassLedger
 from solver.core.schemes import get_scheme
 from solver.core.state import State
-from solver.io.config import Scenario, load_config
+from solver.io.coarsen import (
+    block_reduce,
+    check_indices,
+    coarsen_scenario,
+    coarsened_shape,
+    crop_report,
+)
+from solver.io.config import Scenario, Structure, load_config
 from solver.io.fields import load_field
+from solver.io.mosaic import Mosaic, assemble_mosaic
 from solver.io.provenance import write_provenance
 from solver.io.status import StatusWriter
 from solver.io.viewer_export import export_frames
 from solver.io.zarr_writer import ZarrWriter
 from solver.processes.inflow import InflowInjector
+from solver.processes.reservoir import apply_barriers, build_operators
+from solver.scheduler import EPS_T, MultiRateScheduler
 
 # Scenario is defined in solver.io.config (the §7.1 contract); re-exported here so
 # existing callers (`from solver.run import Scenario`) keep working.
 __all__ = ["Scenario", "load_config", "run_simulation", "main"]
-
-EPS_T = 1e-6  # time-comparison tolerance (seconds)
 
 
 def load_r32_bed(tiles_dir: str | Path) -> tuple[np.ndarray, dict]:
@@ -46,14 +56,25 @@ def load_r32_bed(tiles_dir: str | Path) -> tuple[np.ndarray, dict]:
 
     Returns the ``(ny, nx)`` float32 bed (metres) plus the manifest dict (for dx,
     CRS, bounds). The ``.r32`` is raw little-endian row-major float32 (HANDOFF §7).
+
+    Kept as the single-tile shorthand (and for callers that predate M6); the run
+    path assembles the whole tile set through :func:`solver.io.mosaic.assemble_mosaic`.
     """
-    tiles_dir = Path(tiles_dir)
-    manifest = json.loads((tiles_dir / "tiles.json").read_text())
-    t0 = manifest["tiles"][0]
-    h, w = int(t0["height"]), int(t0["width"])
-    raw = np.fromfile(tiles_dir / t0["file"], dtype="<f4", count=h * w)
-    bed = raw.reshape(h, w).astype(np.float32)
-    return bed, manifest
+    m = assemble_mosaic(tiles_dir, select="first")
+    return m.bed, m.manifest
+
+
+def field_memory_mb(shape: tuple[int, int]) -> float:
+    """Rough device memory for one run's float32 state fields, in MB (M6 §4).
+
+    Counts the local-inertial working set -- ``h, z, n, eta, beta`` at cell centres
+    plus ``qx, qy`` on faces, i.e. ~7 arrays of ``ny*nx`` float32 -- so a reach-scale
+    domain's cost is printed *before* stepping rather than discovered as a CUDA
+    out-of-memory. Optional fields (momentum, channels, loss ledger) add to this;
+    the number is an order-of-magnitude guide, and says so.
+    """
+    ny, nx = shape
+    return 7 * 4 * ny * nx / (1024.0 * 1024.0)
 
 
 def pick_device(requested: str | None) -> str:
@@ -64,10 +85,42 @@ def pick_device(requested: str | None) -> str:
     return "cuda:0" if wp.get_cuda_devices() else "cpu"
 
 
-def _next_event_time(t: float, events: list[float]) -> float:
-    """Smallest event time strictly after ``t`` (or +inf if none)."""
-    future = [e for e in events if e > t + EPS_T]
-    return min(future) if future else float("inf")
+@dataclass
+class _ShiftedElevations:
+    """A run's absolute elevations moved into the stepping datum (M5 §1.5)."""
+
+    bed: np.ndarray
+    z_ref: float
+    stage_curves: dict[str, list[tuple[float, float]]]
+    structures: list[Structure]
+
+
+def shift_for_datum(scenario: Scenario, bed: np.ndarray) -> _ShiftedElevations:
+    """Resolve ``[grid] datum`` and put the run into shifted coordinates (M5 §1.5).
+
+    **Every absolute elevation the scenario carries shifts here**, in this one
+    function, so the bed and the config's elevations can never disagree by
+    ``z_ref``: the bed, each ``fixed_stage`` water-level curve, and each structure's
+    ``crest_m`` / ``target_stage_m``. Depth, velocity and all mass accounting are
+    datum-independent, and the canonical store still records the true bed
+    (:func:`solver.core.datum.unshift_bed`).
+    """
+    z_ref = resolve_datum(scenario.datum, bed)
+    curves = {
+        edge: [(t, level - z_ref) for t, level in curve]
+        for edge, curve in scenario.stage_curves.items()
+    }
+    structures = [
+        replace(
+            s,
+            crest_m=s.crest_m - z_ref,
+            target_stage_m=(None if s.target_stage_m is None else s.target_stage_m - z_ref),
+        )
+        for s in scenario.structures
+    ]
+    return _ShiftedElevations(
+        bed=shift_bed(bed, z_ref), z_ref=z_ref, stage_curves=curves, structures=structures
+    )
 
 
 def run_simulation(
@@ -78,13 +131,16 @@ def run_simulation(
     device: str = "cpu",
     verbose: bool = True,
     status: StatusWriter | None = None,
+    domain: Mosaic | None = None,
 ) -> MassLedger:
-    """Run the local-inertial solver and stream results to a Zarr store.
+    """Run the selected scheme and stream results to a Zarr store.
 
-    Timestep is adaptive and derived from state (determinism, §8/§12) but clamped
-    so a step never crosses an output time or the rainfall on/off boundary -- so
-    frames land exactly on ``output_every`` and each step is either fully raining
-    or fully dry (exact source accounting).
+    The clock is the M5 :class:`~solver.scheduler.MultiRateScheduler`: the timestep
+    is adaptive and derived from state (determinism, §8/§12) but clamped so a step
+    never crosses a **sync point** -- an output time, a forcing breakpoint (rainfall
+    on/off, hydrograph knot) or a slow-process activation. So frames land exactly on
+    ``output_every``, each step is either fully raining or fully dry (exact source
+    accounting), and slow processes split on an exact simulated interval.
 
     If ``status`` is given, a ``running`` record is written at each output frame
     (§7.4). ``status`` is a read-only progress observer -- it never touches Δt or
@@ -96,23 +152,70 @@ def run_simulation(
     # the scheme-owned compute_dt/step pair. LI is the default coverage scheme;
     # hllc_fv is the M4 fidelity option (raises NotImplementedError until wired up).
     scheme = get_scheme(scenario.scheme)
-    grid = Grid(ny=bed.shape[0], nx=bed.shape[1], dx=scenario.dx)
-    manning = load_field(
-        scenario.manning_field, grid, scalar=scenario.manning_n, name="manning_n", nonneg=True
-    )
+    # Resolution choice (M6, solver.io.coarsen): fields are authored at tile
+    # resolution, so they are loaded on the *source* grid and aggregated once,
+    # before any water moves -- one uniform grid per run, no resolution interface.
+    # coarsen == 1 is the identity on every path, so pre-M6 runs are unchanged.
+    k = int(scenario.coarsen)
+    src_grid = Grid(ny=bed.shape[0], nx=bed.shape[1], dx=scenario.dx)
+    if k > 1:
+        note = crop_report(bed.shape, k)
+        if note and verbose:
+            print(f"  {note}")
+        bed = block_reduce(bed, k, "mean")  # volume-preserving floodplain storage
+        scenario = coarsen_scenario(scenario, k)
+    grid = Grid(ny=bed.shape[0], nx=bed.shape[1], dx=scenario.dx * k)
+    check_indices(scenario, grid.shape)
+
+    def _field(path, scalar, name, how="mean"):
+        """Load a parameter field on the source grid, then aggregate it (M6)."""
+        f = load_field(path, src_grid, scalar=scalar, name=name, nonneg=True)
+        return block_reduce(f, k, how) if k > 1 else f
+
+    manning = _field(scenario.manning_field, scenario.manning_n, "manning_n")
+    # Vertical datum (M5, solver.core.datum): step in shifted coordinates so float32
+    # eta = h + z keeps its precision at a high datum; the store gets the true bed
+    # back. Every absolute elevation the scenario carries shifts with it, in one
+    # place (shift_for_datum), so they cannot drift apart.
+    elev = shift_for_datum(scenario, bed)
+    z_ref = elev.z_ref
+    # Structures are bed geometry (M5 plan §1.2): raise the bed to each crest before
+    # stepping, so impoundment and overtopping are ordinary solver physics. The
+    # modified bed is what the store records, so the viewer shows the structure.
+    bed_sim = apply_barriers(elev.bed, elev.structures)
     st = State.from_bed(
-        bed, dx=scenario.dx, depth=scenario.initial_depth, manning=manning, device=device
+        bed_sim, dx=grid.dx, depth=scenario.initial_depth, manning=manning, device=device
     )
+
+    # --- M6 sub-grid channels ---------------------------------------------------
+    # A channel narrower than a cell, as per-cell geometry: what keeps a coarse
+    # reach-scale run from erasing the river (plan §1.2). Armed only when the
+    # scenario carries a width; unarmed, the LI kernels are the M1 ones untouched.
+    channels = None
+    if scenario.has_channels:
+        # Width and depth aggregate by **max**, not mean: a river passes *through*
+        # a block, and averaging its width with the dry cells beside it would thin
+        # away exactly what sub-grid channels exist to keep (solver.io.coarsen).
+        chan_w = _field(
+            scenario.channel_width_field, scenario.channel_width_m, "channel width", "max"
+        )
+        chan_d = _field(
+            scenario.channel_depth_field, scenario.channel_depth_m, "channel depth", "max"
+        )
+        chan_n = None
+        if scenario.channel_manning_field is not None or scenario.channel_manning is not None:
+            chan_n = _field(
+                scenario.channel_manning_field,
+                (scenario.channel_manning or 0.0),
+                "channel manning",
+            )
+        channels = arm_channels(st, chan_w, chan_d, chan_n)
+        if verbose:
+            print(f"  channels      : {channels.summary()}")
 
     # --- M3 sources/sinks -------------------------------------------------------
     # Infiltration (constant-rate sink, mm/hr -> m/s); armed only when nonzero.
-    infil = load_field(
-        scenario.infiltration_field,
-        grid,
-        scalar=scenario.infiltration_mm_hr,
-        name="infiltration",
-        nonneg=True,
-    )
+    infil = _field(scenario.infiltration_field, scenario.infiltration_mm_hr, "infiltration")
     infil_m_s = infil / 1000.0 / 3600.0
     if scenario.infiltration_field is not None or float(infil_m_s.max()) > 0.0:
         st.set_infiltration(infil_m_s)
@@ -120,14 +223,18 @@ def run_simulation(
     rain_is_field = scenario.rain_type == "field"
     rain_field_sum_m_s = 0.0
     if rain_is_field:
-        rain_mm_hr_field = load_field(scenario.rain_field, grid, name="rainfall", nonneg=True)
+        rain_mm_hr_field = _field(scenario.rain_field, 0.0, "rainfall")
         rain_field = rain_mm_hr_field / 1000.0 / 3600.0
         st.set_rain_field(rain_field)
         rain_field_sum_m_s = float(rain_field.astype(np.float64).sum())
     # Inflow hydrographs (prescribed discharge point sources).
     injector = InflowInjector(scenario.inflows, grid, device) if scenario.inflows else None
-    # Open (free-outflow) boundaries (no-op when every edge is closed).
-    st.set_open_boundaries(scenario.boundaries)
+    # Per-edge boundaries: open (free-outflow) and, from M5, fixed_stage water-level
+    # curves (already in the stepping datum). No-op when every edge is closed.
+    st.set_open_boundaries(scenario.boundaries, elev.stage_curves)
+    # Reservoir release rules -- the slow processes the multi-rate scheduler exists
+    # for (HANDOFF §8). Built after the State so they can arm the loss accumulator.
+    reservoirs = build_operators(elev.structures, st)
 
     ledger = MassLedger.from_state(st)
 
@@ -135,7 +242,8 @@ def run_simulation(
     attrs = {
         "scheme": scenario.scheme,
         "crs": scenario.crs,
-        "dx": scenario.dx,
+        "dx": grid.dx,
+        "coarsen": k,
         "units": {"depth": "m", "u": "m/s", "v": "m/s", "time": "s", "bed": "m"},
         "scenario": scenario.name,
         "rain_type": scenario.rain_type,
@@ -145,27 +253,45 @@ def run_simulation(
         "infiltration_mm_hr": scenario.infiltration_mm_hr,
         "end_time_s": scenario.end_time,
         "output_every_s": scenario.output_every,
+        # Elevation offset the run stepped in (0 unless [grid] datum was set); the
+        # stored bed is *un*shifted, so this is provenance, not a decoding key.
+        "datum_shift_m": z_ref,
         # Static provenance (§2): source hash + resolved scenario -> reproducible.
         "provenance": write_provenance(scenario, out_path),
     }
+    if channels is not None:
+        attrs["channels"] = channels.as_attrs()
+    if domain is not None:
+        # How the domain was assembled from the tile set (M6): origin, tile count and
+        # any uncovered cells, so a stored result says which patch of the world it is.
+        attrs["domain"] = domain.as_attrs()
     writer = ZarrWriter(out_path, grid, n_frames, attrs)
-    writer.write_bed(bed)
+    writer.write_bed(unshift_bed(bed_sim, z_ref))  # §7.2 stores true elevations
+    if channels is not None:
+        # The bed alone no longer describes what the run stepped on: store the
+        # channel geometry beside it so a result is self-describing (§7.2).
+        writer.write_static("channel_width", channels.w.numpy())
+        writer.write_static("channel_depth", channels.d.numpy())
 
     # Frame at t = 0 (baseline).
     u0, v0 = st.velocities_numpy()
     writer.append(0.0, st.depth_numpy(), u0, v0)
 
-    t = 0.0
-    next_output = scenario.output_every
-    # Event times a step must not cross: output cadence, rain end, end of run, and
-    # each inflow-hydrograph breakpoint (so the sampled discharge stays faithful).
-    output_times = [scenario.output_every * k for k in range(1, n_frames)]
+    # Forcing breakpoints a step must not cross (the scheduler adds the output
+    # cadence, end_time and any slow-process activations): rain on/off and each
+    # inflow-hydrograph knot, so the sampled discharge stays faithful.
     inflow_events = injector.breakpoints() if injector else []
-    events = output_times + [scenario.rain_duration, scenario.end_time] + inflow_events
+    sched = MultiRateScheduler(
+        end_time=scenario.end_time,
+        output_every=scenario.output_every,
+        events=[scenario.rain_duration, *inflow_events, *scenario.stage_events],
+        processes=[r.as_slow_process() for r in reservoirs],
+    )
 
-    while t < scenario.end_time - EPS_T:
-        dt = scheme.compute_dt(st, alpha=scenario.alpha, dt_max=scenario.dt_max)
-        dt = min(dt, _next_event_time(t, events) - t)
+    for tick in sched.ticks(
+        lambda: scheme.compute_dt(st, alpha=scenario.alpha, dt_max=scenario.dt_max)
+    ):
+        t, dt = tick.t0, tick.dt
 
         # Inject inflow hydrographs for this step (midpoint discharge -> volume).
         if injector is not None:
@@ -174,32 +300,42 @@ def run_simulation(
         raining = t < scenario.rain_duration - EPS_T
 
         if rain_is_field:
-            scheme.step(st, dt=dt, rain_scale=(1.0 if raining else 0.0))
+            scheme.step(st, dt=dt, rain_scale=(1.0 if raining else 0.0), t=t)
             if raining:
                 ledger.add_inflow(rain_field_sum_m_s * dt * grid.cell_area)
         else:
             rain = scenario.rain_m_s if raining else 0.0
-            scheme.step(st, dt=dt, rain=rain)
+            scheme.step(st, dt=dt, rain=rain, t=t)
             if rain > 0.0:
                 ledger.add_rain_step(rain, dt, grid.n_cells)
-        t += dt
 
-        if t >= next_output - EPS_T and next_output <= scenario.end_time + EPS_T:
-            rec = ledger.record(st, t)
+        # Slow processes (operator splitting, HANDOFF §8) advance *after* the fast
+        # step has landed on the sync point, by the exact elapsed simulated time.
+        for proc, elapsed in tick.due:
+            proc.advance(tick.t1, elapsed)
+
+        if tick.is_output:
+            rec = ledger.record(st, tick.t1)
             u, v = st.velocities_numpy()
-            writer.append(t, st.depth_numpy(), u, v)
+            writer.append(tick.t1, st.depth_numpy(), u, v)
             h_max = float(st.h.numpy().max())
             if verbose:
-                print(f"  t={t:8.1f}s  h_max={h_max:6.3f}m  mass_rel_err={rec.rel_error:.2e}")
+                print(f"  t={tick.t1:8.1f}s  h_max={h_max:6.3f}m  mass_rel_err={rec.rel_error:.2e}")
             if status is not None:
                 status.write(
                     "running",
-                    sim_time=t,
-                    message=f"t={t:.0f}s  h_max={h_max:.3f}m  mass_rel_err={rec.rel_error:.1e}",
+                    sim_time=tick.t1,
+                    message=(
+                        f"t={tick.t1:.0f}s  h_max={h_max:.3f}m  mass_rel_err={rec.rel_error:.1e}"
+                    ),
                 )
-            next_output += scenario.output_every
 
-    writer.finalize(ledger.as_attrs())
+    final_attrs = dict(ledger.as_attrs())
+    if reservoirs:
+        # The release history is the evidence the slow clock actually ran; it lives
+        # with the mass series so a stored run is self-describing (§7.2).
+        final_attrs["reservoir_releases"] = {r.structure.name: r.series for r in reservoirs}
+    writer.finalize(final_attrs)
     if verbose:
         print(f"done: {out_path}")
         print(f"  frames        : {len(ledger.series)}")
@@ -225,10 +361,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _resolve_scenario(args: argparse.Namespace) -> tuple[Scenario, np.ndarray]:
-    """Build the run Scenario (from --config or the demo flags) and load its bed.
+def _resolve_scenario(args: argparse.Namespace) -> tuple[Scenario, Mosaic]:
+    """Build the run Scenario (from --config or the demo flags) and its domain.
 
-    ``dx``/``crs`` unset by the config inherit from the tile manifest (§7.1).
+    The domain is the assembled **tile mosaic** (M6, :mod:`solver.io.mosaic`) --
+    ``[grid] tiles`` selects the whole set or just tile 0, ``[grid] window`` clips a
+    reach out of it. ``dx``/``crs`` unset by the config inherit from the tile
+    manifest (§7.1).
     """
     if args.config:
         scenario = load_config(args.config)
@@ -242,12 +381,12 @@ def _resolve_scenario(args: argparse.Namespace) -> tuple[Scenario, np.ndarray]:
             rain_mm_hr=args.rain_mm_hr,
             rain_duration=args.rain_duration,
         )
-    bed, manifest = load_r32_bed(scenario.tiles_dir)
+    mosaic = assemble_mosaic(scenario.tiles_dir, select=scenario.tiles, window=scenario.window)
     if scenario.dx is None:
-        scenario.dx = float(manifest["dx_m"])
+        scenario.dx = mosaic.dx
     if not scenario.crs:
-        scenario.crs = manifest.get("crs", "")
-    return scenario, bed
+        scenario.crs = mosaic.crs
+    return scenario, mosaic
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -265,15 +404,28 @@ def main(argv: list[str] | None = None) -> None:
     status.write("starting", message="resolving scenario")
     try:
         device = pick_device(args.device)
-        scenario, bed = _resolve_scenario(args)
+        scenario, mosaic = _resolve_scenario(args)
+        bed = mosaic.bed
         status.end_time = scenario.end_time
         print(
-            f"River Basin M2 solver | device={device} | grid={bed.shape} "
-            f"dx={scenario.dx:.2f}m | scenario={scenario.name}"
+            f"River Basin solver | device={device} | scenario={scenario.name} | "
+            f"scheme={scenario.scheme}"
         )
-        status.write("starting", message=f"{scenario.name}: {bed.shape} @ dx={scenario.dx:.2f}m")
+        print(f"  domain        : {mosaic.summary()}")
+        run_shape = coarsened_shape(bed.shape, scenario.coarsen)
+        if scenario.coarsen > 1:
+            print(
+                f"  resolution    : coarsen={scenario.coarsen} -> {run_shape[0]}x{run_shape[1]} "
+                f"cells @ dx={scenario.dx * scenario.coarsen:.2f} m"
+            )
+        print(f"  field memory  : ~{field_memory_mb(run_shape):.1f} MB (float32 state fields)")
+        if mosaic.gap_cells:
+            print(f"  WARNING: {mosaic.gap_cells} cells are not covered by any tile (filled flat)")
+        status.write("starting", message=f"{scenario.name}: {mosaic.summary()}")
 
-        ledger = run_simulation(scenario, bed, out_path, device=device, status=status)
+        ledger = run_simulation(
+            scenario, bed, out_path, device=device, status=status, domain=mosaic
+        )
         if not args.no_frames:
             status.write("writing", sim_time=scenario.end_time, message="exporting viewer frames")
             manifest = export_frames(out_path, frames_dir)

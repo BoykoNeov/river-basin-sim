@@ -10,9 +10,9 @@ diagnostic and the validation harness gate every step.
 | **M1** | **Water moves** | Local-inertial solver (Warp), uniform rainfall, closed BCs, Zarr out, live mass balance. **Validate: dam-break.** | **done** |
 | **M2** | **The loop closes** | §7 contracts: config-in/results-out, subprocess + status.json, per-frame tiles; Godot timeline + depth colormap + water surface. | **done** |
 | **M3** | **Real scenarios** | Scenario system + command log + spatially-varying parameter fields; inflow hydrographs + open boundaries. **Validate: channel normal depth.** | **done** |
-| **M4** | **Fidelity step** | Well-balanced HLLC FV behind the same kernel interface. **Validate: lake-at-rest + UK EA 2D suite.** *Also: harden the mass-gate denominator against drain-to-empty collapse (`massbalance.py` causal peak-volume floor + a drain test) before running the suite.* | **acceptance met; confirm before M5** |
-| M5 | Multi-physics | Multi-rate scheduler, exercised by reservoir operations. *Also inherits the M4 deferrals: `[[structures]]` + release rules (always was M5), and `fixed_stage` BC + EA Test 1.* | not started |
-| M6 | Reach | Multi-resolution / tiling-at-scale + sub-grid channels, optional 1D river network. *Highest-risk subsystem (§12).* | not started |
+| **M4** | **Fidelity step** | Well-balanced HLLC FV behind the same kernel interface. **Validate: lake-at-rest + UK EA 2D suite.** *Also: harden the mass-gate denominator against drain-to-empty collapse (`massbalance.py` causal peak-volume floor + a drain test) before running the suite.* | **done** |
+| **M5** | **Multi-physics** | Multi-rate scheduler (single simulated clock, sync points, operator splitting), exercised by reservoir operations (`[[structures]]` + release rules). Also lands the M4 deferrals: **`fixed_stage`** BC (HLLC-only), the **datum shift**, and **EA Test 1**. Pre-M5 runs stay bitwise-identical. | **done** |
+| **M6** | **Reach** | Tiling-at-scale (the domain is the tile mosaic) + resolution choice with conservative coarsening + **sub-grid channels**, validated by a fine-vs-coarse equivalence gate. *Nested two-way multi-resolution and the 1D network stay unbuilt — §12's interface conservation is **avoided**, not solved.* | **acceptance met; confirm before M7** |
 | M7 | Morphology | Sediment transport (Exner + transport capacity) on the slow clock. | not started |
 
 Detailed per-milestone plans live alongside this file as `M<n>-*.md`.

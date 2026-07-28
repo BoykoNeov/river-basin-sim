@@ -1,0 +1,129 @@
+# M5 scenario (HANDOFF §7.1) -- the multi-rate scheduler, exercised end to end.
+#
+# Everything M5 added, on one run:
+#   * [[structures]] -- a dam across the valley (its cells' bed raised to the crest,
+#     so impoundment and overtopping are ordinary solver physics) carrying a
+#     **target_stage release rule** on its **own slow clock** (every 900 simulated
+#     seconds) while the flood scheme sub-cycles at ~2 s;
+#   * a **fixed_stage** boundary on the southern edge -- a tide that rises 1.4 m and
+#     falls back, letting water out and in with the through-flux mass-banked;
+#   * inflow hydrographs (M3) at the head of the valley, filling the reservoir.
+#
+# The story: a flood wave fills the reservoir over the first two hours to just under
+# the 78 m crest, then the release rule draws it back down toward its 75 m target
+# over the following three -- ramping the discharge down as it approaches, which is
+# the closed-loop behaviour the sync-point feedback exists for. The release history
+# lands in the store's .zattrs as `reservoir_releases`.
+#
+# Terrain is synthetic and must be generated first, so the dam's cells and crest
+# refer to a *known* valley rather than wherever a line happened to land on real
+# terrain:
+#
+#   uv run python scripts/make_reservoir_demo.py
+#   uv run python -m solver.run --config scenarios/reservoir_release.toml
+#
+# Key elevations from that script: channel floor 70.31 m at the dam line (row 60),
+# 78.31 m at the head of the pool (row 44), 36.81 m at the tidal southern edge.
+# The scheme must be hllc_fv -- fixed_stage is HLLC-only (M5 plan §1.4).
+
+[meta]
+name = "reservoir_release"
+seed = 12345
+scheme = "hllc_fv"
+
+[grid]
+tiles_dir = "data/tiles/reservoir_demo"   # dx / crs inherit from tiles.json
+
+[run]
+end_time = 18000.0               # 5 h simulated: ~2 h filling, ~3 h drawing down
+output_every = 1200.0            # 16 frames
+cfl = 0.45                       # HLLC's bound is velocity-dependent (vs LI's ~0.7)
+dt_max = 10.0
+
+[rainfall]
+type = "uniform"
+rate_mm_hr = 0.0                 # the reservoir is filled by the hydrographs, not rain
+duration_s = 0.0
+
+[parameters]
+manning_n = 0.035
+
+# The flood wave arriving at the head of the valley: a triangular hydrograph
+# peaking at 180 m^3/s in total, spread across five cells so the inflow enters as a
+# reach rather than a single-cell jet. Total volume ~0.65 Mm^3 -- enough to fill the
+# reservoir to just under the crest.
+[[inflow]]
+cell = [4, 62]
+hydrograph = [[0.0, 0.0], [3600.0, 36.0], [7200.0, 0.0]]
+
+[[inflow]]
+cell = [4, 63]
+hydrograph = [[0.0, 0.0], [3600.0, 36.0], [7200.0, 0.0]]
+
+[[inflow]]
+cell = [4, 64]
+hydrograph = [[0.0, 0.0], [3600.0, 36.0], [7200.0, 0.0]]
+
+[[inflow]]
+cell = [4, 65]
+hydrograph = [[0.0, 0.0], [3600.0, 36.0], [7200.0, 0.0]]
+
+[[inflow]]
+cell = [4, 66]
+hydrograph = [[0.0, 0.0], [3600.0, 36.0], [7200.0, 0.0]]
+
+# The dam: a line of cells across the valley at row 60, raised to a 78 m crest. The
+# natural valley walls are already above 78 m outside columns 52..76, so the 50..78
+# span closes it. The rule draws the pool toward 75 m, ramping the discharge from 0
+# at the target up to the 60 m^3/s cap at the crest -- re-evaluated every 900
+# simulated seconds, which is what the multi-rate scheduler is for.
+[[structures]]
+name = "valley_dam"
+type = "dam"
+crest_m = 78.0
+cells = [
+  [60, 50],
+  [60, 51],
+  [60, 52],
+  [60, 53],
+  [60, 54],
+  [60, 55],
+  [60, 56],
+  [60, 57],
+  [60, 58],
+  [60, 59],
+  [60, 60],
+  [60, 61],
+  [60, 62],
+  [60, 63],
+  [60, 64],
+  [60, 65],
+  [60, 66],
+  [60, 67],
+  [60, 68],
+  [60, 69],
+  [60, 70],
+  [60, 71],
+  [60, 72],
+  [60, 73],
+  [60, 74],
+  [60, 75],
+  [60, 76],
+  [60, 77],
+  [60, 78],
+]
+release_rule = "target_stage"
+target_stage_m = 75.0
+release_max_m3_s = 60.0
+pool = [45, 50, 59, 78]          # inclusive [row0, col0, row1, col1] behind the dam
+# Deliver into a downstream *reach*, not one cell: operator splitting hands over a
+# whole interval's release at once, and 54,000 m^3 into a single 40 m cell would be
+# a 34 m column. Spread over 225 cells it is a sane 0.15 m.
+outlet = [62, 52, 70, 76]
+interval_s = 900.0               # the slow clock
+
+# A tide on the southern edge: the water level rises 1.4 m and falls back. Water
+# crosses this boundary in both directions and is mass-banked either way.
+[boundaries]
+default = "closed"
+south = { type = "fixed_stage", stage = [[0.0, 37.2], [9000.0, 38.6], [18000.0, 37.2]] }

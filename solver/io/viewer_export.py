@@ -9,13 +9,24 @@ This is deliberately a **post-process over the finished Zarr**, not inline in th
 solver hot loop: it can be re-run to regenerate ``frames/`` without re-simulating,
 and it keeps the solver's only *live* output the canonical store (decoupling, §4).
 
-Layout (single demo tile -> a 1x1 tile grid; multi-tile splitting is M6)::
+Layout -- one file per frame while the frame fits in a tile (the demo case), a
+row-major tile grid beyond that (M6, reach scale)::
 
     frames/
       manifest.json
-      f0000_depth.raw   raw LE f32, row-major (Y, X), metres -- one tile
+      f0000_depth.raw               small domain: the whole frame, one tile
       f0001_depth.raw
       ...
+      f0000_depth_r00_c00.raw       reach scale: `tile_grid` tiles, row-major
+      f0000_depth_r00_c01.raw
+      ...
+
+``manifest["tile_grid"]`` carries ``rows``/``cols``/``size`` and the geometry of
+every tile (``x``, ``y``, ``width``, ``height``) **once**; each frame lists its tile
+files in that same order (``frames[i]["tiles"]["depth"]``). A 1x1 grid keeps the M2
+per-frame shape exactly -- one ``.raw`` of identical bytes, ``frames[i]["files"]``,
+no ``tiles`` key -- so existing readers keep working; only the manifest's
+``tile_grid`` gains the (now non-trivial) geometry fields.
 
 Byte layout matches the M0 ``.r32`` convention (raw LE f32, row-major) so the
 viewer loads a frame into a Godot ``FORMAT_RF`` image with the *same* orientation
@@ -41,6 +52,11 @@ import xarray as xr
 
 from solver.core.grid import H_DRY
 
+# Frames larger than this in either dimension are split into a tile grid (M6). 512
+# matches the §7.2 chunk hint and Godot's comfortable texture-update size; below it,
+# one file per frame stays byte-identical to the M2 export.
+DEFAULT_TILE_SIZE = 512
+
 # Cap on wet samples kept for global percentiles; beyond this a frame is strided
 # (deterministically) so memory stays bounded on large runs. Percentiles are
 # robust to this uniform thinning.
@@ -59,14 +75,40 @@ def _robust_stats(wet: np.ndarray) -> dict:
     }
 
 
+def _tile_layout(ny: int, nx: int, tile_size: int) -> list[dict]:
+    """Row-major tile geometry covering a ``(ny, nx)`` frame (edge tiles clipped)."""
+    tiles = []
+    for r, y0 in enumerate(range(0, ny, tile_size)):
+        for c, x0 in enumerate(range(0, nx, tile_size)):
+            tiles.append(
+                {
+                    "row": r,
+                    "col": c,
+                    "x": x0,
+                    "y": y0,
+                    "width": min(tile_size, nx - x0),
+                    "height": min(tile_size, ny - y0),
+                }
+            )
+    return tiles
+
+
 def export_frames(
     zarr_path: str | Path,
     out_dir: str | Path,
     *,
     field: str = "depth",
     h_dry: float = H_DRY,
+    tile_size: int = DEFAULT_TILE_SIZE,
 ) -> Path:
     """Export ``field`` from a canonical Zarr store as §7.3 per-frame tiles.
+
+    A frame that fits inside ``tile_size`` is written as **one** ``.raw`` per frame
+    -- byte-identical to the M2 export, which is what every demo-scale run gets.
+    Beyond that the frame is split into a row-major tile grid (M6): a 4096² frame is
+    64 MB, too big to hand a viewer as one buffer per scrub step, and §7.3 always
+    specified a ``tile_grid``. The geometry is listed **once** in the manifest and
+    each frame lists its tile files in the same row-major order.
 
     Returns the written ``manifest.json`` path.
     """
@@ -82,6 +124,11 @@ def export_frames(
     ny, nx = int(ds.sizes["y"]), int(ds.sizes["x"])
     times = [float(t) for t in ds["time"].values]
 
+    layout = _tile_layout(ny, nx, max(int(tile_size), 1))
+    tiled = len(layout) > 1
+    rows = max(t["row"] for t in layout) + 1
+    cols = max(t["col"] for t in layout) + 1
+
     frames: list[dict] = []
     wet_samples: list[np.ndarray] = []
     global_max = 0.0
@@ -89,7 +136,17 @@ def export_frames(
     for i in range(n_frames):
         arr = np.ascontiguousarray(ds[field].isel(time=i).values, dtype="<f4")
         fname = f"f{i:04d}_{field}.raw"
-        (out_dir / fname).write_bytes(arr.tobytes())
+        tile_files: list[str] = []
+        if tiled:
+            for t in layout:
+                block = np.ascontiguousarray(
+                    arr[t["y"] : t["y"] + t["height"], t["x"] : t["x"] + t["width"]], dtype="<f4"
+                )
+                tname = f"f{i:04d}_{field}_r{t['row']:02d}_c{t['col']:02d}.raw"
+                (out_dir / tname).write_bytes(block.tobytes())
+                tile_files.append(tname)
+        else:
+            (out_dir / fname).write_bytes(arr.tobytes())
 
         fmin, fmax = float(arr.min()), float(arr.max())
         global_max = max(global_max, fmax)
@@ -99,14 +156,19 @@ def export_frames(
             wet = wet[::stride]
         wet_samples.append(wet)
 
-        frames.append(
-            {
-                "index": i,
-                "time": times[i],
-                "files": {field: fname},
-                field: {"min": fmin, "max": fmax},
-            }
-        )
+        entry = {
+            "index": i,
+            "time": times[i],
+            "files": {field: fname},
+            field: {"min": fmin, "max": fmax},
+        }
+        if tiled:
+            # The single-file name is not written when tiled; the tile list is the
+            # frame. Keeping both keys would invite a reader to load a file that
+            # does not exist, so `files` is replaced rather than supplemented.
+            entry["files"] = {}
+            entry["tiles"] = {field: tile_files}
+        frames.append(entry)
 
     all_wet = np.concatenate(wet_samples) if wet_samples else np.empty(0)
     global_stats = _robust_stats(all_wet)
@@ -117,7 +179,8 @@ def export_frames(
         "crs": str(ds.attrs.get("crs", "")),
         "scheme": str(ds.attrs.get("scheme", "")),
         "grid": {"width": nx, "height": ny},
-        "tile_grid": {"cols": 1, "rows": 1},
+        # Row-major tile geometry, listed once (frames reference it by order).
+        "tile_grid": {"cols": cols, "rows": rows, "size": int(tile_size), "tiles": layout},
         "fields": [field],
         "h_dry": float(h_dry),
         "n_frames": n_frames,

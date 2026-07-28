@@ -161,7 +161,9 @@ def test_open_boundaries_default_and_per_edge(tmp_path):
     ("mutation", "repl", "needle"),
     [
         ('type = "uniform"', 'type = "storm_cells"', "later"),  # temporal rain
-        ('default = "closed"', 'default = "fixed_stage"', "M5"),  # fixed-stage BC
+        # The `inflow` boundary *type* stays deferred: [[inflow]] cell sources cover
+        # prescribed discharge and their mass accounting is exact by construction.
+        ('default = "closed"', 'default = "closed"\neast = { type = "inflow" }', "deferred"),
     ],
 )
 def test_scope_gate_names_the_milestone(tmp_path, mutation, repl, needle):
@@ -186,10 +188,89 @@ def test_unknown_scheme_rejected(tmp_path):
         load_config(_write(tmp_path, text))
 
 
-def test_structures_rejected(tmp_path):
-    text = _FULL + '\n[[structures]]\ntype = "dam"\ncell = [1, 2]\ncrest_m = 100.0\n'
-    with pytest.raises(ConfigError, match="structures"):
-        load_config(_write(tmp_path, text))
+# --- M5: [[structures]] ------------------------------------------------------- #
+_DAM = """
+[[structures]]
+name = "upper_dam"
+type = "dam"
+cells = [[6, 4], [7, 4]]
+crest_m = 145.0
+release_rule = "target_stage"
+target_stage_m = 143.0
+release_max_m3_s = 40.0
+pool = [2, 0, 5, 9]
+outlet = [8, 4]
+interval_s = 600.0
+"""
+
+
+def test_structure_parsed(tmp_path):
+    scn = load_config(_write(tmp_path, _FULL + _DAM))
+    (s,) = scn.structures
+    assert (s.name, s.kind) == ("upper_dam", "dam")
+    assert s.cells == [(6, 4), (7, 4)]
+    assert (s.crest_m, s.target_stage_m, s.release_max_m3_s) == (145.0, 143.0, 40.0)
+    assert s.pool == (2, 0, 5, 9) and s.outlet == (8, 4, 8, 4)  # cell -> 1x1 box
+    assert s.interval_s == 600.0
+
+
+def test_levee_is_barrier_only(tmp_path):
+    text = _FULL + '\n[[structures]]\ntype = "levee"\ncell = [3, 3]\ncrest_m = 12.0\n'
+    (s,) = load_config(_write(tmp_path, text)).structures
+    assert s.kind == "levee" and s.release_rule == "none"
+
+
+def test_target_stage_rule_ramps_between_target_and_crest(tmp_path):
+    """The closed-loop rule: 0 at the target, capped at the crest, linear between."""
+    (s,) = load_config(_write(tmp_path, _FULL + _DAM)).structures
+    assert s.discharge_at(None) == 0.0  # dry pool -> no release
+    assert s.discharge_at(142.0) == 0.0  # below target -> shut off
+    assert s.discharge_at(144.0) == pytest.approx(20.0)  # half way -> half the cap
+    assert s.discharge_at(150.0) == 40.0  # above crest -> capped, not extrapolated
+
+
+def test_fixed_rule_is_open_loop(tmp_path):
+    text = _FULL + (
+        '\n[[structures]]\ntype = "dam"\ncell = [5, 5]\ncrest_m = 20.0\n'
+        'release_rule = "fixed"\nrelease_m3_s = 7.5\npool = [0, 0, 4, 9]\noutlet = [6, 5]\n'
+    )
+    (s,) = load_config(_write(tmp_path, text)).structures
+    assert s.discharge_at(19.0) == 7.5 and s.discharge_at(1.0) == 7.5
+    assert s.discharge_at(None) == 0.0
+
+
+@pytest.mark.parametrize(
+    "body,needle",
+    [
+        ('type = "weir"\ncell = [1, 1]\ncrest_m = 5.0', "type must be one of"),
+        ('type = "dam"\ncrest_m = 5.0', "at least one barrier cell"),
+        ('type = "dam"\ncell = [1, 1]', "crest_m' is required"),
+        ('type = "dam"\ncell = [1, 1]\ncrest_m = 5.0\nrelease_rule = "spill"', "release_rule"),
+        (
+            'type = "levee"\ncell = [1, 1]\ncrest_m = 5.0\nrelease_rule = "fixed"\n'
+            "release_m3_s = 1.0\npool = [0, 0, 0, 1]\noutlet = [3, 3]",
+            "levee is barrier geometry only",
+        ),
+        (
+            'type = "dam"\ncell = [1, 1]\ncrest_m = 5.0\nrelease_rule = "fixed"\n'
+            "release_m3_s = 1.0",
+            "needs both a 'pool' box and an 'outlet'",
+        ),
+        (
+            'type = "dam"\ncell = [1, 1]\ncrest_m = 5.0\nrelease_rule = "fixed"\n'
+            "release_m3_s = 1.0\npool = [0, 0, 3, 3]\noutlet = [1, 1]",
+            "overlaps the pool",
+        ),
+        (
+            'type = "dam"\ncell = [1, 1]\ncrest_m = 5.0\nrelease_rule = "target_stage"\n'
+            "target_stage_m = 6.0\nrelease_max_m3_s = 2.0\npool = [0, 0, 0, 1]\noutlet = [3, 3]",
+            "must be below crest_m",
+        ),
+    ],
+)
+def test_structure_validation(tmp_path, body, needle):
+    with pytest.raises(ConfigError, match=needle):
+        load_config(_write(tmp_path, _FULL + "\n[[structures]]\n" + body + "\n"))
 
 
 def test_manning_bool_rejected(tmp_path):
@@ -237,3 +318,179 @@ def test_scenario_post_init_guards_direct_construction():
         Scenario(output_every=0.0)
     with pytest.raises(ValueError, match="multiple of output_every"):
         Scenario(end_time=3500.0, output_every=300.0)
+
+
+# --- M5: vertical datum ------------------------------------------------------ #
+def test_datum_defaults_to_none(tmp_path):
+    """`[grid] datum` is opt-in: absent means no shift (pre-M5 runs unchanged)."""
+    assert load_config(_write(tmp_path, _FULL)).datum is None
+
+
+@pytest.mark.parametrize("value,expected", [('"auto"', "auto"), ("9.7", 9.7), ("-3", -3.0)])
+def test_datum_values(tmp_path, value, expected):
+    cfg = _FULL.replace('crs = "EPSG:32617"', f'crs = "EPSG:32617"\ndatum = {value}')
+    assert load_config(_write(tmp_path, cfg)).datum == expected
+
+
+@pytest.mark.parametrize("value", ['"sea-level"', "true", "[1, 2]"])
+def test_datum_rejects_nonsense(tmp_path, value):
+    cfg = _FULL.replace('crs = "EPSG:32617"', f'crs = "EPSG:32617"\ndatum = {value}')
+    with pytest.raises(ConfigError, match="datum"):
+        load_config(_write(tmp_path, cfg))
+
+
+# --- M5: fixed_stage boundaries ---------------------------------------------- #
+_HLLC = _FULL.replace('scheme = "local_inertial"', 'scheme = "hllc_fv"')
+
+
+def test_fixed_stage_constant_level(tmp_path):
+    text = _HLLC.replace(
+        'default = "closed"', 'default = "closed"\neast = { type = "fixed_stage", level = 10.35 }'
+    )
+    scn = load_config(_write(tmp_path, text))
+    assert scn.boundaries["east"] == "fixed_stage"
+    assert scn.stage_curves["east"] == [(0.0, 10.35)]  # constant -> one-point curve
+    assert scn.stage_events == [0.0]
+
+
+def test_fixed_stage_time_varying_curve_and_sync_events(tmp_path):
+    text = _HLLC.replace(
+        'default = "closed"',
+        'default = "closed"\nwest = { type = "fixed_stage", '
+        "stage = [[0.0, 9.7], [3600.0, 10.35], [7200.0, 9.7]] }",
+    )
+    scn = load_config(_write(tmp_path, text))
+    assert scn.stage_curves["west"] == [(0.0, 9.7), (3600.0, 10.35), (7200.0, 9.7)]
+    # Curve knots become scheduler sync points, so no step straddles a slope change.
+    assert scn.stage_events == [0.0, 3600.0, 7200.0]
+
+
+def test_fixed_stage_requires_the_hllc_scheme(tmp_path):
+    """HLLC-only by design (M5 plan §1.4) -- a loud error, not a silent fallback."""
+    text = _FULL.replace(
+        'default = "closed"', 'default = "closed"\neast = { type = "fixed_stage", level = 3.0 }'
+    )
+    with pytest.raises(ConfigError, match="hllc_fv"):
+        load_config(_write(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    "table,needle",
+    [
+        ('{ type = "fixed_stage" }', "exactly one of"),
+        ('{ type = "fixed_stage", level = 1.0, stage = [[0.0, 1.0]] }', "exactly one of"),
+        ('{ type = "fixed_stage", level = "high" }', "must be a number"),
+        ('{ type = "fixed_stage", stage = [] }', "non-empty"),
+        ('{ type = "fixed_stage", stage = [[10.0, 1.0], [0.0, 2.0]] }', "non-decreasing"),
+        ('{ type = "tidal" }', "unknown boundary type"),
+        ("42", "must be 'closed'"),
+    ],
+)
+def test_fixed_stage_malformed(tmp_path, table, needle):
+    text = _HLLC.replace('default = "closed"', f'default = "closed"\neast = {table}')
+    with pytest.raises(ConfigError, match=needle):
+        load_config(_write(tmp_path, text))
+
+
+def test_fixed_stage_string_form_is_rejected_with_a_useful_message(tmp_path):
+    """`east = "fixed_stage"` cannot work -- it carries no level. Say so."""
+    text = _HLLC.replace('default = "closed"', 'default = "closed"\neast = "fixed_stage"')
+    with pytest.raises(ConfigError, match="fixed_stage table"):
+        load_config(_write(tmp_path, text))
+
+
+def test_outlet_may_be_a_reach_box(tmp_path):
+    """Spreading a release over a reach avoids the point-outlet delivery spike."""
+    text = _FULL + _DAM.replace("outlet = [8, 4]", "outlet = [8, 2, 10, 6]")
+    (s,) = load_config(_write(tmp_path, text)).structures
+    assert s.outlet == (8, 2, 10, 6)
+
+
+def test_outlet_overlapping_the_pool_is_rejected(tmp_path):
+    text = _FULL + _DAM.replace(
+        "outlet = [8, 4]", "outlet = [4, 2, 10, 6]"
+    )  # rows 4.. hit the pool
+    with pytest.raises(ConfigError, match="overlaps the pool"):
+        load_config(_write(tmp_path, text))
+
+
+def test_domain_selection_defaults_to_the_whole_mosaic(tmp_path):
+    """M6: the domain is the tile set unless the scenario says otherwise."""
+    scn = load_config(_write(tmp_path, _FULL))
+    assert scn.tiles == "all"
+    assert scn.window is None
+
+
+def test_domain_selection_parses_tiles_and_window(tmp_path):
+    text = _FULL.replace(
+        'tiles_dir = "data/tiles/demo"',
+        'tiles_dir = "data/tiles/demo"\ntiles = "first"\nwindow = [0, 0, 63, 127]',
+    )
+    scn = load_config(_write(tmp_path, text))
+    assert scn.tiles == "first"
+    assert scn.window == (0, 0, 63, 127)
+
+
+def test_bad_domain_selection_is_rejected(tmp_path):
+    text = _FULL.replace('tiles_dir = "data/tiles/demo"', 'tiles_dir = "d"\ntiles = "some"')
+    with pytest.raises(ConfigError, match=r"\[grid\] tiles"):
+        load_config(_write(tmp_path, text))
+
+    text = _FULL.replace('tiles_dir = "data/tiles/demo"', 'tiles_dir = "d"\nwindow = [0, 0, 5]')
+    with pytest.raises(ConfigError, match=r"\[grid\] window"):
+        load_config(_write(tmp_path, text))
+
+    text = _FULL.replace('tiles_dir = "data/tiles/demo"', 'tiles_dir = "d"\nwindow = [9, 0, 5, 5]')
+    with pytest.raises(ConfigError, match="inclusive"):
+        load_config(_write(tmp_path, text))
+
+
+_CHANNELS = """
+[channels]
+width = 25.0
+depth = 3.0
+manning = 0.028
+"""
+
+
+def test_channels_parse_as_scalars_or_fields(tmp_path):
+    scn = load_config(_write(tmp_path, _FULL + _CHANNELS))
+    assert scn.has_channels
+    assert scn.channel_width_m == 25.0
+    assert scn.channel_depth_m == 3.0
+    assert scn.channel_manning == 0.028
+    assert scn.channel_width_field is None
+
+    text = _FULL + '\n[channels]\nwidth = "w.r32"\ndepth = "d.r32"\n'
+    scn = load_config(_write(tmp_path, text))
+    assert scn.has_channels
+    assert scn.channel_width_field.endswith("w.r32")
+    assert scn.channel_manning is None  # inherits the floodplain roughness
+    assert "channel_width" in scn.field_paths()
+
+
+def test_no_channels_section_means_no_channels(tmp_path):
+    assert not load_config(_write(tmp_path, _FULL)).has_channels
+
+
+def test_channels_are_rejected_on_the_hllc_scheme(tmp_path):
+    """Sub-grid channels are local-inertial-only (M6 plan §0) -- loudly."""
+    text = _FULL.replace('scheme = "local_inertial"', 'scheme = "hllc_fv"') + _CHANNELS
+    with pytest.raises(ConfigError, match="requires scheme='local_inertial'"):
+        load_config(_write(tmp_path, text))
+
+
+def test_a_channel_width_without_a_depth_is_rejected(tmp_path):
+    text = _FULL + "\n[channels]\nwidth = 25.0\n"
+    with pytest.raises(ConfigError, match="bank-full depth"):
+        load_config(_write(tmp_path, text))
+
+
+def test_coarsen_parses_and_validates(tmp_path):
+    assert load_config(_write(tmp_path, _FULL)).coarsen == 1
+    text = _FULL.replace('tiles_dir = "data/tiles/demo"', 'tiles_dir = "d"\ncoarsen = 4')
+    assert load_config(_write(tmp_path, text)).coarsen == 4
+    for bad in ("0", "2.5", "true"):
+        text = _FULL.replace('tiles_dir = "data/tiles/demo"', f"tiles_dir = 'd'\ncoarsen = {bad}")
+        with pytest.raises(ConfigError, match="coarsen"):
+            load_config(_write(tmp_path, text))
