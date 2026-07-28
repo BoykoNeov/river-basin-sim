@@ -33,12 +33,11 @@ from solver.io.status import StatusWriter
 from solver.io.viewer_export import export_frames
 from solver.io.zarr_writer import ZarrWriter
 from solver.processes.inflow import InflowInjector
+from solver.scheduler import EPS_T, MultiRateScheduler
 
 # Scenario is defined in solver.io.config (the §7.1 contract); re-exported here so
 # existing callers (`from solver.run import Scenario`) keep working.
 __all__ = ["Scenario", "load_config", "run_simulation", "main"]
-
-EPS_T = 1e-6  # time-comparison tolerance (seconds)
 
 
 def load_r32_bed(tiles_dir: str | Path) -> tuple[np.ndarray, dict]:
@@ -64,12 +63,6 @@ def pick_device(requested: str | None) -> str:
     return "cuda:0" if wp.get_cuda_devices() else "cpu"
 
 
-def _next_event_time(t: float, events: list[float]) -> float:
-    """Smallest event time strictly after ``t`` (or +inf if none)."""
-    future = [e for e in events if e > t + EPS_T]
-    return min(future) if future else float("inf")
-
-
 def run_simulation(
     scenario: Scenario,
     bed: np.ndarray,
@@ -79,12 +72,14 @@ def run_simulation(
     verbose: bool = True,
     status: StatusWriter | None = None,
 ) -> MassLedger:
-    """Run the local-inertial solver and stream results to a Zarr store.
+    """Run the selected scheme and stream results to a Zarr store.
 
-    Timestep is adaptive and derived from state (determinism, §8/§12) but clamped
-    so a step never crosses an output time or the rainfall on/off boundary -- so
-    frames land exactly on ``output_every`` and each step is either fully raining
-    or fully dry (exact source accounting).
+    The clock is the M5 :class:`~solver.scheduler.MultiRateScheduler`: the timestep
+    is adaptive and derived from state (determinism, §8/§12) but clamped so a step
+    never crosses a **sync point** -- an output time, a forcing breakpoint (rainfall
+    on/off, hydrograph knot) or a slow-process activation. So frames land exactly on
+    ``output_every``, each step is either fully raining or fully dry (exact source
+    accounting), and slow processes split on an exact simulated interval.
 
     If ``status`` is given, a ``running`` record is written at each output frame
     (§7.4). ``status`` is a read-only progress observer -- it never touches Δt or
@@ -155,17 +150,20 @@ def run_simulation(
     u0, v0 = st.velocities_numpy()
     writer.append(0.0, st.depth_numpy(), u0, v0)
 
-    t = 0.0
-    next_output = scenario.output_every
-    # Event times a step must not cross: output cadence, rain end, end of run, and
-    # each inflow-hydrograph breakpoint (so the sampled discharge stays faithful).
-    output_times = [scenario.output_every * k for k in range(1, n_frames)]
+    # Forcing breakpoints a step must not cross (the scheduler adds the output
+    # cadence, end_time and any slow-process activations): rain on/off and each
+    # inflow-hydrograph knot, so the sampled discharge stays faithful.
     inflow_events = injector.breakpoints() if injector else []
-    events = output_times + [scenario.rain_duration, scenario.end_time] + inflow_events
+    sched = MultiRateScheduler(
+        end_time=scenario.end_time,
+        output_every=scenario.output_every,
+        events=[scenario.rain_duration, *inflow_events],
+    )
 
-    while t < scenario.end_time - EPS_T:
-        dt = scheme.compute_dt(st, alpha=scenario.alpha, dt_max=scenario.dt_max)
-        dt = min(dt, _next_event_time(t, events) - t)
+    for tick in sched.ticks(
+        lambda: scheme.compute_dt(st, alpha=scenario.alpha, dt_max=scenario.dt_max)
+    ):
+        t, dt = tick.t0, tick.dt
 
         # Inject inflow hydrographs for this step (midpoint discharge -> volume).
         if injector is not None:
@@ -182,22 +180,27 @@ def run_simulation(
             scheme.step(st, dt=dt, rain=rain)
             if rain > 0.0:
                 ledger.add_rain_step(rain, dt, grid.n_cells)
-        t += dt
 
-        if t >= next_output - EPS_T and next_output <= scenario.end_time + EPS_T:
-            rec = ledger.record(st, t)
+        # Slow processes (operator splitting, HANDOFF §8) advance *after* the fast
+        # step has landed on the sync point, by the exact elapsed simulated time.
+        for proc, elapsed in tick.due:
+            proc.advance(tick.t1, elapsed)
+
+        if tick.is_output:
+            rec = ledger.record(st, tick.t1)
             u, v = st.velocities_numpy()
-            writer.append(t, st.depth_numpy(), u, v)
+            writer.append(tick.t1, st.depth_numpy(), u, v)
             h_max = float(st.h.numpy().max())
             if verbose:
-                print(f"  t={t:8.1f}s  h_max={h_max:6.3f}m  mass_rel_err={rec.rel_error:.2e}")
+                print(f"  t={tick.t1:8.1f}s  h_max={h_max:6.3f}m  mass_rel_err={rec.rel_error:.2e}")
             if status is not None:
                 status.write(
                     "running",
-                    sim_time=t,
-                    message=f"t={t:.0f}s  h_max={h_max:.3f}m  mass_rel_err={rec.rel_error:.1e}",
+                    sim_time=tick.t1,
+                    message=(
+                        f"t={tick.t1:.0f}s  h_max={h_max:.3f}m  mass_rel_err={rec.rel_error:.1e}"
+                    ),
                 )
-            next_output += scenario.output_every
 
     writer.finalize(ledger.as_attrs())
     if verbose:
