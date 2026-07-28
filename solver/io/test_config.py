@@ -188,10 +188,89 @@ def test_unknown_scheme_rejected(tmp_path):
         load_config(_write(tmp_path, text))
 
 
-def test_structures_rejected(tmp_path):
-    text = _FULL + '\n[[structures]]\ntype = "dam"\ncell = [1, 2]\ncrest_m = 100.0\n'
-    with pytest.raises(ConfigError, match="structures"):
-        load_config(_write(tmp_path, text))
+# --- M5: [[structures]] ------------------------------------------------------- #
+_DAM = """
+[[structures]]
+name = "upper_dam"
+type = "dam"
+cells = [[6, 4], [7, 4]]
+crest_m = 145.0
+release_rule = "target_stage"
+target_stage_m = 143.0
+release_max_m3_s = 40.0
+pool = [2, 0, 5, 9]
+outlet = [8, 4]
+interval_s = 600.0
+"""
+
+
+def test_structure_parsed(tmp_path):
+    scn = load_config(_write(tmp_path, _FULL + _DAM))
+    (s,) = scn.structures
+    assert (s.name, s.kind) == ("upper_dam", "dam")
+    assert s.cells == [(6, 4), (7, 4)]
+    assert (s.crest_m, s.target_stage_m, s.release_max_m3_s) == (145.0, 143.0, 40.0)
+    assert s.pool == (2, 0, 5, 9) and s.outlet == (8, 4)
+    assert s.interval_s == 600.0
+
+
+def test_levee_is_barrier_only(tmp_path):
+    text = _FULL + '\n[[structures]]\ntype = "levee"\ncell = [3, 3]\ncrest_m = 12.0\n'
+    (s,) = load_config(_write(tmp_path, text)).structures
+    assert s.kind == "levee" and s.release_rule == "none"
+
+
+def test_target_stage_rule_ramps_between_target_and_crest(tmp_path):
+    """The closed-loop rule: 0 at the target, capped at the crest, linear between."""
+    (s,) = load_config(_write(tmp_path, _FULL + _DAM)).structures
+    assert s.discharge_at(None) == 0.0  # dry pool -> no release
+    assert s.discharge_at(142.0) == 0.0  # below target -> shut off
+    assert s.discharge_at(144.0) == pytest.approx(20.0)  # half way -> half the cap
+    assert s.discharge_at(150.0) == 40.0  # above crest -> capped, not extrapolated
+
+
+def test_fixed_rule_is_open_loop(tmp_path):
+    text = _FULL + (
+        '\n[[structures]]\ntype = "dam"\ncell = [5, 5]\ncrest_m = 20.0\n'
+        'release_rule = "fixed"\nrelease_m3_s = 7.5\npool = [0, 0, 4, 9]\noutlet = [6, 5]\n'
+    )
+    (s,) = load_config(_write(tmp_path, text)).structures
+    assert s.discharge_at(19.0) == 7.5 and s.discharge_at(1.0) == 7.5
+    assert s.discharge_at(None) == 0.0
+
+
+@pytest.mark.parametrize(
+    "body,needle",
+    [
+        ('type = "weir"\ncell = [1, 1]\ncrest_m = 5.0', "type must be one of"),
+        ('type = "dam"\ncrest_m = 5.0', "at least one barrier cell"),
+        ('type = "dam"\ncell = [1, 1]', "crest_m' is required"),
+        ('type = "dam"\ncell = [1, 1]\ncrest_m = 5.0\nrelease_rule = "spill"', "release_rule"),
+        (
+            'type = "levee"\ncell = [1, 1]\ncrest_m = 5.0\nrelease_rule = "fixed"\n'
+            "release_m3_s = 1.0\npool = [0, 0, 0, 1]\noutlet = [3, 3]",
+            "levee is barrier geometry only",
+        ),
+        (
+            'type = "dam"\ncell = [1, 1]\ncrest_m = 5.0\nrelease_rule = "fixed"\n'
+            "release_m3_s = 1.0",
+            "needs both a 'pool' box and an 'outlet'",
+        ),
+        (
+            'type = "dam"\ncell = [1, 1]\ncrest_m = 5.0\nrelease_rule = "fixed"\n'
+            "release_m3_s = 1.0\npool = [0, 0, 3, 3]\noutlet = [1, 1]",
+            "sits inside the pool",
+        ),
+        (
+            'type = "dam"\ncell = [1, 1]\ncrest_m = 5.0\nrelease_rule = "target_stage"\n'
+            "target_stage_m = 6.0\nrelease_max_m3_s = 2.0\npool = [0, 0, 0, 1]\noutlet = [3, 3]",
+            "must be below crest_m",
+        ),
+    ],
+)
+def test_structure_validation(tmp_path, body, needle):
+    with pytest.raises(ConfigError, match=needle):
+        load_config(_write(tmp_path, _FULL + "\n[[structures]]\n" + body + "\n"))
 
 
 def test_manning_bool_rejected(tmp_path):

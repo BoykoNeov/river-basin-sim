@@ -92,6 +92,131 @@ class Inflow:
         return hg[-1][1]
 
 
+_STRUCTURE_KINDS = {"dam", "levee"}
+_RELEASE_RULES = {"none", "fixed", "target_stage"}
+# Default slow-clock cadence for a release rule: 15 simulated minutes. Small enough
+# that the feedback in `target_stage` is meaningful, coarse enough that the split is
+# genuinely multi-rate against a flood step of seconds (M5 plan §4).
+_DEFAULT_RELEASE_INTERVAL_S = 900.0
+_STRUCTURE_KEYS = {
+    "name",
+    "type",
+    "cell",
+    "cells",
+    "crest_m",
+    "release_rule",
+    "release_m3_s",
+    "target_stage_m",
+    "release_max_m3_s",
+    "pool",
+    "outlet",
+    "interval_s",
+}
+
+
+@dataclass
+class Structure:
+    """A dam or levee with an optional release rule (M5, §7.1 ``[[structures]]``).
+
+    A structure is **barrier geometry plus a rule** (M5 plan §1.2), not a new
+    momentum term:
+
+    * ``cells`` + ``crest_m`` raise the bed to the crest, so impoundment and
+      overtopping are ordinary shallow-water physics the validated scheme already
+      handles. A ``levee`` is exactly this and nothing more.
+    * a ``dam`` may additionally carry a **release rule**, evaluated on the slow
+      clock (``interval_s``) by :mod:`solver.processes.reservoir`, which moves water
+      from the ``pool`` region to the ``outlet`` cell.
+
+    ``pool`` is an inclusive ``(row0, col0, row1, col1)`` box. Elevations
+    (``crest_m``, ``target_stage_m``) are absolute and shift with ``[grid] datum``.
+    """
+
+    name: str = "dam"
+    kind: str = "dam"
+    cells: list[tuple[int, int]] = field(default_factory=list)
+    crest_m: float = 0.0
+    release_rule: str = "none"
+    release_m3_s: float = 0.0  # "fixed": the constant release
+    target_stage_m: float | None = None  # "target_stage": the level to draw down to
+    release_max_m3_s: float = 0.0  # "target_stage": cap on the release
+    pool: tuple[int, int, int, int] | None = None
+    outlet: tuple[int, int] | None = None
+    interval_s: float = _DEFAULT_RELEASE_INTERVAL_S  # slow-clock cadence (sim seconds)
+
+    def __post_init__(self) -> None:
+        if self.kind not in _STRUCTURE_KINDS:
+            raise ValueError(
+                f"structure '{self.name}': type must be one of {sorted(_STRUCTURE_KINDS)}"
+            )
+        if not self.cells:
+            raise ValueError(f"structure '{self.name}': needs at least one barrier cell")
+        if self.release_rule not in _RELEASE_RULES:
+            raise ValueError(
+                f"structure '{self.name}': release_rule must be one of {sorted(_RELEASE_RULES)}"
+            )
+        if self.kind == "levee" and self.release_rule != "none":
+            raise ValueError(
+                f"structure '{self.name}': a levee is barrier geometry only; use type='dam' "
+                "for a release rule"
+            )
+        if self.interval_s <= 0:
+            raise ValueError(f"structure '{self.name}': interval_s must be > 0")
+        if self.release_rule == "none":
+            return
+        if self.pool is None or self.outlet is None:
+            raise ValueError(
+                f"structure '{self.name}': release_rule='{self.release_rule}' needs both a "
+                "'pool' box and an 'outlet' cell (where the released water is delivered)"
+            )
+        r0, c0, r1, c1 = self.pool
+        if r1 < r0 or c1 < c0:
+            raise ValueError(f"structure '{self.name}': pool must be [row0, col0, row1, col1]")
+        oi, oj = self.outlet
+        if r0 <= oi <= r1 and c0 <= oj <= c1:
+            raise ValueError(
+                f"structure '{self.name}': the outlet {self.outlet} sits inside the pool "
+                f"{self.pool}; the release would just shuffle water within the reservoir"
+            )
+        if self.release_rule == "fixed" and self.release_m3_s <= 0:
+            raise ValueError(
+                f"structure '{self.name}': release_rule='fixed' needs release_m3_s > 0"
+            )
+        if self.release_rule == "target_stage":
+            if self.target_stage_m is None:
+                raise ValueError(
+                    f"structure '{self.name}': release_rule='target_stage' needs target_stage_m"
+                )
+            if self.release_max_m3_s <= 0:
+                raise ValueError(
+                    f"structure '{self.name}': release_rule='target_stage' needs "
+                    "release_max_m3_s > 0 (the cap the proportional rule scales toward)"
+                )
+            if self.target_stage_m >= self.crest_m:
+                raise ValueError(
+                    f"structure '{self.name}': target_stage_m ({self.target_stage_m}) must be "
+                    f"below crest_m ({self.crest_m}) -- the rule ramps between the two"
+                )
+
+    def discharge_at(self, stage: float | None) -> float:
+        """Release discharge (m^3/s) the rule asks for at the given pool stage.
+
+        ``fixed`` is open-loop (a constant). ``target_stage`` is the closed-loop
+        rule -- and the one that makes the sync-point feedback path load-bearing:
+        the release ramps proportionally from 0 at the target level to
+        ``release_max_m3_s`` at the crest, so the pool is drawn down toward the
+        target and the release shuts off once it is reached. ``stage is None``
+        (a dry pool) always means no release.
+        """
+        if self.release_rule == "none" or stage is None:
+            return 0.0
+        if self.release_rule == "fixed":
+            return float(self.release_m3_s)
+        span = self.crest_m - float(self.target_stage_m)
+        frac = (stage - float(self.target_stage_m)) / span
+        return float(self.release_max_m3_s) * min(max(frac, 0.0), 1.0)
+
+
 @dataclass
 class Scenario:
     """Solver run configuration (§7.1).
@@ -131,6 +256,8 @@ class Scenario:
     rain_duration: float = 1800.0  # seconds rain falls for
     # Inflow hydrographs (point sources).
     inflows: list[Inflow] = field(default_factory=list)
+    # Dams / levees with optional slow-clock release rules (M5).
+    structures: list[Structure] = field(default_factory=list)
     # Per-edge boundary behaviour: {north,south,east,west} -> "closed"|"open"|"fixed_stage".
     boundaries: dict[str, str] = field(default_factory=lambda: {e: "closed" for e in _EDGES})
     # Water-level curve for each "fixed_stage" edge (M5): piecewise-linear
@@ -338,6 +465,71 @@ def _parse_stage_curve(edge: str, table: dict) -> list[tuple[float, float]]:
     return pts
 
 
+def _cell_pair(value: object, what: str) -> tuple[int, int]:
+    if not (isinstance(value, list) and len(value) == 2):
+        raise ConfigError(f"{what} must be [row, col], got {value!r}")
+    return (int(value[0]), int(value[1]))
+
+
+def _parse_structures(doc: dict) -> list[Structure]:
+    """Parse the ``[[structures]]`` array into validated :class:`Structure` records.
+
+    Barrier cells may be given as a single ``cell = [i, j]`` or a ``cells`` list;
+    both forms end up in ``Structure.cells``.
+    """
+    raw = doc.get("structures", [])
+    if isinstance(raw, dict):  # a single [structures] table rather than [[structures]]
+        raw = [raw]
+    out: list[Structure] = []
+    for k, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ConfigError(f"[[structures]] #{k}: must be a table")
+        unknown = set(entry) - _STRUCTURE_KEYS
+        if unknown:
+            warnings.warn(
+                f"[[structures]] #{k}: unknown key(s) {sorted(unknown)} ignored", stacklevel=3
+            )
+        name = str(entry.get("name", f"structure_{k}"))
+        cells: list[tuple[int, int]] = []
+        if "cell" in entry:
+            cells.append(_cell_pair(entry["cell"], f"[[structures]] #{k}: 'cell'"))
+        for c in entry.get("cells", []):
+            cells.append(_cell_pair(c, f"[[structures]] #{k}: each entry of 'cells'"))
+        if "crest_m" not in entry:
+            raise ConfigError(f"[[structures]] #{k} ('{name}'): 'crest_m' is required")
+        pool = entry.get("pool")
+        if pool is not None:
+            if not (isinstance(pool, list) and len(pool) == 4):
+                raise ConfigError(
+                    f"[[structures]] #{k} ('{name}'): 'pool' must be [row0, col0, row1, col1]"
+                )
+            pool = tuple(int(v) for v in pool)
+        outlet = entry.get("outlet")
+        if outlet is not None:
+            outlet = _cell_pair(outlet, f"[[structures]] #{k} ('{name}'): 'outlet'")
+        try:
+            out.append(
+                Structure(
+                    name=name,
+                    kind=str(entry.get("type", "dam")),
+                    cells=cells,
+                    crest_m=float(entry["crest_m"]),
+                    release_rule=str(entry.get("release_rule", "none")),
+                    release_m3_s=float(entry.get("release_m3_s", 0.0)),
+                    target_stage_m=(
+                        float(entry["target_stage_m"]) if "target_stage_m" in entry else None
+                    ),
+                    release_max_m3_s=float(entry.get("release_max_m3_s", 0.0)),
+                    pool=pool,
+                    outlet=outlet,
+                    interval_s=float(entry.get("interval_s", _DEFAULT_RELEASE_INTERVAL_S)),
+                )
+            )
+        except (TypeError, ValueError) as e:
+            raise ConfigError(f"[[structures]] #{k} ('{name}'): {e}") from e
+    return out
+
+
 def _parse_boundaries(
     boundaries: dict,
 ) -> tuple[dict[str, str], dict[str, list[tuple[float, float]]]]:
@@ -450,12 +642,6 @@ def load_config(path: str | Path) -> Scenario:
             raise ConfigError("[rainfall] type='field' requires a 'field' path")
         rain_field = _resolve_path(base_dir, str(rainfall["field"]))
 
-    if "structures" in doc:
-        raise ConfigError(
-            "[[structures]] (dams/levees) are not supported yet; structures and "
-            "release rules arrive in M5."
-        )
-
     datum = grid.get("datum")
     if datum is not None and not isinstance(datum, (int, float, str)):
         raise ConfigError(f"[grid] datum must be a number or 'auto', got {datum!r}")
@@ -472,6 +658,7 @@ def load_config(path: str | Path) -> Scenario:
         parameters, "infiltration", base_dir, default_scalar=0.0
     )
     inflows = _parse_inflows(doc)
+    structures = _parse_structures(doc)
 
     # --- build the Scenario ----------------------------------------------------
     defaults = Scenario()
@@ -497,6 +684,7 @@ def load_config(path: str | Path) -> Scenario:
             rain_field=rain_field,
             rain_duration=float(rainfall.get("duration_s", defaults.rain_duration)),
             inflows=inflows,
+            structures=structures,
             boundaries=bc,
             stage_curves=stage_curves,
             source_path=str(path),

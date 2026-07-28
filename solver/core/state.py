@@ -125,6 +125,15 @@ class State:
         if self.open_edges or self.stage_curves:
             self._ensure_loss_cum()
 
+    def arm_loss_accumulator(self) -> None:
+        """Ensure the float64 loss accumulator exists (idempotent).
+
+        Public because sinks outside this class need it too: M5's reservoir release
+        banks its float32 delivery shortfall there
+        (:mod:`solver.processes.reservoir`).
+        """
+        self._ensure_loss_cum()
+
     def _ensure_loss_cum(self) -> None:
         # float64: sink outflow can concentrate at a single edge cell and grow far
         # larger than any per-step increment; a float32 accumulator there would

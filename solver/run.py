@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -28,13 +28,14 @@ from solver.core.grid import Grid
 from solver.core.massbalance import MASS_GATE, MassLedger
 from solver.core.schemes import get_scheme
 from solver.core.state import State
-from solver.io.config import Scenario, load_config
+from solver.io.config import Scenario, Structure, load_config
 from solver.io.fields import load_field
 from solver.io.provenance import write_provenance
 from solver.io.status import StatusWriter
 from solver.io.viewer_export import export_frames
 from solver.io.zarr_writer import ZarrWriter
 from solver.processes.inflow import InflowInjector
+from solver.processes.reservoir import apply_barriers, build_operators
 from solver.scheduler import EPS_T, MultiRateScheduler
 
 # Scenario is defined in solver.io.config (the §7.1 contract); re-exported here so
@@ -72,6 +73,7 @@ class _ShiftedElevations:
     bed: np.ndarray
     z_ref: float
     stage_curves: dict[str, list[tuple[float, float]]]
+    structures: list[Structure]
 
 
 def shift_for_datum(scenario: Scenario, bed: np.ndarray) -> _ShiftedElevations:
@@ -79,17 +81,27 @@ def shift_for_datum(scenario: Scenario, bed: np.ndarray) -> _ShiftedElevations:
 
     **Every absolute elevation the scenario carries shifts here**, in this one
     function, so the bed and the config's elevations can never disagree by
-    ``z_ref``: the bed and each ``fixed_stage`` water-level curve (structure crests
-    join them below, applied to the already-shifted bed). Depth, velocity and all
-    mass accounting are datum-independent, and the canonical store still records the
-    true bed (:func:`solver.core.datum.unshift_bed`).
+    ``z_ref``: the bed, each ``fixed_stage`` water-level curve, and each structure's
+    ``crest_m`` / ``target_stage_m``. Depth, velocity and all mass accounting are
+    datum-independent, and the canonical store still records the true bed
+    (:func:`solver.core.datum.unshift_bed`).
     """
     z_ref = resolve_datum(scenario.datum, bed)
     curves = {
         edge: [(t, level - z_ref) for t, level in curve]
         for edge, curve in scenario.stage_curves.items()
     }
-    return _ShiftedElevations(bed=shift_bed(bed, z_ref), z_ref=z_ref, stage_curves=curves)
+    structures = [
+        replace(
+            s,
+            crest_m=s.crest_m - z_ref,
+            target_stage_m=(None if s.target_stage_m is None else s.target_stage_m - z_ref),
+        )
+        for s in scenario.structures
+    ]
+    return _ShiftedElevations(
+        bed=shift_bed(bed, z_ref), z_ref=z_ref, stage_curves=curves, structures=structures
+    )
 
 
 def run_simulation(
@@ -129,7 +141,11 @@ def run_simulation(
     # back. Every absolute elevation the scenario carries shifts with it, in one
     # place (shift_for_datum), so they cannot drift apart.
     elev = shift_for_datum(scenario, bed)
-    bed_sim, z_ref = elev.bed, elev.z_ref
+    z_ref = elev.z_ref
+    # Structures are bed geometry (M5 plan §1.2): raise the bed to each crest before
+    # stepping, so impoundment and overtopping are ordinary solver physics. The
+    # modified bed is what the store records, so the viewer shows the structure.
+    bed_sim = apply_barriers(elev.bed, elev.structures)
     st = State.from_bed(
         bed_sim, dx=scenario.dx, depth=scenario.initial_depth, manning=manning, device=device
     )
@@ -159,6 +175,9 @@ def run_simulation(
     # Per-edge boundaries: open (free-outflow) and, from M5, fixed_stage water-level
     # curves (already in the stepping datum). No-op when every edge is closed.
     st.set_open_boundaries(scenario.boundaries, elev.stage_curves)
+    # Reservoir release rules -- the slow processes the multi-rate scheduler exists
+    # for (HANDOFF §8). Built after the State so they can arm the loss accumulator.
+    reservoirs = build_operators(elev.structures, st)
 
     ledger = MassLedger.from_state(st)
 
@@ -197,6 +216,7 @@ def run_simulation(
         end_time=scenario.end_time,
         output_every=scenario.output_every,
         events=[scenario.rain_duration, *inflow_events, *scenario.stage_events],
+        processes=[r.as_slow_process() for r in reservoirs],
     )
 
     for tick in sched.ticks(
@@ -241,7 +261,12 @@ def run_simulation(
                     ),
                 )
 
-    writer.finalize(ledger.as_attrs())
+    final_attrs = dict(ledger.as_attrs())
+    if reservoirs:
+        # The release history is the evidence the slow clock actually ran; it lives
+        # with the mass series so a stored run is self-describing (§7.2).
+        final_attrs["reservoir_releases"] = {r.structure.name: r.series for r in reservoirs}
+    writer.finalize(final_attrs)
     if verbose:
         print(f"done: {out_path}")
         print(f"  frames        : {len(ledger.series)}")
