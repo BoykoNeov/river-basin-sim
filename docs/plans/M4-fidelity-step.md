@@ -295,8 +295,24 @@ Ships as its own commit/PR, green on `ruff` + `pytest`, before touching the sche
 11. **Example scenario(s)** — an `scheme = "hllc_fv"` scenario; regenerate a real
     `results.zarr` + frames; **confirm checkpoint** (mass gate + rendered PNG + a
     side-by-side LI-vs-HLLC on the same scenario).
+    - **Done** (commit 67eea13). `scenarios/river_reach_hllc.toml` is
+      `river_reach.toml` with **only** `[meta].scheme` and the CFL changed (0.45 vs
+      LI's 0.70 — HLLC's bound is velocity-dependent), so the pair is a like-for-like
+      side-by-side on the same real tile. Verified end to end on the RTX 5090 (13
+      frames, 1 h sim): HLLC **6.66e-7** < gate, LI baseline **1.24e-7**. The fields
+      agree at the gross level (wet-depth r = 0.965, total volumes within 4.3%) with
+      localized front-placement differences, and the donor-β positivity limiter fires
+      on **0 deep channel cells at every frame** — so the channels are out of limiter
+      regime and the comparison reflects real scheme hydraulics, not clamp-vs-clamp.
+      Godot renders the HLLC store unchanged (scheme-agnostic Zarr contract).
 12. **Docs** — CLAUDE.md status, roadmap, this plan's acceptance section; note any
     HANDOFF divergences.
+    - **Done.** CLAUDE.md status gains an M4 entry (M3 flipped to done), roadmap M4
+      → acceptance met, §4/§6 below record the resolved scope decisions and the
+      carried limitations. **No HANDOFF divergences**: §8's HLLC/well-balanced/wet-dry
+      spec is implemented as written; the two departures from *this plan* are the §6
+      decisions (`fixed_stage` deferred, EA Test 3 substituted for Test 1), both
+      user-confirmed and neither contradicting HANDOFF.
 
 Viewer changes are **not** required for M4 (the depth/velocity viewer renders any run;
 the store contract is scheme-agnostic).
@@ -341,9 +357,86 @@ coverage scheme.
 
 ---
 
-## 6. Open scope decisions (confirm before build step 3)
-1. **`fixed_stage` BC** — include in M4 (recommended, HLLC-only, non-gating) or defer?
-2. **EA subset** — Test 1 + Test 2 as the gate (recommended), with Test 5 as stretch;
-   or a different selection?
+## 6. Open scope decisions — RESOLVED
+1. **`fixed_stage` BC** — **deferred past M4** (the recommendation was to include it;
+   it was not gating, and step 9 landed transmissive + closed ghosts without it). It
+   needs a numeric per-edge config extension *and* re-opens float32 datum sensitivity
+   (EA Test 1's ~10 m datum wants a `z' = z − z_ref` shift alongside it). `config.py`
+   still rejects it with the milestone-naming scope-gate error — that message now
+   points one milestone late and is corrected as part of M5's intake.
+2. **EA subset** — landed as **Test 2 + Test 3**, not the recommended Test 1 + Test 2.
+   Test 1 requires the deferred `fixed_stage` (decision 1), so Test 3 was substituted
+   as the lower-effort second case; **user signed off 2026-07-02 (option a)**. Test 1
+   and Test 5 are post-M4 additions. See the step-10 notes for the Test 3 reframe —
+   it is a **within-HLLC momentum gate, not a scheme discriminator**.
 
-*(Acceptance section added on completion, per the M0–M3 pattern.)*
+---
+
+## 7. Acceptance / demo — MET (2026-07-02)
+
+- [x] **Well-balanced HLLC FV scheme** (`scheme = "hllc_fv"`): MUSCL/minmod
+      reconstruction on η, **hydrostatic reconstruction** (Audusse 2004), HLLC flux
+      with contact restoration, **SSP-RK2**, semi-implicit Manning sharing
+      `friction.manning_denominator` with LI, clean `H_DRY` wet/dry.
+- [x] **Same kernel interface** (§1.1): `schemes.get_scheme(name)` returns the module
+      providing `compute_dt`/`step`; the run loop never branches on scheme. Momentum
+      `hu/hv` is optional armed state (§1.2), so the **LI path is bitwise-unchanged** —
+      LI dam-break still reports nRMSE 0.0740 / front 0.0953 / mass 2.46e-9.
+- [x] **Lake-at-rest** (the well-balancedness keystone): flat η over a sloped, bumpy
+      bed stays flat — **8.5e-6**. And the *discriminating* wet/dry version,
+      `test_shoreline_lake_at_rest_on_bumpy_bed` (dry islands, 115 internal
+      shorelines), holds at the **float32 floor ~1e-5** — this caught a real bug
+      (MUSCL across a shoreline spun a bowl to ~20 m/s; fixed by dropping to first
+      order adjacent to dry cells, identically in the flux *and* source kernels).
+- [x] **Dam-break on HLLC** beats LI on shape *and* front: nRMSE **0.0076** (vs
+      0.0740) and front **0.0101** (vs 0.0953), against analytical Stoker. One
+      parametrized `test_dam_break.py` now gates **both** schemes, wet- and dry-bed,
+      under a single `<1e-6` mass gate (HLLC: 8.0e-10 wet, 1.2e-8 dry).
+- [x] **Manning normal depth (HLLC)**: a steady head-inflow / open-toe transcritical
+      channel (Fr ≈ 1.1) settles to the analytical wide-channel normal depth to
+      **0.59%** across a dead-uniform interior — far tighter than LI's [0.5, 2.0] band.
+- [x] **Ghost-cell BCs** (step 9): per-edge closed (reflective wall, exactly
+      antisymmetric ⇒ identical to transmissive at rest ⇒ lake-at-rest preserved by
+      construction) + open (transmissive with per-RK-stage mass banking into the f64
+      ledger). Gated per-edge ×4 for drain, plus wall reflection + through-flow contrast.
+- [x] **Mass-gate hardening** (§2): causal peak-volume floor in `massbalance.py`, so a
+      drain-to-empty run can't trip the gate by denominator collapse. Monotonic-fill
+      runs are bitwise-unchanged (`peak_v == v`).
+- [x] **Conservative positivity limiter**: the old `wp.max(h, 0)` clamp invented mass
+      whenever it fired (a full drain measured ~6.5e-2, five orders over the gate).
+      Replaced by LI's donor-cell β on the HLLC **mass** flux — non-negativity per RK
+      stage, exact conservation, momentum untouched (lake-at-rest exact, in-regime
+      dam-break bitwise). `test_hllc_drains_to_empty_mass_conservative`: drains to 0.4%
+      of V0 with ~96% of cells below `H_DRY` → **3.0e-8**.
+- [x] **EA SC080035 Test 2** (floodplain depression filling): faithful flattened
+      egg-box, corner hydrograph, dry start, at CI-tractable **40 m / 12 h** (report:
+      20 m / 48 h). Mass **2.9e-7**; 11/16 depressions fill; the up-slope NE
+      depressions **stay dry**, reproducing the report's points-15/16 finding.
+- [x] **EA SC080035 Test 3** (momentum over an obstruction): the report's *exact*
+      300×100 m / 5 m / 15 min setup. Gate is **within-HLLC**: crest fixed by an
+      offline scheme-free volume anchor, then two runs inject the **same volume**
+      differing only in hydrograph sharpness — gentle → P2 dry (null), sharp → P2 wets
+      to 6 cm (≈ the report's 5–6 cm). Mass 2.1e-9 / 6.7e-8.
+- [x] **GPU demo + side-by-side**: `scenarios/river_reach_hllc.toml` on the real Smoky
+      Mtns tile, mass **6.66e-7** (LI baseline 1.24e-7); fields agree grossly
+      (r = 0.965, volumes within 4.3%) with the limiter firing on **0** channel cells.
+- [x] `ruff` + `ruff format` clean; **111 tests green** (106 without `--extra geo`).
+- **Stop and confirm before M5.** ← we are here.
+
+### Carried limitations (state these honestly)
+- **EA Test 3 is not an HLLC-vs-LI discriminator.** The original premise was wrong:
+  report p.105 splits *zero-inertia* from *with-inertia* packages, and Bates LI keeps
+  `∂q/∂t`, so LI sits on the **same** side as HLLC — empirically both overtop. A
+  second, non-gating test records exactly that. Test 3 here is a momentum-conservation
+  reproduction.
+- **Open-boundary mass banking is exact only while the positivity limiter doesn't
+  rescale the banked face.** The donor-β limiter made drain-to-empty conservative
+  (3.0e-8), but the banking/limiter interaction is the sharp edge in this scheme —
+  re-check it before trusting a new open-boundary regime.
+- **EA Test 2 runs at reduced resolution/horizon** (40 m / 12 h vs the report's
+  20 m / 48 h) to stay CI-tractable. The full-fidelity run is a GPU demo, not a test.
+- **`fixed_stage` and EA Test 1 are not in M4** (§6.1). The `config.py` scope-gate
+  message for `fixed_stage` still says "arrive in M4" and needs re-pointing.
+- The steep-tile caveat from M1 is **unchanged for LI**; HLLC now carries the full
+  momentum balance there, but the M0 tile still has no measured-truth comparison —
+  agreement between the two schemes is a consistency check, not a validation.

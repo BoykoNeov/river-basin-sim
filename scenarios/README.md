@@ -12,6 +12,7 @@ writes a `<store>.provenance.json` sidecar recording the config + field hashes.
 | `demo_basin_rain.toml` | M2: uniform rain, closed boundaries, scalar Manning. |
 | `river_reach.toml` | M3: an **inflow hydrograph** + scalar **infiltration** + an **open** (free-outflow) boundary, on the demo tile. Self-contained. |
 | `spatial_fields.toml` | M3: spatially-varying **Manning** and **infiltration** `.r32` fields (generate them first with `scripts/make_demo_fields.py`). |
+| `river_reach_hllc.toml` | M4: the well-balanced **HLLC** finite-volume scheme on the *same* setup as `river_reach.toml` — only `[meta].scheme` and the CFL differ, so the pair is a like-for-like LI-vs-HLLC side-by-side. |
 
 Run one with:
 
@@ -36,7 +37,17 @@ the demo bed as a worked example.
 `[boundaries] default` plus optional per-edge `north/south/east/west`, each
 `"closed"` (reflective) or `"open"` (transmissive / free-outflow). Open edges route
 water off the domain; the leaving volume is mass-accounted. `fixed_stage`/`inflow`
-boundary *types* arrive in M4.
+boundary *types* were deferred out of M4 and now arrive in M5.
+
+## Scheme selection (M4)
+
+`[meta] scheme = "local_inertial"` (default, the M1 Bates scheme — permanent
+coverage for lowland floodplains) or `"hllc_fv"` (the M4 well-balanced HLLC
+finite-volume scheme — the fidelity option for shocks, transcritical flow, and
+well-balanced wet/dry). Both honour the same config; only the CFL differs in
+practice, since HLLC's bound is velocity-dependent — use `[run] cfl ≈ 0.45` for
+HLLC against LI's `≈ 0.7`. The output store is scheme-agnostic, so the viewer
+reads either unchanged.
 
 ## Inflow hydrographs (M3)
 

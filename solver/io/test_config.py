@@ -161,7 +161,7 @@ def test_open_boundaries_default_and_per_edge(tmp_path):
     ("mutation", "repl", "needle"),
     [
         ('type = "uniform"', 'type = "storm_cells"', "later"),  # temporal rain
-        ('default = "closed"', 'default = "fixed_stage"', "M4"),  # fixed-stage BC
+        ('default = "closed"', 'default = "fixed_stage"', "M5"),  # fixed-stage BC
     ],
 )
 def test_scope_gate_names_the_milestone(tmp_path, mutation, repl, needle):
