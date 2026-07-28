@@ -262,6 +262,9 @@ class Scenario:
     tiles: str = "all"
     # Optional inclusive [row0, col0, row1, col1] sub-window in mosaic coordinates.
     window: tuple[int, int, int, int] | None = None
+    # Run k times coarser than the tiles (M6, solver.io.coarsen): dx' = k*dx, with
+    # every input field aggregated once, before stepping. 1 = run at tile resolution.
+    coarsen: int = 1
     dx: float | None = None  # metres; None -> take from the tile manifest
     crs: str = ""  # "" -> take from the tile manifest
     # Vertical datum shift (M5): None = no shift, "auto" = floor(min(bed)), or an
@@ -348,6 +351,8 @@ class Scenario:
                     f"[grid] window {list(self.window)} must be a non-negative, non-empty "
                     "inclusive [row0, col0, row1, col1] box in mosaic coordinates"
                 )
+        if self.coarsen < 1:
+            raise ValueError(f"[grid] coarsen must be an integer >= 1, got {self.coarsen}")
         # Physical scalars are non-negative (field files are checked in solver.io.fields).
         if self.manning_n < 0:
             raise ValueError(f"manning_n must be >= 0, got {self.manning_n}")
@@ -456,7 +461,7 @@ _KNOWN_TABLES = {
 }
 _KNOWN_KEYS = {
     "meta": {"name", "seed", "scheme"},
-    "grid": {"tiles_dir", "tiles", "window", "dx", "crs", "datum"},
+    "grid": {"tiles_dir", "tiles", "window", "coarsen", "dx", "crs", "datum"},
     "run": {"end_time", "output_every", "cfl", "dt_max"},
     "rainfall": {"type", "rate_mm_hr", "field", "duration_s"},
     "parameters": {"manning_n", "infiltration"},
@@ -780,6 +785,12 @@ def load_config(path: str | Path) -> Scenario:
                 f"coordinates), got {window!r}"
             )
         window = tuple(int(v) for v in window)
+    coarsen = grid.get("coarsen", 1)
+    if isinstance(coarsen, bool) or not isinstance(coarsen, int) or coarsen < 1:
+        raise ConfigError(
+            f"[grid] coarsen={coarsen!r} must be an integer >= 1 (the factor by which the "
+            "run grid is coarser than the tiles; 1 runs at tile resolution)"
+        )
 
     # --- build the Scenario ----------------------------------------------------
     defaults = Scenario()
@@ -791,6 +802,7 @@ def load_config(path: str | Path) -> Scenario:
             tiles_dir=str(grid.get("tiles_dir", defaults.tiles_dir)),
             tiles=tiles_select,
             window=window,
+            coarsen=coarsen,
             dx=(float(grid["dx"]) if "dx" in grid else None),
             crs=str(grid.get("crs", "")),
             datum=(datum if isinstance(datum, str) or datum is None else float(datum)),

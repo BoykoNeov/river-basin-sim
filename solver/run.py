@@ -28,6 +28,13 @@ from solver.core.grid import Grid
 from solver.core.massbalance import MASS_GATE, MassLedger
 from solver.core.schemes import get_scheme
 from solver.core.state import State
+from solver.io.coarsen import (
+    block_reduce,
+    check_indices,
+    coarsen_scenario,
+    coarsened_shape,
+    crop_report,
+)
 from solver.io.config import Scenario, Structure, load_config
 from solver.io.fields import load_field
 from solver.io.mosaic import Mosaic, assemble_mosaic
@@ -145,10 +152,27 @@ def run_simulation(
     # the scheme-owned compute_dt/step pair. LI is the default coverage scheme;
     # hllc_fv is the M4 fidelity option (raises NotImplementedError until wired up).
     scheme = get_scheme(scenario.scheme)
-    grid = Grid(ny=bed.shape[0], nx=bed.shape[1], dx=scenario.dx)
-    manning = load_field(
-        scenario.manning_field, grid, scalar=scenario.manning_n, name="manning_n", nonneg=True
-    )
+    # Resolution choice (M6, solver.io.coarsen): fields are authored at tile
+    # resolution, so they are loaded on the *source* grid and aggregated once,
+    # before any water moves -- one uniform grid per run, no resolution interface.
+    # coarsen == 1 is the identity on every path, so pre-M6 runs are unchanged.
+    k = int(scenario.coarsen)
+    src_grid = Grid(ny=bed.shape[0], nx=bed.shape[1], dx=scenario.dx)
+    if k > 1:
+        note = crop_report(bed.shape, k)
+        if note and verbose:
+            print(f"  {note}")
+        bed = block_reduce(bed, k, "mean")  # volume-preserving floodplain storage
+        scenario = coarsen_scenario(scenario, k)
+    grid = Grid(ny=bed.shape[0], nx=bed.shape[1], dx=scenario.dx * k)
+    check_indices(scenario, grid.shape)
+
+    def _field(path, scalar, name, how="mean"):
+        """Load a parameter field on the source grid, then aggregate it (M6)."""
+        f = load_field(path, src_grid, scalar=scalar, name=name, nonneg=True)
+        return block_reduce(f, k, how) if k > 1 else f
+
+    manning = _field(scenario.manning_field, scenario.manning_n, "manning_n")
     # Vertical datum (M5, solver.core.datum): step in shifted coordinates so float32
     # eta = h + z keeps its precision at a high datum; the store gets the true bed
     # back. Every absolute elevation the scenario carries shifts with it, in one
@@ -160,7 +184,7 @@ def run_simulation(
     # modified bed is what the store records, so the viewer shows the structure.
     bed_sim = apply_barriers(elev.bed, elev.structures)
     st = State.from_bed(
-        bed_sim, dx=scenario.dx, depth=scenario.initial_depth, manning=manning, device=device
+        bed_sim, dx=grid.dx, depth=scenario.initial_depth, manning=manning, device=device
     )
 
     # --- M6 sub-grid channels ---------------------------------------------------
@@ -169,28 +193,21 @@ def run_simulation(
     # scenario carries a width; unarmed, the LI kernels are the M1 ones untouched.
     channels = None
     if scenario.has_channels:
-        chan_w = load_field(
-            scenario.channel_width_field,
-            grid,
-            scalar=scenario.channel_width_m,
-            name="channel width",
-            nonneg=True,
+        # Width and depth aggregate by **max**, not mean: a river passes *through*
+        # a block, and averaging its width with the dry cells beside it would thin
+        # away exactly what sub-grid channels exist to keep (solver.io.coarsen).
+        chan_w = _field(
+            scenario.channel_width_field, scenario.channel_width_m, "channel width", "max"
         )
-        chan_d = load_field(
-            scenario.channel_depth_field,
-            grid,
-            scalar=scenario.channel_depth_m,
-            name="channel depth",
-            nonneg=True,
+        chan_d = _field(
+            scenario.channel_depth_field, scenario.channel_depth_m, "channel depth", "max"
         )
         chan_n = None
         if scenario.channel_manning_field is not None or scenario.channel_manning is not None:
-            chan_n = load_field(
+            chan_n = _field(
                 scenario.channel_manning_field,
-                grid,
-                scalar=(scenario.channel_manning or 0.0),
-                name="channel manning",
-                nonneg=True,
+                (scenario.channel_manning or 0.0),
+                "channel manning",
             )
         channels = arm_channels(st, chan_w, chan_d, chan_n)
         if verbose:
@@ -198,13 +215,7 @@ def run_simulation(
 
     # --- M3 sources/sinks -------------------------------------------------------
     # Infiltration (constant-rate sink, mm/hr -> m/s); armed only when nonzero.
-    infil = load_field(
-        scenario.infiltration_field,
-        grid,
-        scalar=scenario.infiltration_mm_hr,
-        name="infiltration",
-        nonneg=True,
-    )
+    infil = _field(scenario.infiltration_field, scenario.infiltration_mm_hr, "infiltration")
     infil_m_s = infil / 1000.0 / 3600.0
     if scenario.infiltration_field is not None or float(infil_m_s.max()) > 0.0:
         st.set_infiltration(infil_m_s)
@@ -212,7 +223,7 @@ def run_simulation(
     rain_is_field = scenario.rain_type == "field"
     rain_field_sum_m_s = 0.0
     if rain_is_field:
-        rain_mm_hr_field = load_field(scenario.rain_field, grid, name="rainfall", nonneg=True)
+        rain_mm_hr_field = _field(scenario.rain_field, 0.0, "rainfall")
         rain_field = rain_mm_hr_field / 1000.0 / 3600.0
         st.set_rain_field(rain_field)
         rain_field_sum_m_s = float(rain_field.astype(np.float64).sum())
@@ -231,7 +242,8 @@ def run_simulation(
     attrs = {
         "scheme": scenario.scheme,
         "crs": scenario.crs,
-        "dx": scenario.dx,
+        "dx": grid.dx,
+        "coarsen": k,
         "units": {"depth": "m", "u": "m/s", "v": "m/s", "time": "s", "bed": "m"},
         "scenario": scenario.name,
         "rain_type": scenario.rain_type,
@@ -400,7 +412,13 @@ def main(argv: list[str] | None = None) -> None:
             f"scheme={scenario.scheme}"
         )
         print(f"  domain        : {mosaic.summary()}")
-        print(f"  field memory  : ~{field_memory_mb(bed.shape):.1f} MB (float32 state fields)")
+        run_shape = coarsened_shape(bed.shape, scenario.coarsen)
+        if scenario.coarsen > 1:
+            print(
+                f"  resolution    : coarsen={scenario.coarsen} -> {run_shape[0]}x{run_shape[1]} "
+                f"cells @ dx={scenario.dx * scenario.coarsen:.2f} m"
+            )
+        print(f"  field memory  : ~{field_memory_mb(run_shape):.1f} MB (float32 state fields)")
         if mosaic.gap_cells:
             print(f"  WARNING: {mosaic.gap_cells} cells are not covered by any tile (filled flat)")
         status.write("starting", message=f"{scenario.name}: {mosaic.summary()}")

@@ -484,3 +484,13 @@ def test_a_channel_width_without_a_depth_is_rejected(tmp_path):
     text = _FULL + "\n[channels]\nwidth = 25.0\n"
     with pytest.raises(ConfigError, match="bank-full depth"):
         load_config(_write(tmp_path, text))
+
+
+def test_coarsen_parses_and_validates(tmp_path):
+    assert load_config(_write(tmp_path, _FULL)).coarsen == 1
+    text = _FULL.replace('tiles_dir = "data/tiles/demo"', 'tiles_dir = "d"\ncoarsen = 4')
+    assert load_config(_write(tmp_path, text)).coarsen == 4
+    for bad in ("0", "2.5", "true"):
+        text = _FULL.replace('tiles_dir = "data/tiles/demo"', f"tiles_dir = 'd'\ncoarsen = {bad}")
+        with pytest.raises(ConfigError, match="coarsen"):
+            load_config(_write(tmp_path, text))
