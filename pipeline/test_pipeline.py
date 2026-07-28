@@ -136,3 +136,48 @@ def test_read_conditioned_matches_metadata(tmp_path):
     assert bed.shape == tuple(meta["shape"])
     assert acc.shape == bed.shape
     assert abs(transform.a - meta["dx_m"]) < 1e-6
+
+
+# --- M6: sub-grid channel geometry -------------------------------------------
+
+
+def test_hydraulic_geometry_scales_with_area_and_clips_to_the_cell():
+    """Width grows with drainage area, stops at dx, and vanishes below threshold."""
+    from pipeline.channels import hydraulic_geometry
+
+    area = np.array([[0.1, 1.0, 10.0, 1000.0]])  # km^2
+    w, d, clipped = hydraulic_geometry(area, dx=50.0, min_area_km2=1.0)
+
+    assert w[0, 0] == 0.0 and d[0, 0] == 0.0  # hillslope: no channel
+    assert w[0, 1] == pytest.approx(8.0)  # 8 * 1^0.5
+    assert w[0, 2] == pytest.approx(8.0 * 10**0.5, rel=1e-5)
+    assert w[0, 3] == 50.0  # clipped to dx -- a channel must fit its cell
+    assert clipped == 1
+    assert d[0, 2] == pytest.approx(0.27 * 10**0.3, rel=1e-5)
+    # Monotone in area, and "no channel" is zero in both fields.
+    assert np.all(np.diff(w[0]) >= 0)
+    assert np.all((w[0] > 0) == (d[0] > 0))
+
+
+def test_channel_fields_align_to_the_tile_mosaic(tmp_path):
+    """The fields the solver loads must match the assembled domain, cell for cell."""
+    from pipeline.channels import channel_fields
+
+    src = tmp_path / "dem.tif"
+    cond_dir = tmp_path / "conditioned"
+    tiles_dir = tmp_path / "tiles"
+    fields_dir = tmp_path / "fields"
+    _write_geographic_dem(src, n=64)
+    condition_dem(src, cond_dir, dst_crs="EPSG:32617")
+    manifest = tile_dem(cond_dir, tiles_dir, size=32)  # a full multi-tile mosaic
+
+    record = channel_fields(cond_dir, tiles_dir, fields_dir, min_area_km2=0.0)
+
+    ny = max(t["row"] + t["height"] for t in manifest["tiles"])
+    nx = max(t["col"] + t["width"] for t in manifest["tiles"])
+    assert record["shape"] == [ny, nx]
+    for name in ("channel_width", "channel_depth"):
+        raw = np.fromfile(fields_dir / f"{name}.r32", dtype="<f4")
+        assert raw.size == ny * nx
+    # The coefficients travel with the fields -- they are calibration, not constants.
+    assert "coefficients" in json.loads((fields_dir / "channels.json").read_text())

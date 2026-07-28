@@ -14,6 +14,7 @@ writes a `<store>.provenance.json` sidecar recording the config + field hashes.
 | `spatial_fields.toml` | M3: spatially-varying **Manning** and **infiltration** `.r32` fields (generate them first with `scripts/make_demo_fields.py`). |
 | `river_reach_hllc.toml` | M4: the well-balanced **HLLC** finite-volume scheme on the *same* setup as `river_reach.toml` — only `[meta].scheme` and the CFL differ, so the pair is a like-for-like LI-vs-HLLC side-by-side. |
 | `reservoir_release.toml` | M5: a **dam** with a `target_stage` **release rule on the slow clock**, plus a tidal **`fixed_stage`** boundary and an inflow hydrograph. Needs its synthetic valley tile first: `uv run python scripts/make_reservoir_demo.py`. |
+| `reach_basin.toml` | M6: **reach** — a 6×6 **tile mosaic** (1536² @ 50 m = 76.8 km square) run at `coarsen = 2` (768² @ 100 m) with the river carried by **sub-grid channels**. Needs its synthetic basin + channel fields first: `uv run python scripts/make_reach_demo.py`. |
 
 Run one with:
 
@@ -95,6 +96,53 @@ elevations, with the offset in `.zattrs` as `datum_shift_m`. Structure crests an
 stage levels shift with the bed. It is worth setting for terrain hundreds of metres
 above the datum; at ~10 m it measurably buys nothing (see
 `validation/test_ea_test1.py`).
+
+## Domain, resolution and sub-grid channels (M6)
+
+The domain is the **tile mosaic**, and the run resolution is a choice:
+
+```toml
+[grid]
+tiles_dir = "data/tiles/reach_demo"
+tiles = "all"              # "all" (the whole tile set, default) | "first" (tile 0)
+window = [0, 0, 767, 767]  # optional inclusive [row0, col0, row1, col1], mosaic coords
+coarsen = 2                # run k times coarser than the tiles: dx' = k*dx
+```
+
+Only the tiles a `window` touches are read, and cells no tile covers are filled
+flat **and counted** — a hole in the terrain is reported at startup, never
+discovered later in the depth field. Coarsening aggregates every input field once,
+before stepping: the bed and the rate fields (Manning, infiltration, rainfall) by
+block **mean** (volume-preserving), channel width/depth by block **max** (a river
+crosses a block; averaging its width away is the failure this exists to prevent).
+Partial blocks are cropped, not padded, and the trim is reported.
+
+**Cell indices** (`[[inflow]] cell`, `[[structures]] cells`/`pool`/`outlet`) are
+authored in the **assembled-domain frame** — after `window`, before `coarsen` — and
+mapped by `i // k`; an index outside the resolved domain is a loud error.
+
+A cell may carry a **channel narrower than itself**, which is what lets a coarse run
+keep its river:
+
+```toml
+[channels]
+width = "../data/fields/reach_demo/channel_width.r32"   # m, 0 < w <= dx (or a scalar)
+depth = "../data/fields/reach_demo/channel_depth.r32"   # m below the floodplain bed
+manning = 0.03                                          # default: the floodplain value
+```
+
+Water below bank full sits in the channel (its depth amplified by `dx/w`), and a
+face carries a channel flow plus a floodplain flow. Sub-grid channels are
+**`local_inertial`-only** and rejected on `hllc_fv` (M6 plan §0). Generate the two
+fields from a conditioned DEM's flow accumulation with
+
+```
+uv run python -m pipeline.channels --src <conditioned> --tiles <tiles> --out <fields>
+```
+
+whose hydraulic-geometry coefficients are **regional calibration inputs, not
+constants** — they are written beside the fields in `channels.json` for that reason,
+and a coarse run is only as good as the channel geometry it is fed.
 
 ## Scheme selection (M4)
 

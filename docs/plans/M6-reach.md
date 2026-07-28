@@ -252,15 +252,105 @@ Say this wherever the coarse run's numbers are reported.
 
 ---
 
-## 5. Acceptance / demo
+## 5. Acceptance / demo — MET
 
-- [ ] Mosaic domain assembly with `[grid] tiles` / `[grid] window`, bitwise-safe
-      for single-tile scenarios.
-- [ ] Sub-grid channels in the local-inertial scheme: storage curve, two-component
-      face conveyance, channel-aware CFL, `[channels]` fields, HLLC scope gate.
-- [ ] `[grid] coarsen` with volume-preserving aggregation and channel geometry
-      derived at the target resolution.
-- [ ] Fine-vs-coarse equivalence measured and reported.
-- [ ] §7.3 frame tiling at reach scale.
-- [ ] Demo scenario, docs, `ruff` + `pytest` green.
-- [ ] **Stop and confirm before M7.**
+- [x] **Mosaic domain assembly** (`solver/io/mosaic.py`): the domain is the tile
+      set, placed by each tile's `(row, col)` origin, with `[grid] tiles`
+      (`all`/`first`) and `[grid] window` selecting it. Only the tiles a window
+      touches are read (`np.memmap`). Uncovered cells are filled flat **and
+      counted**, reported at startup. Gated by: a tiled array reassembles to its
+      source exactly; a run over a 2×2 mosaic is **bitwise-identical** to the same
+      run over the equivalent single bed.
+- [x] **Sub-grid channels** (`solver/core/channels.py` + the LI kernels): the
+      storage curve `h → η`, a two-component face update (channel with `R = A/P`,
+      floodplain with the M1 formula, recombined into the same total flux), a CFL
+      that reduces over the water *column*, `[channels]` scalar-or-field geometry,
+      validation on arming, and a loud `hllc_fv` scope gate. Armed with `w ≡ 0`
+      the scheme reproduces M1 **bitwise**.
+- [x] **Resolution choice** (`solver/io/coarsen.py`, `[grid] coarsen = k`): block
+      **mean** for the bed and the rate fields (volume-preserving), block **max**
+      for channel width/depth, cell indices mapped `i // k` and refused if they
+      leave the domain, partial blocks cropped and reported. `coarsen = 1` is the
+      identity on every path.
+- [x] **Validated** (`validation/test_subgrid_channel.py`, CPU):
+      steady flow in a 20 m channel inside 50 m cells settles at the Manning normal
+      depth of **its own section** — 1.296 m modelled vs 1.298 m analytic (**−0.1%**);
+      overbank flow spills onto the floodplain with the mass gate holding (3.6e-8);
+      and the **reach claim** — the same 2 km reach with the channel **resolved** at
+      10 m (2000 cells) and carried **sub-grid** at 100 m (20 cells) agrees to
+      **0.1%** in depth (1.111 m vs 1.110 m), against analytical sections that
+      themselves differ by 2.3% (the wetted-perimeter term the sub-grid model adds
+      back). Storage agrees to 5.5%.
+- [x] **§7.3 frame tiling**: frames larger than `tile_size` (512) split into a
+      row-major tile grid whose geometry is listed once; tiles reassemble to the
+      Zarr frame exactly, edge tiles clipped; an untiled export is byte-for-byte
+      what M2 wrote. The Godot reader takes the results grid from the manifest
+      (a mosaic/coarsened run need not match terrain tile 0) and blits tiles.
+- [x] **Demo** `scenarios/reach_basin.toml` (+ `scripts/make_reach_demo.py`,
+      `pipeline/channels.py`): a **6×6 tile mosaic**, 1536² @ 50 m = **76.8 km
+      square**, run at `coarsen = 2` → **768² @ 100 m**, with 2232 sub-grid channel
+      cells (7–45 m wide) carrying a 15 mm/hr storm plus a 60 m³/s inflow wave over
+      12 h. The channel deepens from a 1.5 m column at 1 h to 3.75 m at 12 h,
+      overbank cells grow 25 → 1201, 11.6 Mm³ leaves the open southern edge, and the
+      frames export lands on a **2×2 tile grid**. Mass **2.79e-7**; 2.8 min on the
+      CPU backend (this session has no GPU).
+- [x] `ruff` + `ruff format` clean; **228 tests green** (221 without `--extra geo`).
+- **Stop and confirm before M7.** ← we are here.
+
+### HANDOFF divergences (deliberate)
+
+1. **"Multi-resolution" is resolution *choice*, not nested grids** (§1.1). The
+   milestone line offers "multi-resolution / tiling-at-scale"; M6 builds the second
+   plus a per-run resolution with conservative aggregation, and sub-grid channels to
+   make coarsening survivable. §12's interface-conservation problem is **avoided,
+   not solved** — there is no resolution interface in a run. Nested two-way patches
+   remain unbuilt, and this milestone is not evidence they work.
+2. **The 1D river network is not built** (the roadmap line already calls it
+   optional). It carries the same 1D↔2D exchange-conservation risk for capability
+   sub-grid channels largely cover at reach scale. Its gate is named for whoever
+   builds it: a dedicated exchange-conservation test, before any result.
+3. **Sub-grid channels are local-inertial-only**, the mirror of M5's `fixed_stage`
+   being HLLC-only, and rejected loudly rather than ignored.
+
+### Carried limitations (state these honestly)
+
+- **The mass gate is now a precision envelope, not a comfortable margin.** A
+  rain-on-grid run at reach scale is the first thing in this project to approach the
+  1e-6 gate for *arithmetic* reasons: the same demo scenario at `coarsen = 4`
+  (384² cells) **exceeds** it at 1.8e-6, and does so **identically with channels
+  disabled** (1.87e-6), so it is float32 accumulation of a distributed source into a
+  thin sheet — HANDOFF §12's "float32 conservation drift at scale", measured. The
+  residual is generated *while it rains* (it stops growing when the storm stops) and
+  is roughly fixed in absolute terms, so the relative error falls as the basin fills:
+  the shipped demo sits at 2.8e-7 with a 15 mm/hr storm and would fail with a 2 mm/hr
+  one. **Before treating a reach-scale gate failure as a bug, check the storm depth,
+  the cell count and the step count.** A real fix (a compensated or float64 source
+  accumulation) is a precision pass, and it should happen before sediment (M7) adds
+  another distributed source on the same fields.
+- **A sub-grid channel is a parameterization, not resolved physics.** It restores
+  conveyance and storage; it does not restore planform, meander routing or overbank
+  velocity structure. And its geometry is calibration data: `pipeline/channels.py`'s
+  hydraulic-geometry coefficients are regional inputs, wrong by factors outside the
+  regime they were fitted for, which is why the CLI writes them beside the fields.
+- **A channel must be continuous to convey.** `w_face = min(w_L, w_R)`, so a channel
+  band that steps sideways faster than it is wide has a wall across it — and nothing
+  in the depth field says so. `scripts/make_reach_demo.py::check_continuity` exists
+  because the first demo basin did exactly that.
+- **Coarsening removes natural barriers.** A one-cell ridge inside a `k × k` block is
+  averaged away and the coarse run will not hold water the fine run holds.
+  `[[structures]]` survive (applied after coarsening, at their authored crest); ridges
+  do not.
+- **The fine-vs-coarse gate is an equivalence claim about our own two runs**, not a
+  benchmark validation, and the two models are not identical by construction (the
+  resolved 2D channel has no side-wall drag; the sub-grid one does). Both numbers and
+  both analytical sections are printed rather than hidden inside the tolerance.
+- **The Godot side is unverified in this session.** The frame-tiling and
+  manifest-driven-geometry changes in `results_player.gd` are written against the
+  contract and the Python round-trip tests, but this session has **no Godot and no
+  GPU**: they have not been run. M2's gotcha applies — verify file handoffs with
+  `--rblaunch`, not just `pytest`. The terrain layer still loads tile 0 only, so a
+  mosaic run renders its water over one terrain tile until the viewer's terrain path
+  catches up.
+- **Reach scale is still bounded by device memory.** The run prints its resolved
+  domain and estimated field memory before stepping, but nothing streams: a domain
+  larger than the GPU is a failure, not a slow run.

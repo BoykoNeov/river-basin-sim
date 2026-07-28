@@ -15,7 +15,38 @@ A faithful research/education sandbox validated against benchmarks — **not a
 regulatory-certification tool**. State that honestly anywhere it matters.
 
 ## Status
-- **M5 — Multi-physics: acceptance met; confirm before M6.** The locked time-integration
+- **M6 — Reach: acceptance met; confirm before M7.** Reach is bought by **choosing the
+  resolution** and putting the lost river back, not by nesting grids. Three pieces:
+  **`solver/io/mosaic.py`** makes the domain the whole **tile mosaic** (`[grid] tiles`
+  = `all`/`first`, `[grid] window` = an inclusive box in mosaic coords; only the tiles a
+  window touches are memmapped; uncovered cells are filled flat **and counted**);
+  **`solver/io/coarsen.py`** runs `k`× coarser (`[grid] coarsen`, `dx' = k·dx`) with every
+  field aggregated **once, before any water moves** — block **mean** for the bed and the
+  rate fields (volume-preserving), block **max** for channel width/depth (a river crosses
+  a block; a mean thins it away) — and cell indices mapped `i // k`, refused if they leave
+  the domain; and **`solver/core/channels.py`** carries a **channel narrower than its
+  cell**. That last is the milestone: `h` keeps its meaning (volume per unit plan area,
+  so continuity, the donor limiter and the ledger are untouched and **mass conservation
+  stays exact by construction**), and the channel enters only through the **storage
+  curve** `h → η` (below bank full `η = z − d + h·dx/w`; above it `η = z + (h − h_bf)`;
+  `w = 0` collapses to `z + h` bit for bit) and a **two-component face update** — channel
+  flow with hydraulic radius `A/P` **not** the depth, plus the M1 floodplain flow,
+  recombined into the same total flux. The CFL reduces over the water **column**, since a
+  channel concentrates depth by `dx/w`. **Local-inertial only, loudly** (the mirror of
+  M5's HLLC-only `fixed_stage`). **Validated:** normal depth in a 20 m channel inside 50 m
+  cells is **−0.1%** off its own analytical section (1.296 vs 1.298 m); overbank spill
+  conserves mass (3.6e-8); and the **reach claim** — the same 2 km reach resolved at 10 m
+  (2000 cells) versus sub-grid at 100 m (20 cells) — agrees to **0.1%** in depth. §7.3's
+  `tile_grid` is real now (frames > 512 split row-major; an untiled export is byte-identical
+  to M2's), and the Godot reader takes its grid from the manifest and blits tiles —
+  **written but unverified, no Godot/GPU in that session**. Demo
+  `scenarios/reach_basin.toml`: a **6×6 mosaic, 76.8 km square**, run at 768² @ 100 m with
+  2232 channel cells, mass **2.79e-7**. **228 tests green.** **One loud carried finding:**
+  the mass gate is now a *precision envelope* — the same demo at `coarsen = 4` **exceeds**
+  it (1.8e-6) and does so identically with channels off, i.e. float32 accumulation of
+  rain into a thin sheet (§12's drift-at-scale, measured). Check storm depth / cell count /
+  step count before calling a reach-scale gate failure a bug. See `docs/plans/M6-reach.md`.
+- **M5 — Multi-physics: done.** The locked time-integration
   decision (HANDOFF §2/§8) is now real code. **`solver/scheduler.py`** owns the single
   simulated clock and *only* that: the fast scheme still computes its own state-derived
   `Δt`; the scheduler clamps it so a step never crosses a **sync point** (output cadence,
@@ -158,6 +189,13 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   open boundary, self-contained) and `scenarios/spatial_fields.toml` (Manning +
   infiltration `.r32` fields — generate them first with
   `uv run python scripts/make_demo_fields.py`).
+- M6 scenario: `scenarios/reach_basin.toml` — a 6x6 tile mosaic (1536^2 @ 50 m = 76.8 km
+  square) run at `coarsen = 2` (768^2 @ 100 m) with the river carried by sub-grid
+  channels. Generate its synthetic basin + channel fields first with
+  `uv run python scripts/make_reach_demo.py`. For a real DEM, derive the channel fields
+  from the M0 flow accumulation: `uv run python -m pipeline.channels --src <conditioned>
+  --tiles <tiles> --out <fields>` (its hydraulic-geometry coefficients are **regional
+  calibration inputs**, recorded beside the fields).
 - M5 scenario: `scenarios/reservoir_release.toml` — a dam with a `target_stage` release
   rule on the slow clock, a tidal `fixed_stage` southern edge, and inflow hydrographs
   filling the reservoir. Generate its synthetic valley tile first with
@@ -227,6 +265,20 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   a single 40 m cell that is a 34 m instantaneous column. Deliver over a *reach* (the
   `outlet` box), and sanity-check `Q · interval_s / (area · cells)` before believing a
   release-driven result.
+- **At reach scale the mass gate is a *precision envelope*, not a margin.** A
+  rain-on-grid run over hundreds of thousands of cells accumulates float32 round-off in
+  `h` while it rains: M6's demo is 2.8e-7 at 15 mm/hr but the *same* scenario at
+  `coarsen = 4` trips the gate at 1.8e-6 — **identically with sub-grid channels disabled**,
+  so it is the source accumulation, not the new code (HANDOFF §12's drift-at-scale). The
+  residual is roughly fixed in absolute terms and stops growing when the rain stops, so the
+  relative error *falls* as the basin fills. Diagnose a reach-scale failure by storm depth,
+  cell count and step count before suspecting the scheme; the real fix (compensated or
+  float64 source accumulation) is a precision pass, and it should land before M7 adds
+  sediment to the same fields.
+- **A sub-grid channel conveys only where it is continuous.** `w_face = min(w_L, w_R)`, so
+  a channel band that steps sideways faster than it is wide has a wall across it and
+  nothing in the depth field says so. Check connectivity when authoring channel geometry
+  (`scripts/make_reach_demo.py::check_continuity` exists because the first demo did this).
 - **Never keep depth non-negative with a bare `max(h, 0)`.** It invents mass and
   silently breaks the ledger and any boundary banking (M4 measured ~6.5e-2 on a full
   drain, five orders over the gate). Both schemes use a **donor-cell β mass-flux
