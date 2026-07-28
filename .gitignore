@@ -23,6 +23,11 @@ viewer/uid_cache.bin
 # Install with viewer/scripts/fetch_terrain3d.sh (or Godot AssetLib). See viewer/README.
 viewer/addons/
 
+# Third-party Godot editor tooling dropped at the repo root (e.g. the gdai MCP
+# plugin): ~16 MB of GDExtension binaries, and there is no project.godot here
+# anyway, so Godot never loads it from this path. Not vendored.
+/addons/
+
 # Throwaway Terrain3D compatibility-probe project
 .t3dtest/
 
