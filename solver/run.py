@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -64,18 +65,31 @@ def pick_device(requested: str | None) -> str:
     return "cuda:0" if wp.get_cuda_devices() else "cpu"
 
 
-def shift_for_datum(scenario: Scenario, bed: np.ndarray) -> tuple[np.ndarray, float]:
+@dataclass
+class _ShiftedElevations:
+    """A run's absolute elevations moved into the stepping datum (M5 §1.5)."""
+
+    bed: np.ndarray
+    z_ref: float
+    stage_curves: dict[str, list[tuple[float, float]]]
+
+
+def shift_for_datum(scenario: Scenario, bed: np.ndarray) -> _ShiftedElevations:
     """Resolve ``[grid] datum`` and put the run into shifted coordinates (M5 §1.5).
 
-    Returns ``(bed_shifted, z_ref)``. **Every absolute elevation the scenario
-    carries shifts here**, in this one function, so the bed and the config's
-    elevations can never disagree by ``z_ref``. Today that is the bed alone;
-    boundary stage levels and structure crests join it as they land. Depth,
-    velocity and all mass accounting are datum-independent, and the canonical store
-    still records the true bed (:func:`solver.core.datum.unshift_bed`).
+    **Every absolute elevation the scenario carries shifts here**, in this one
+    function, so the bed and the config's elevations can never disagree by
+    ``z_ref``: the bed and each ``fixed_stage`` water-level curve (structure crests
+    join them below, applied to the already-shifted bed). Depth, velocity and all
+    mass accounting are datum-independent, and the canonical store still records the
+    true bed (:func:`solver.core.datum.unshift_bed`).
     """
     z_ref = resolve_datum(scenario.datum, bed)
-    return shift_bed(bed, z_ref), z_ref
+    curves = {
+        edge: [(t, level - z_ref) for t, level in curve]
+        for edge, curve in scenario.stage_curves.items()
+    }
+    return _ShiftedElevations(bed=shift_bed(bed, z_ref), z_ref=z_ref, stage_curves=curves)
 
 
 def run_simulation(
@@ -114,7 +128,8 @@ def run_simulation(
     # eta = h + z keeps its precision at a high datum; the store gets the true bed
     # back. Every absolute elevation the scenario carries shifts with it, in one
     # place (shift_for_datum), so they cannot drift apart.
-    bed_sim, z_ref = shift_for_datum(scenario, bed)
+    elev = shift_for_datum(scenario, bed)
+    bed_sim, z_ref = elev.bed, elev.z_ref
     st = State.from_bed(
         bed_sim, dx=scenario.dx, depth=scenario.initial_depth, manning=manning, device=device
     )
@@ -141,8 +156,9 @@ def run_simulation(
         rain_field_sum_m_s = float(rain_field.astype(np.float64).sum())
     # Inflow hydrographs (prescribed discharge point sources).
     injector = InflowInjector(scenario.inflows, grid, device) if scenario.inflows else None
-    # Open (free-outflow) boundaries (no-op when every edge is closed).
-    st.set_open_boundaries(scenario.boundaries)
+    # Per-edge boundaries: open (free-outflow) and, from M5, fixed_stage water-level
+    # curves (already in the stepping datum). No-op when every edge is closed.
+    st.set_open_boundaries(scenario.boundaries, elev.stage_curves)
 
     ledger = MassLedger.from_state(st)
 
@@ -180,7 +196,7 @@ def run_simulation(
     sched = MultiRateScheduler(
         end_time=scenario.end_time,
         output_every=scenario.output_every,
-        events=[scenario.rain_duration, *inflow_events],
+        events=[scenario.rain_duration, *inflow_events, *scenario.stage_events],
     )
 
     for tick in sched.ticks(
@@ -195,12 +211,12 @@ def run_simulation(
         raining = t < scenario.rain_duration - EPS_T
 
         if rain_is_field:
-            scheme.step(st, dt=dt, rain_scale=(1.0 if raining else 0.0))
+            scheme.step(st, dt=dt, rain_scale=(1.0 if raining else 0.0), t=t)
             if raining:
                 ledger.add_inflow(rain_field_sum_m_s * dt * grid.cell_area)
         else:
             rain = scenario.rain_m_s if raining else 0.0
-            scheme.step(st, dt=dt, rain=rain)
+            scheme.step(st, dt=dt, rain=rain, t=t)
             if rain > 0.0:
                 ledger.add_rain_step(rain, dt, grid.n_cells)
 

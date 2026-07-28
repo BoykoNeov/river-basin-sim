@@ -62,11 +62,20 @@ bitwise. The retained ``wp.max(h, 0)`` in the RK kernels is now only a sub-ULP
 round-off net (and a diagnostic: a genuine limiter gap would surface *as* a mass
 gate failure, not a silent negative).
 
-``fixed_stage`` (a prescribed-surface Dirichlet ghost) is additive to this
-structure but needs a numeric per-edge config extension; deferred (plan §6,
-non-gating). Determinism (HANDOFF §8/§12): every kernel writes each output from one
-thread reading only inputs; the timestep is a state-derived atomic-max reduction,
-order-independent like the LI scheme's.
+  * **fixed_stage** edge (M5) -> a *prescribed-surface Dirichlet ghost*:
+    ``eta_ghost = stage(t)``, ``h_ghost = max(stage - z_edge, 0)``,
+    ``z_ghost = z_edge`` (so the bed correction vanishes as it does at a wall), and
+    zero-gradient velocity. The Riemann solver then decides the direction -- inflow
+    when the stage sits above the interior surface, outflow when below -- and the
+    through-flux is banked like an open edge, signed, so water entering registers as
+    ledger inflow. At equilibrium the two sides are identical and the flux is
+    exactly 0, so lake-at-rest survives a stage edge. HLLC-only by design (M5 plan
+    §1.4); the config rejects it on the local-inertial scheme.
+
+Determinism (HANDOFF §8/§12): every kernel writes each output from one thread
+reading only inputs; the timestep is a state-derived atomic-max reduction,
+order-independent like the LI scheme's; a time-varying stage is a host-side scalar
+evaluated from the simulated clock.
 """
 
 from __future__ import annotations
@@ -75,6 +84,7 @@ from dataclasses import dataclass
 
 import warp as wp
 
+from solver.core.boundaries import stage_at
 from solver.core.friction import manning_denominator
 from solver.core.grid import GRAVITY, H_DRY
 from solver.core.state import State
@@ -511,6 +521,113 @@ def _wall_y_south(
     fy_mt[ny, j] = f[2]
 
 
+# --------------------------------------------------------------------------- #
+# fixed_stage edges (M5): a prescribed-water-surface Dirichlet ghost -- the third #
+# member of the same ghost-cell family as the wall and the transmissive edge.    #
+# The ghost gets eta_ghost = stage(t), h_ghost = max(stage - z_edge, 0), and      #
+# z_ghost = z_edge, so (exactly as for the wall) z_star = z_edge and the Audusse  #
+# hydrostatic bed correction vanishes at the boundary face. Velocity is           #
+# zero-gradient (copied from the edge cell), so the HLLC solver -- not a hand      #
+# rule -- decides the direction: a stage above the interior surface drives inflow, #
+# below it drives outflow, and stage <= z_edge gives h_ghost = 0, i.e. a dry ghost #
+# that is inert by construction. At equilibrium (interior surface == stage, u = 0) #
+# the two sides are identical, so the flux is exactly 0 and lake-at-rest holds.   #
+# Through-flux is banked in both directions (see _bank_* below).                  #
+# --------------------------------------------------------------------------- #
+@wp.kernel
+def _stage_x_west(
+    h: wp.array2d(dtype=wp.float32),
+    z: wp.array2d(dtype=wp.float32),
+    uvel: wp.array2d(dtype=wp.float32),
+    vvel: wp.array2d(dtype=wp.float32),
+    fx_h: wp.array2d(dtype=wp.float32),
+    fx_mn_r: wp.array2d(dtype=wp.float32),
+    fx_mt: wp.array2d(dtype=wp.float32),
+    stage: wp.float32,
+    g: wp.float32,
+    dry: wp.float32,
+):
+    """West stage edge (x-face col 0): prescribed-surface ghost on the left."""
+    i = wp.tid()
+    h_g = wp.max(stage - z[i, 0], 0.0)
+    f = _hllc(h_g, uvel[i, 0], vvel[i, 0], h[i, 0], uvel[i, 0], vvel[i, 0], g, dry)
+    fx_h[i, 0] = f[0]
+    fx_mn_r[i, 0] = f[1]
+    fx_mt[i, 0] = f[2]
+
+
+@wp.kernel
+def _stage_x_east(
+    h: wp.array2d(dtype=wp.float32),
+    z: wp.array2d(dtype=wp.float32),
+    uvel: wp.array2d(dtype=wp.float32),
+    vvel: wp.array2d(dtype=wp.float32),
+    fx_h: wp.array2d(dtype=wp.float32),
+    fx_mn_l: wp.array2d(dtype=wp.float32),
+    fx_mt: wp.array2d(dtype=wp.float32),
+    stage: wp.float32,
+    nx: wp.int32,
+    g: wp.float32,
+    dry: wp.float32,
+):
+    """East stage edge (x-face col nx): interior on the left, stage ghost right."""
+    i = wp.tid()
+    u = uvel[i, nx - 1]
+    v = vvel[i, nx - 1]
+    h_g = wp.max(stage - z[i, nx - 1], 0.0)
+    f = _hllc(h[i, nx - 1], u, v, h_g, u, v, g, dry)
+    fx_h[i, nx] = f[0]
+    fx_mn_l[i, nx] = f[1]
+    fx_mt[i, nx] = f[2]
+
+
+@wp.kernel
+def _stage_y_north(
+    h: wp.array2d(dtype=wp.float32),
+    z: wp.array2d(dtype=wp.float32),
+    uvel: wp.array2d(dtype=wp.float32),
+    vvel: wp.array2d(dtype=wp.float32),
+    fy_h: wp.array2d(dtype=wp.float32),
+    fy_mn_r: wp.array2d(dtype=wp.float32),
+    fy_mt: wp.array2d(dtype=wp.float32),
+    stage: wp.float32,
+    g: wp.float32,
+    dry: wp.float32,
+):
+    """North stage edge (y-face row 0): normal velocity is v, transverse is u."""
+    j = wp.tid()
+    h_g = wp.max(stage - z[0, j], 0.0)
+    f = _hllc(h_g, vvel[0, j], uvel[0, j], h[0, j], vvel[0, j], uvel[0, j], g, dry)
+    fy_h[0, j] = f[0]
+    fy_mn_r[0, j] = f[1]
+    fy_mt[0, j] = f[2]
+
+
+@wp.kernel
+def _stage_y_south(
+    h: wp.array2d(dtype=wp.float32),
+    z: wp.array2d(dtype=wp.float32),
+    uvel: wp.array2d(dtype=wp.float32),
+    vvel: wp.array2d(dtype=wp.float32),
+    fy_h: wp.array2d(dtype=wp.float32),
+    fy_mn_l: wp.array2d(dtype=wp.float32),
+    fy_mt: wp.array2d(dtype=wp.float32),
+    stage: wp.float32,
+    ny: wp.int32,
+    g: wp.float32,
+    dry: wp.float32,
+):
+    """South stage edge (y-face row ny): interior on the left, stage ghost below."""
+    j = wp.tid()
+    u = uvel[ny - 1, j]
+    v = vvel[ny - 1, j]
+    h_g = wp.max(stage - z[ny - 1, j], 0.0)
+    f = _hllc(h[ny - 1, j], v, u, h_g, v, u, g, dry)
+    fy_h[ny, j] = f[0]
+    fy_mn_l[ny, j] = f[1]
+    fy_mt[ny, j] = f[2]
+
+
 # Open-edge mass banking (M4 step 9). The depth added to an edge cell from its
 # boundary face over one SSP-RK2 step is 0.5*dt*(F_stage1 + F_stage2)/dx (Heun
 # weights; loss_cum holds a per-cell depth); banking the negative of that records
@@ -873,18 +990,95 @@ def compute_dt(state: State, alpha: float = 0.45, dt_max: float = 30.0) -> float
     return min(alpha * g.dx / smax, dt_max)
 
 
-def _apply_walls(state: State, h: wp.array) -> None:
-    """Overwrite closed-edge boundary face fluxes with reflective-wall fluxes.
+def _apply_boundaries(state: State, h: wp.array, stages: dict[str, float]) -> None:
+    """Overwrite boundary-face fluxes for closed (wall) and fixed_stage edges.
 
     Runs inside :func:`_eval_L` after the interior flux kernels (which filled the
     boundary faces transmissively) and before the flux divergence. ``h`` and the
-    scratch velocities ``s.uvel/s.vvel`` are the current RK-stage state. Open edges
-    are skipped -- they keep the transmissive flux and are banked in :func:`step`.
+    scratch velocities ``s.uvel/s.vvel`` are the current RK-stage state; ``stages``
+    holds the prescribed surface for each fixed_stage edge, already evaluated for
+    this step. **Open** edges are skipped -- they keep the transmissive flux the
+    interior kernels computed. Open and fixed_stage edges are both banked in
+    :func:`step`.
     """
     g = state.grid
     s: _HllcScratch = state.hllc
     bc = state.boundaries
     gf, dryf = float(GRAVITY), float(H_DRY)
+    if bc["west"] == "fixed_stage":
+        wp.launch(
+            _stage_x_west,
+            dim=g.ny,
+            inputs=[
+                h,
+                state.z,
+                s.uvel,
+                s.vvel,
+                s.fx_h,
+                s.fx_mn_r,
+                s.fx_mt,
+                stages["west"],
+                gf,
+                dryf,
+            ],
+            device=state.device,
+        )
+    if bc["east"] == "fixed_stage":
+        wp.launch(
+            _stage_x_east,
+            dim=g.ny,
+            inputs=[
+                h,
+                state.z,
+                s.uvel,
+                s.vvel,
+                s.fx_h,
+                s.fx_mn_l,
+                s.fx_mt,
+                stages["east"],
+                g.nx,
+                gf,
+                dryf,
+            ],
+            device=state.device,
+        )
+    if bc["north"] == "fixed_stage":
+        wp.launch(
+            _stage_y_north,
+            dim=g.nx,
+            inputs=[
+                h,
+                state.z,
+                s.uvel,
+                s.vvel,
+                s.fy_h,
+                s.fy_mn_r,
+                s.fy_mt,
+                stages["north"],
+                gf,
+                dryf,
+            ],
+            device=state.device,
+        )
+    if bc["south"] == "fixed_stage":
+        wp.launch(
+            _stage_y_south,
+            dim=g.nx,
+            inputs=[
+                h,
+                state.z,
+                s.uvel,
+                s.vvel,
+                s.fy_h,
+                s.fy_mn_l,
+                s.fy_mt,
+                stages["south"],
+                g.ny,
+                gf,
+                dryf,
+            ],
+            device=state.device,
+        )
     if bc["west"] == "closed":
         wp.launch(
             _wall_x_west,
@@ -915,13 +1109,18 @@ def _apply_walls(state: State, h: wp.array) -> None:
         )
 
 
-def _bank_open_outflow(state: State, wt: float) -> None:
-    """Bank one SSP-RK2 stage of open-edge boundary flux into ``loss_cum``.
+_BANKED = ("open", "fixed_stage")  # edge types water can actually cross
+
+
+def _bank_boundary_flux(state: State, wt: float) -> None:
+    """Bank one SSP-RK2 stage of boundary through-flux into ``loss_cum``.
 
     ``wt = 0.5*dt/dx`` (a Heun stage weight; ``loss_cum`` holds a per-cell depth);
     called once after each of the two per-step ``_eval_L`` evaluations, reading that
-    stage's boundary mass flux. A no-op unless the scenario has an open edge (which
-    armed ``loss_cum``).
+    stage's boundary mass flux. Applies to **open** and **fixed_stage** edges alike
+    -- the banked quantity is signed, so an edge that draws water *in* (which a
+    stage edge routinely does) banks a negative loss the float64 ledger reads as
+    inflow. A no-op unless the scenario has such an edge (which armed ``loss_cum``).
     """
     if state.loss_cum is None:
         return
@@ -929,19 +1128,19 @@ def _bank_open_outflow(state: State, wt: float) -> None:
     s: _HllcScratch = state.hllc
     bc = state.boundaries
     wt64 = float(wt)
-    if bc["west"] == "open":
+    if bc["west"] in _BANKED:
         wp.launch(
             _bank_x_west, dim=g.ny, inputs=[s.fx_h, state.loss_cum, wt64], device=state.device
         )
-    if bc["east"] == "open":
+    if bc["east"] in _BANKED:
         wp.launch(
             _bank_x_east, dim=g.ny, inputs=[s.fx_h, state.loss_cum, wt64, g.nx], device=state.device
         )
-    if bc["north"] == "open":
+    if bc["north"] in _BANKED:
         wp.launch(
             _bank_y_north, dim=g.nx, inputs=[s.fy_h, state.loss_cum, wt64], device=state.device
         )
-    if bc["south"] == "open":
+    if bc["south"] in _BANKED:
         wp.launch(
             _bank_y_south,
             dim=g.nx,
@@ -950,12 +1149,20 @@ def _bank_open_outflow(state: State, wt: float) -> None:
         )
 
 
-def _eval_L(state: State, h: wp.array, hu: wp.array, hv: wp.array, dt: float) -> None:
+def _eval_L(
+    state: State,
+    h: wp.array,
+    hu: wp.array,
+    hv: wp.array,
+    dt: float,
+    stages: dict[str, float],
+) -> None:
     """Evaluate the spatial operator ``L(U) = dU/dt`` from (h, hu, hv) into scratch.
 
-    Closed-edge walls are applied to the boundary face fluxes before the divergence
-    (:func:`_apply_walls`); open edges keep the transmissive flux and are banked by
-    the caller after this returns (:func:`_bank_open_outflow`).
+    Closed-edge walls and fixed_stage ghosts are applied to the boundary face fluxes
+    before the divergence (:func:`_apply_boundaries`); open edges keep the
+    transmissive flux. Open and fixed_stage edges are banked by the caller after
+    this returns (:func:`_bank_boundary_flux`).
 
     **The mass divergence is limited to be positivity-preserving for this stage.**
     After the fluxes (interior + walls) are formed, the donor-cell limiter
@@ -1017,9 +1224,10 @@ def _eval_L(state: State, h: wp.array, hu: wp.array, hv: wp.array, dt: float) ->
         ],
         device=state.device,
     )
-    # Closed-edge reflective walls overwrite their boundary face fluxes; open edges
-    # keep the transmissive flux computed above (banked by the caller).
-    _apply_walls(state, h)
+    # Closed-edge reflective walls and fixed_stage ghosts overwrite their boundary
+    # face fluxes; open edges keep the transmissive flux computed above (banked by
+    # the caller, as are the stage edges).
+    _apply_boundaries(state, h, stages)
     # Mass-conservative positivity limiter (M4 step 10): cap each cell's mass
     # outflow to what it holds, so h + dt*dh >= 0 this stage (replaces the
     # non-conservative wp.max(h,0) clamp). Scales fx_h/fy_h in place before the
@@ -1066,15 +1274,29 @@ def step(
     dt: float,
     rain: float = 0.0,
     rain_scale: float = 1.0,
+    t: float = 0.0,
 ) -> None:
     """Advance one HLLC step of size ``dt`` (SSP-RK2 + friction + sources).
 
     Signature mirrors the local-inertial ``step`` so the run loop is scheme-agnostic
     (``rain`` uniform source; ``rain_scale`` gates the optional spatial rain field;
-    ``state.infil`` the optional infiltration sink). Per-edge ghost-cell BCs come
-    from ``state.boundaries`` (§9): closed edges are reflective walls (applied in
-    ``_eval_L``), open edges are transmissive and mass-banked here into
-    ``state.loss_cum``; ``fixed_stage`` is deferred (plan §6).
+    ``state.infil`` the optional infiltration sink; ``t`` the simulated time at the
+    *start* of the step, for time-dependent boundary forcing). Per-edge ghost-cell
+    BCs come from ``state.boundaries``: closed edges are reflective walls and
+    ``fixed_stage`` edges are prescribed-surface ghosts (both applied in
+    ``_eval_L``); open and ``fixed_stage`` edges are mass-banked here into
+    ``state.loss_cum``.
+
+    A time-varying stage is evaluated **once per step, at the midpoint** ``t+dt/2``
+    (second-order on a linear segment, and steps never straddle a curve knot because
+    those are scheduler sync points), then held across both Heun stages.
+
+    *Caveat (documented, not defended against):* ``compute_dt`` derives the CFL from
+    the **interior** state, so a stage edge set far above the interior surface is a
+    dam-break at the boundary whose first step can be under-resolved. It is not a
+    stability hazard -- the donor-β limiter caps outflow and an inflow only raises
+    ``h``, which the next ``compute_dt`` sees -- but ramp a stage from the initial
+    interior level rather than stepping it discontinuously.
     """
     from solver.core.local_inertial import apply_infiltration, apply_rain_field
 
@@ -1082,6 +1304,11 @@ def step(
     g = state.grid
     s: _HllcScratch = state.hllc
     dtf, dxf, gf, dryf = float(dt), float(g.dx), float(GRAVITY), float(H_DRY)
+    stages = (
+        {e: stage_at(c, t + 0.5 * dtf) for e, c in state.stage_curves.items()}
+        if state.stage_curves
+        else {}
+    )
 
     # SSP-RK2 (Heun): predictor then corrector, each a full L evaluation. Open-edge
     # outflow is banked after each L eval with the matching Heun weight (0.5*dt),
@@ -1090,16 +1317,16 @@ def step(
     # 0.5*dt*(fx_h*inv_dx) over the two Heun stages, so the stage weight is
     # 0.5*dt/dx (NOT *dx -- that would over-bank by dx^2).
     wt = 0.5 * dtf / dxf
-    _eval_L(state, state.h, state.hu, state.hv, dtf)
-    _bank_open_outflow(state, wt)
+    _eval_L(state, state.h, state.hu, state.hv, dtf, stages)
+    _bank_boundary_flux(state, wt)
     wp.launch(
         _rk_stage1,
         dim=g.shape,
         inputs=[state.h, state.hu, state.hv, s.dh, s.dhu, s.dhv, s.h1, s.hu1, s.hv1, dtf, dryf],
         device=state.device,
     )
-    _eval_L(state, s.h1, s.hu1, s.hv1, dtf)
-    _bank_open_outflow(state, wt)
+    _eval_L(state, s.h1, s.hu1, s.hv1, dtf, stages)
+    _bank_boundary_flux(state, wt)
     wp.launch(
         _rk_stage2,
         dim=g.shape,

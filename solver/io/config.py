@@ -14,7 +14,10 @@ Supported now (through M3)::
     [rainfall]   type="uniform"|"field", rate_mm_hr, field?, duration_s
     [parameters] manning_n = <scalar OR field path>, infiltration = <scalar OR path>
     [[inflow]]   cell = [i, j], hydrograph = [[t, Q], ...]      (m^3/s)
-    [boundaries] default="closed"|"open", north/south/east/west = "closed"|"open"
+    [boundaries] default="closed"|"open"
+                 north/south/east/west = "closed" | "open"
+                                       | { type="fixed_stage", level=<m> }
+                                       | { type="fixed_stage", stage=[[t, level], ...] }
 
 M3 adds: spatially-varying ``manning_n`` / ``infiltration`` fields, ``field``
 rainfall, inflow hydrographs, and open boundaries (§9 M3). Field paths are raw
@@ -25,9 +28,14 @@ M4 adds: ``scheme="hllc_fv"`` (the well-balanced HLLC finite-volume scheme). The
 scheme name is validated against the known set here; whether a known scheme is
 wired up is decided at dispatch (:mod:`solver.core.schemes`).
 
+M5 adds: ``[grid] datum`` (vertical datum shift, :mod:`solver.core.datum`) and the
+``fixed_stage`` boundary type -- a prescribed water surface, constant or
+piecewise-linear in time, written as a per-edge table because it carries a level.
+It is **HLLC-only** (M5 plan §1.4) and rejected with the local-inertial scheme.
+
 Rejected until a later milestone: temporal rainfall ``timeseries``/``storm_cells``
-(later), ``[[structures]]`` (M5), and the ``fixed_stage``/``inflow`` boundary
-*types* (deferred out of M4 -- see the M4 plan §6.1 -- so they now carry M5).
+(later) and the ``inflow`` boundary *type* (deferred indefinitely -- ``[[inflow]]``
+cell sources cover prescribed discharge and their mass accounting is exact).
 Field paths are resolved relative to the TOML file's directory.
 """
 
@@ -42,8 +50,10 @@ from solver.core.schemes import KNOWN_SCHEMES
 
 # Rainfall types this milestone honours (spatial only; temporal rain deferred).
 _RAIN_TYPES = {"uniform", "field"}
-# Per-edge boundary behaviours this milestone honours.
+# Per-edge boundary behaviours writable as a bare string.
 _BC_TYPES = {"closed", "open"}
+# ... plus "fixed_stage" (M5), which needs a table because it carries a level.
+_BC_ALL = _BC_TYPES | {"fixed_stage"}
 # Edge names -> which domain face they map to (see solver.core.grid docstring).
 _EDGES = ("north", "south", "east", "west")
 
@@ -121,8 +131,12 @@ class Scenario:
     rain_duration: float = 1800.0  # seconds rain falls for
     # Inflow hydrographs (point sources).
     inflows: list[Inflow] = field(default_factory=list)
-    # Per-edge boundary behaviour: {north, south, east, west} -> "closed"|"open".
+    # Per-edge boundary behaviour: {north,south,east,west} -> "closed"|"open"|"fixed_stage".
     boundaries: dict[str, str] = field(default_factory=lambda: {e: "closed" for e in _EDGES})
+    # Water-level curve for each "fixed_stage" edge (M5): piecewise-linear
+    # [(t_s, level_m), ...], held at its end values outside the range. A constant
+    # level is a one-point curve. Absolute elevations -- shifted with the datum.
+    stage_curves: dict[str, list[tuple[float, float]]] = field(default_factory=dict)
     initial_depth: float = 0.0
     source_path: str | None = None  # the TOML this was loaded from (provenance)
     meta: dict = field(default_factory=dict)
@@ -162,6 +176,27 @@ class Scenario:
             raise ValueError(f"rainfall rate must be >= 0 mm/hr, got {self.rain_mm_hr}")
         if self.rain_duration < 0:
             raise ValueError(f"rainfall duration must be >= 0 s, got {self.rain_duration}")
+        # fixed_stage is HLLC-only (M5 plan §1.4): the local-inertial scheme has no
+        # boundary faces to impose a surface on -- its BCs are a zeroed edge face
+        # (closed) plus a post-interior self-capping sink (open), because the M1
+        # donor limiter never scales edge faces. A pressure-driven edge flux there
+        # would be exactly the unprotected case that shape exists to avoid. So this
+        # is a hard error on both construction paths, not a silent approximation.
+        bad_bc = sorted(f"{e}={v!r}" for e, v in self.boundaries.items() if v not in _BC_ALL)
+        if bad_bc:
+            raise ValueError(
+                f"unknown boundary type(s): {', '.join(bad_bc)}; use {sorted(_BC_ALL)}"
+            )
+        stage_edges = sorted(e for e, v in self.boundaries.items() if v == "fixed_stage")
+        if stage_edges and self.scheme != "hllc_fv":
+            raise ValueError(
+                f"boundary type 'fixed_stage' ({', '.join(stage_edges)}) requires "
+                f"scheme='hllc_fv'; the '{self.scheme}' scheme has no boundary faces to "
+                "prescribe a water surface on (M5 plan §1.4)"
+            )
+        for edge in stage_edges:
+            if not self.stage_curves.get(edge):
+                raise ValueError(f"boundary '{edge}' is fixed_stage but carries no stage curve")
         # The local-inertial scheme is stable only to CFL ~0.7 (Bates 2010); warn
         # loudly above that band rather than fail (experimentation is allowed).
         if self.alpha > 0.9:
@@ -178,6 +213,11 @@ class Scenario:
     @property
     def has_open_boundary(self) -> bool:
         return any(v == "open" for v in self.boundaries.values())
+
+    @property
+    def stage_events(self) -> list[float]:
+        """Stage-curve knot times -- sync points so a step never straddles a slope."""
+        return sorted({t for curve in self.stage_curves.values() for t, _ in curve})
 
     def field_paths(self) -> dict[str, str]:
         """Referenced field files by role (for provenance hashing)."""
@@ -264,24 +304,87 @@ def _parse_inflows(doc: dict, ny_nx: tuple[int, int] | None = None) -> list[Infl
     return inflows
 
 
-def _parse_boundaries(boundaries: dict) -> dict[str, str]:
-    """Resolve per-edge boundary behaviour, applying ``default`` to unset edges."""
-    default = boundaries.get("default", "closed")
-    if default not in _BC_TYPES:
+_STAGE_EXAMPLE = '{ type = "fixed_stage", level = 10.0 }'
+
+
+def _parse_stage_curve(edge: str, table: dict) -> list[tuple[float, float]]:
+    """Parse a ``fixed_stage`` edge table into a piecewise-linear stage curve.
+
+    Either ``level = <m>`` (constant, stored as a one-point curve) or
+    ``stage = [[t_s, level_m], ...]`` (piecewise-linear, held at its end values
+    outside the range -- a water level does not vanish the way a hydrograph does).
+    """
+    has_level, has_curve = "level" in table, "stage" in table
+    if has_level == has_curve:
         raise ConfigError(
-            f"[boundaries] default='{default}' is not supported; use "
-            "'closed' or 'open'. 'fixed_stage'/'inflow' boundary types arrive in M5."
+            f"[boundaries] {edge}: fixed_stage needs exactly one of 'level' "
+            f"(constant, e.g. {_STAGE_EXAMPLE}) or 'stage' (a [[t, level]] curve)"
         )
-    resolved = {}
+    if has_level:
+        lvl = table["level"]
+        if isinstance(lvl, bool) or not isinstance(lvl, (int, float)):
+            raise ConfigError(f"[boundaries] {edge}: fixed_stage 'level' must be a number")
+        return [(0.0, float(lvl))]
+    raw = table["stage"]
+    if not (isinstance(raw, list) and raw and all(len(pt) == 2 for pt in raw)):
+        raise ConfigError(
+            f"[boundaries] {edge}: fixed_stage 'stage' must be a non-empty list of "
+            "[t_s, level_m] pairs"
+        )
+    pts = [(float(t), float(lv)) for t, lv in raw]
+    times = [t for t, _ in pts]
+    if any(b < a for a, b in zip(times, times[1:], strict=False)):
+        raise ConfigError(f"[boundaries] {edge}: fixed_stage 'stage' times must be non-decreasing")
+    return pts
+
+
+def _parse_boundaries(
+    boundaries: dict,
+) -> tuple[dict[str, str], dict[str, list[tuple[float, float]]]]:
+    """Resolve per-edge boundary behaviour, applying ``default`` to unset edges.
+
+    Returns ``(types, stage_curves)``: the per-edge type map and, for every
+    ``fixed_stage`` edge, its water-level curve. A bare string is ``"closed"`` or
+    ``"open"``; ``fixed_stage`` is a table because it carries a level (M5).
+    """
+    default = boundaries.get("default", "closed")
+    if not isinstance(default, str) or default not in _BC_TYPES:
+        raise ConfigError(
+            f"[boundaries] default={default!r} is not supported; use 'closed' or 'open'. "
+            f"A fixed_stage edge is per-edge and needs a level: north = {_STAGE_EXAMPLE}."
+        )
+    resolved: dict[str, str] = {}
+    curves: dict[str, list[tuple[float, float]]] = {}
     for edge in _EDGES:
         val = boundaries.get(edge, default)
-        if val not in _BC_TYPES:
+        if isinstance(val, str):
+            if val not in _BC_TYPES:
+                raise ConfigError(
+                    f"[boundaries] {edge}='{val}' is not supported; use 'closed', 'open', or a "
+                    f"fixed_stage table ({edge} = {_STAGE_EXAMPLE}). The 'inflow' boundary "
+                    "*type* stays deferred -- use [[inflow]] cell sources, which are exact."
+                )
+            resolved[edge] = val
+            continue
+        if not isinstance(val, dict):
             raise ConfigError(
-                f"[boundaries] {edge}='{val}' is not supported; use 'closed' or "
-                "'open'. 'fixed_stage'/'inflow' boundary types arrive in M5."
+                f"[boundaries] {edge}={val!r} must be 'closed', 'open', or a fixed_stage "
+                f"table ({edge} = {_STAGE_EXAMPLE})"
             )
-        resolved[edge] = val
-    return resolved
+        kind = val.get("type")
+        if kind == "inflow":
+            raise ConfigError(
+                f"[boundaries] {edge}: the 'inflow' boundary *type* is deferred -- use "
+                "[[inflow]] cell sources (M3), whose mass accounting is exact by construction."
+            )
+        if kind != "fixed_stage":
+            raise ConfigError(
+                f"[boundaries] {edge}: unknown boundary type {kind!r}; the table form is "
+                f"only for fixed_stage ({edge} = {_STAGE_EXAMPLE})"
+            )
+        resolved[edge] = "fixed_stage"
+        curves[edge] = _parse_stage_curve(edge, val)
+    return resolved, curves
 
 
 def load_config(path: str | Path) -> Scenario:
@@ -361,7 +464,7 @@ def load_config(path: str | Path) -> Scenario:
     if isinstance(datum, bool):  # bool is an int subclass -- reject explicitly
         raise ConfigError(f"[grid] datum must be a number or 'auto', got {datum!r}")
 
-    bc = _parse_boundaries(boundaries)
+    bc, stage_curves = _parse_boundaries(boundaries)
     manning_n, manning_field = _parse_field_param(
         parameters, "manning_n", base_dir, default_scalar=Scenario().manning_n
     )
@@ -395,6 +498,7 @@ def load_config(path: str | Path) -> Scenario:
             rain_duration=float(rainfall.get("duration_s", defaults.rain_duration)),
             inflows=inflows,
             boundaries=bc,
+            stage_curves=stage_curves,
             source_path=str(path),
             meta={"scheme": scheme, "boundaries": bc, "rain_type": rain_type},
         )

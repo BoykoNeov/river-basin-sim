@@ -64,13 +64,19 @@ class State:
     # Names of open (free-outflow) domain edges, subset of {north,south,east,west}.
     # The local-inertial scheme reads this (its post-interior sink is open-only).
     open_edges: frozenset[str] = frozenset()
-    # Full per-edge boundary map {north,south,east,west} -> "closed"|"open". The
-    # HLLC scheme needs *both* types: a closed edge is a reflective ghost-cell wall
-    # (no through-flux), an open edge is transmissive + mass-banked. Defaults to an
-    # all-closed box, so a State built directly by `from_bed` (dam-break, the
-    # validation harness) is walled without any config call. `set_open_boundaries`
-    # overwrites it from the resolved scenario.
+    # Full per-edge boundary map {north,south,east,west} ->
+    # "closed"|"open"|"fixed_stage". The HLLC scheme needs all three: a closed edge
+    # is a reflective ghost-cell wall (no through-flux), an open edge is
+    # transmissive + mass-banked, and a fixed_stage edge (M5) is a
+    # prescribed-surface Dirichlet ghost, also mass-banked (both directions).
+    # Defaults to an all-closed box, so a State built directly by `from_bed`
+    # (dam-break, the validation harness) is walled without any config call.
+    # `set_open_boundaries` overwrites it from the resolved scenario.
     boundaries: dict[str, str] = field(default_factory=lambda: {e: "closed" for e in _EDGES})
+    # Water-level curve per fixed_stage edge: piecewise-linear [(t_s, level_m), ...]
+    # in the *stepping* datum (already shifted). Host-side python -- evaluated to a
+    # scalar per step by the HLLC scheme (solver.core.boundaries.stage_at).
+    stage_curves: dict[str, list[tuple[float, float]]] = field(default_factory=dict)
 
     def set_infiltration(self, infil: np.ndarray) -> None:
         """Attach an infiltration-rate field (m/s) and arm the loss accumulator."""
@@ -87,18 +93,36 @@ class State:
             raise ValueError(f"rain-field shape {rain.shape} != grid {(ny, nx)}")
         self.rain = wp.array(np.ascontiguousarray(rain, dtype=np.float32), device=self.device)
 
-    def set_open_boundaries(self, boundaries: dict[str, str]) -> None:
+    def set_open_boundaries(
+        self,
+        boundaries: dict[str, str],
+        stage_curves: dict[str, list[tuple[float, float]]] | None = None,
+    ) -> None:
         """Record the per-edge boundary map and arm the loss accumulator if needed.
 
-        ``boundaries`` maps edge name -> "closed"|"open" (per :func:`solver.io.config`).
-        The full map is stored on ``self.boundaries`` (the HLLC scheme walls closed
-        edges and banks open ones); ``open_edges`` is the open subset the LI sink
-        reads. Arming ``loss_cum`` is triggered by any open edge (both schemes bank
-        their outflow there).
+        ``boundaries`` maps edge name -> "closed"|"open"|"fixed_stage" (per
+        :func:`solver.io.config`). The full map is stored on ``self.boundaries`` (the
+        HLLC scheme walls closed edges, banks open ones, and drives fixed_stage edges
+        from ``stage_curves``); ``open_edges`` is the open subset the LI sink reads.
+        Arming ``loss_cum`` is triggered by any edge water can cross -- open **or**
+        fixed_stage -- since both bank their through-flux there (a fixed_stage edge
+        banks a negative loss when it lets water *in*).
         """
         self.boundaries = {e: boundaries.get(e, "closed") for e in _EDGES}
         self.open_edges = frozenset(e for e, v in self.boundaries.items() if v == "open")
-        if self.open_edges:
+        self.stage_curves = {
+            e: list(c)
+            for e, c in (stage_curves or {}).items()
+            if self.boundaries.get(e) == "fixed_stage"
+        }
+        missing = [
+            e
+            for e, v in self.boundaries.items()
+            if v == "fixed_stage" and e not in self.stage_curves
+        ]
+        if missing:
+            raise ValueError(f"fixed_stage edges without a stage curve: {sorted(missing)}")
+        if self.open_edges or self.stage_curves:
             self._ensure_loss_cum()
 
     def _ensure_loss_cum(self) -> None:

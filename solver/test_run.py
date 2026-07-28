@@ -166,3 +166,85 @@ def test_main_writes_error_status_on_bad_config(tmp_path):
     rec = json.loads(status_path.read_text(encoding="utf-8"))
     assert rec["state"] == "error"
     assert "structures" in rec["message"]
+
+
+# --- M5: fixed_stage through the config -> run path -------------------------- #
+def test_fixed_stage_scenario_runs_end_to_end(tmp_path):
+    """A stage edge drives a run from the §7.1 config path, ledger and store intact.
+
+    Covers the wiring the unit tests cannot: stage curves surviving load_config ->
+    the datum shift -> State -> the HLLC ghost, plus the curve knots joining the
+    scheduler's sync points.
+    """
+    ny = nx = 16
+    bed = np.tile(np.linspace(1.0, 0.0, nx, dtype=np.float32), (ny, 1))
+    scn = Scenario(
+        name="stage_run",
+        scheme="hllc_fv",
+        dx=10.0,
+        end_time=600.0,
+        output_every=300.0,
+        dt_max=2.0,
+        alpha=0.45,
+        rain_mm_hr=0.0,
+        rain_duration=0.0,
+        boundaries={"north": "closed", "south": "closed", "east": "fixed_stage", "west": "closed"},
+        stage_curves={"east": [(0.0, 0.2), (600.0, 0.6)]},
+    )
+    ledger = run_simulation(scn, bed, tmp_path / "stage.zarr", device="cpu", verbose=False)
+    assert ledger.max_rel_error < MASS_GATE
+
+    ds = xr.open_zarr(tmp_path / "stage.zarr", consolidated=False)
+    final = ds["depth"].isel(time=-1).values
+    assert np.isfinite(final).all() and final.min() >= 0.0
+    assert float(final.sum()) > 0.0, "the stage edge never let water in"
+    # Ledger inflow arrives as a *negative* banked loss (the signed banking path).
+    assert ledger.series[-1].outflow_cum < 0.0
+
+
+def test_fixed_stage_is_rejected_on_the_local_inertial_scheme():
+    """HLLC-only (M5 plan §1.4): a loud error on the in-code path too, not silence."""
+    with pytest.raises(ValueError, match="hllc_fv"):
+        Scenario(
+            scheme="local_inertial",
+            boundaries={
+                "north": "fixed_stage",
+                "south": "closed",
+                "east": "closed",
+                "west": "closed",
+            },
+            stage_curves={"north": [(0.0, 1.0)]},
+        )
+
+
+def test_fixed_stage_without_a_curve_is_rejected():
+    with pytest.raises(ValueError, match="no stage curve"):
+        Scenario(
+            scheme="hllc_fv",
+            boundaries={
+                "north": "fixed_stage",
+                "south": "closed",
+                "east": "closed",
+                "west": "closed",
+            },
+        )
+
+
+def test_datum_shift_is_recorded_and_the_store_keeps_true_elevations(tmp_path):
+    """[grid] datum steps in shifted coordinates but stores the real bed (§7.2)."""
+    ny = nx = 12
+    bed = (np.zeros((ny, nx), np.float32) + 9.5).astype(np.float32)
+    scn = Scenario(
+        name="datum_run",
+        dx=10.0,
+        datum="auto",
+        end_time=200.0,
+        output_every=200.0,
+        dt_max=5.0,
+        rain_mm_hr=20.0,
+        rain_duration=200.0,
+    )
+    run_simulation(scn, bed, tmp_path / "d.zarr", device="cpu", verbose=False)
+    ds = xr.open_zarr(tmp_path / "d.zarr", consolidated=False)
+    assert ds.attrs["datum_shift_m"] == 9.0  # floor(min(bed))
+    assert np.allclose(ds["bed"].values, bed)  # stored un-shifted

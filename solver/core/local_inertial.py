@@ -288,6 +288,7 @@ def step(
     rain: float = 0.0,
     limit: bool = True,
     rain_scale: float = 1.0,
+    t: float = 0.0,  # noqa: ARG001 -- scheme-interface parity; LI has no time-dependent BC
 ) -> None:
     """Advance the state by one local-inertial step of size ``dt`` (seconds).
 
@@ -302,6 +303,11 @@ def step(
     raining, 0 otherwise). ``state.infil`` is the optional M3 infiltration sink.
     Both are skipped (no launch, bitwise no-op) when unset -- so uniform-parameter
     runs such as dam-break are unchanged.
+
+    ``t`` (the simulated time at the start of the step) is accepted for parity with
+    the scheme interface (:mod:`solver.core.schemes`) and ignored: the local-inertial
+    scheme has no time-dependent boundary forcing -- ``fixed_stage`` is HLLC-only
+    (M5 plan §1.4) -- and its rainfall gating is done by the caller.
 
     ``limit`` enables the per-cell donor limiter that keeps depths non-negative
     when the scheme is pushed out of regime (steep thin-sheet flow). It is

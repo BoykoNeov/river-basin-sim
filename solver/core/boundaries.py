@@ -1,4 +1,14 @@
-"""Boundary conditions (M1 closed; M3 open / transmissive, HANDOFF §8).
+"""Boundary conditions (M1 closed; M3 open / transmissive; M5 fixed stage, HANDOFF §8).
+
+This module holds the **local-inertial** scheme's boundary handling plus the
+scheme-independent stage-curve evaluation (:func:`stage_at`). The HLLC scheme
+imposes its own per-edge ghost cells inside :mod:`solver.core.hllc` -- closed
+(reflective wall), open (transmissive + banked) and, from M5, ``fixed_stage``
+(a prescribed-surface Dirichlet ghost). ``fixed_stage`` has no local-inertial
+counterpart by design (M5 plan §1.4): the staggered scheme has no boundary face to
+prescribe a surface on, and an unlimited pressure-driven edge flux is exactly what
+the post-interior sink below exists to avoid. The config rejects the combination.
+
 
 **Closed / reflective** (M1): zero normal flux on every domain-edge face. On the
 staggered grid the left/right ``qx`` boundary columns (``j = 0`` and ``j = nx``)
@@ -29,9 +39,35 @@ bitwise-unchanged.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import warp as wp
 
 from solver.core.state import State
+
+
+def stage_at(curve: Sequence[tuple[float, float]], t: float) -> float:
+    """Prescribed water surface (m) at time ``t`` from a piecewise-linear curve.
+
+    **Held, not zeroed, outside the range** -- the opposite of an inflow hydrograph
+    (:meth:`solver.io.config.Inflow.discharge_at`), and deliberately so: a discharge
+    that runs off the end of its curve has stopped, but a water *level* that runs
+    off the end of its curve is simply still there. A one-point curve is a constant
+    stage. Evaluated host-side (a scalar per step), so it costs no device work and
+    stays deterministic.
+    """
+    if not curve:
+        raise ValueError("empty stage curve")
+    if t <= curve[0][0]:
+        return float(curve[0][1])
+    if t >= curve[-1][0]:
+        return float(curve[-1][1])
+    for (t0, s0), (t1, s1) in zip(curve, curve[1:], strict=False):
+        if t0 <= t <= t1:
+            if t1 == t0:
+                return float(s1)
+            return float(s0 + (s1 - s0) * (t - t0) / (t1 - t0))
+    return float(curve[-1][1])  # pragma: no cover -- unreachable for sorted curves
 
 
 @wp.kernel

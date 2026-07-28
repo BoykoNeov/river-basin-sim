@@ -161,7 +161,9 @@ def test_open_boundaries_default_and_per_edge(tmp_path):
     ("mutation", "repl", "needle"),
     [
         ('type = "uniform"', 'type = "storm_cells"', "later"),  # temporal rain
-        ('default = "closed"', 'default = "fixed_stage"', "M5"),  # fixed-stage BC
+        # The `inflow` boundary *type* stays deferred: [[inflow]] cell sources cover
+        # prescribed discharge and their mass accounting is exact by construction.
+        ('default = "closed"', 'default = "closed"\neast = { type = "inflow" }', "deferred"),
     ],
 )
 def test_scope_gate_names_the_milestone(tmp_path, mutation, repl, needle):
@@ -256,3 +258,63 @@ def test_datum_rejects_nonsense(tmp_path, value):
     cfg = _FULL.replace('crs = "EPSG:32617"', f'crs = "EPSG:32617"\ndatum = {value}')
     with pytest.raises(ConfigError, match="datum"):
         load_config(_write(tmp_path, cfg))
+
+
+# --- M5: fixed_stage boundaries ---------------------------------------------- #
+_HLLC = _FULL.replace('scheme = "local_inertial"', 'scheme = "hllc_fv"')
+
+
+def test_fixed_stage_constant_level(tmp_path):
+    text = _HLLC.replace(
+        'default = "closed"', 'default = "closed"\neast = { type = "fixed_stage", level = 10.35 }'
+    )
+    scn = load_config(_write(tmp_path, text))
+    assert scn.boundaries["east"] == "fixed_stage"
+    assert scn.stage_curves["east"] == [(0.0, 10.35)]  # constant -> one-point curve
+    assert scn.stage_events == [0.0]
+
+
+def test_fixed_stage_time_varying_curve_and_sync_events(tmp_path):
+    text = _HLLC.replace(
+        'default = "closed"',
+        'default = "closed"\nwest = { type = "fixed_stage", '
+        "stage = [[0.0, 9.7], [3600.0, 10.35], [7200.0, 9.7]] }",
+    )
+    scn = load_config(_write(tmp_path, text))
+    assert scn.stage_curves["west"] == [(0.0, 9.7), (3600.0, 10.35), (7200.0, 9.7)]
+    # Curve knots become scheduler sync points, so no step straddles a slope change.
+    assert scn.stage_events == [0.0, 3600.0, 7200.0]
+
+
+def test_fixed_stage_requires_the_hllc_scheme(tmp_path):
+    """HLLC-only by design (M5 plan §1.4) -- a loud error, not a silent fallback."""
+    text = _FULL.replace(
+        'default = "closed"', 'default = "closed"\neast = { type = "fixed_stage", level = 3.0 }'
+    )
+    with pytest.raises(ConfigError, match="hllc_fv"):
+        load_config(_write(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    "table,needle",
+    [
+        ('{ type = "fixed_stage" }', "exactly one of"),
+        ('{ type = "fixed_stage", level = 1.0, stage = [[0.0, 1.0]] }', "exactly one of"),
+        ('{ type = "fixed_stage", level = "high" }', "must be a number"),
+        ('{ type = "fixed_stage", stage = [] }', "non-empty"),
+        ('{ type = "fixed_stage", stage = [[10.0, 1.0], [0.0, 2.0]] }', "non-decreasing"),
+        ('{ type = "tidal" }', "unknown boundary type"),
+        ("42", "must be 'closed'"),
+    ],
+)
+def test_fixed_stage_malformed(tmp_path, table, needle):
+    text = _HLLC.replace('default = "closed"', f'default = "closed"\neast = {table}')
+    with pytest.raises(ConfigError, match=needle):
+        load_config(_write(tmp_path, text))
+
+
+def test_fixed_stage_string_form_is_rejected_with_a_useful_message(tmp_path):
+    """`east = "fixed_stage"` cannot work -- it carries no level. Say so."""
+    text = _HLLC.replace('default = "closed"', 'default = "closed"\neast = "fixed_stage"')
+    with pytest.raises(ConfigError, match="fixed_stage table"):
+        load_config(_write(tmp_path, text))

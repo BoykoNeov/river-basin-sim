@@ -3,8 +3,11 @@
 The run loop (:mod:`solver.run`) is **scheme-agnostic**: it only ever calls a pair
 of scheme-owned functions on the state,
 
-    compute_dt(state, alpha=..., dt_max=...) -> float   # scheme-owned CFL
-    step(state, dt=..., rain=..., rain_scale=...) -> None  # scheme-owned update
+    compute_dt(state, alpha=..., dt_max=...) -> float          # scheme-owned CFL
+    step(state, dt=..., rain=..., rain_scale=..., t=...) -> None  # scheme-owned update
+
+``t`` is the simulated time at the *start* of the step, for time-dependent boundary
+forcing (M5's ``fixed_stage`` curves); a scheme without any is free to ignore it.
 
 ``get_scheme(name)`` maps a scenario's ``scheme`` string to the module (or object)
 that provides that pair. The two schemes coexist by selection (HANDOFF §2):
