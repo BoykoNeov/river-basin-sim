@@ -107,8 +107,12 @@ Removed volume − delivered volume = the banked residual, exactly, to the bit.
 
 **Rules.** `fixed` (constant `release_m3_s`) and `target_stage` (proportional:
 `Q = q_max · clamp((stage − target)/(crest − target), 0, 1)`) — one open-loop, one
-closed-loop, which is what proves the sync-point feedback path. Pool stage is
-`max(z + h)` over **wet** pool cells (a still pool gives exactly its level).
+closed-loop, which is what proves the sync-point feedback path.
+
+> **Superseded during the build.** This plan specified the pool stage as `max(z + h)`
+> over wet pool cells, and the outlet as a single cell. The demo scenario broke both
+> (see *What the demo caught* in §5): the stage is now read at a **gauge cell — the
+> pool's deepest point** — and the outlet is a **box**. The rest of §1.2 stands.
 
 ### 1.3 `fixed_stage` is a ghost cell, like the M4 BCs
 M4 landed per-edge ghosts for closed (reflective) and open (transmissive). A
@@ -235,15 +239,99 @@ tolerances. Same policy M4 used for Tests 2 and 3.
 
 ---
 
-## 5. Acceptance / demo
+## 5. Acceptance / demo — MET
 
-- [ ] `solver/scheduler.py`: one simulated clock, fast sub-cycling, slow processes at
-      sync points via operator splitting; `run.py` on it; existing runs bitwise-equal.
-- [ ] `[[structures]]` dams with `fixed` / `target_stage` release rules, exact
-      pool → outlet mass transfer, release series recorded in `.zattrs`.
-- [ ] `fixed_stage` per-edge BC (constant + time-varying) on HLLC, banked both ways;
-      rejected loudly on LI.
-- [ ] Datum shift, with a lake-at-rest-at-altitude test demonstrating why.
-- [ ] EA SC080035 Test 1 (faithful-in-form, qualitative gate + mass gate).
-- [ ] A reservoir demo scenario; `ruff` + full `pytest` green.
-- [ ] Stop and confirm before M6.
+- [x] **Multi-rate scheduler** (`solver/scheduler.py`): one simulated clock, the fast
+      scheme sub-cycling with its own state-derived `Δt`, sync points it may not cross,
+      slow processes advancing there by the exact elapsed simulated time. A **clock,
+      not a driver** — `run.py` keeps state/stepping/forcing/accounting/IO, so the
+      sync-point algebra is unit-tested with a stub `dt_fn` and no GPU at all.
+- [x] **Pre-M5 runs bitwise-identical**: verified against stored LI / M3-sources / HLLC
+      baselines, and guarded in-tree by a test that replays the pre-M5 inline loop as an
+      executable reference and asserts float equality on every step.
+- [x] **`[[structures]]`** dams and levees: barrier geometry (`cells` + `crest_m` raised
+      into the bed, so impoundment and overtopping stay ordinary solver physics) plus
+      `fixed` / `target_stage` release rules on the structure's own slow clock; release
+      series recorded in `.zattrs` as `reservoir_releases`.
+- [x] **Mass-exact transfer**: 300.000 m³ requested, 300.000 removed, 300.000 delivered,
+      **0.0** banked residual; a release outrunning its reservoir takes exactly what is
+      there; `target_stage` converges 3.76 → 3.002 m with Q easing 3.04 → 0.01 m³/s under
+      its cap; activations are bit-identical at `dt_max` 5.0 and 1.0.
+- [x] **`fixed_stage`** per-edge BC on HLLC, constant and time-varying, banked in both
+      directions; rejected loudly on the local-inertial scheme. Equilibrium leaves a lake
+      at rest (1.2e-5 m/s, nothing crosses); per-edge fill ×4 settles exactly at the
+      prescribed level (mass 2.7e-7); a drain to 90% dry cells — deliberately into the
+      positivity-limiter regime M4 flagged — still banks exactly (7.3e-8).
+- [x] **Datum shift** (`[grid] datum`), with the lake-at-rest-at-altitude test that
+      *fails without it*: 7.5e-6 m/s shifted versus 2.5e-5 at 10 m, 7.8e-4 at 500 m and
+      1.2e-2 at 5000 m. Asserted as a ratio, so a future no-op shift cannot pass.
+- [x] **EA SC080035 Test 1**: the far pond floods to 0.393 m and still holds 0.317 m
+      after 5 h at the 10.10 m ridge crest, while the connected pond returns exactly to
+      the 9.700 m boundary and ground above the peak never wets. Mass 6.9e-7.
+- [x] **Demo scenario** `scenarios/reservoir_release.toml` (+ `scripts/make_reservoir_demo.py`):
+      inflow hydrographs fill a valley reservoir to 0.52 Mm³ (stage 77.0 m, below the
+      78 m crest), then the `target_stage` rule draws it back down on its 900 s clock —
+      engaging at 75.1 m with 2.3 m³/s, peaking at 40.6 m³/s, then easing 36.6 → 30.8 →
+      25.3 → 20.5 → 16.4 → 12.7 as the pool falls toward the 75 m target — while a tidal
+      `fixed_stage` southern edge passes water both ways. Mass **4.6e-7** over 5 h;
+      `h_max` 5.9 m; the dam is in the stored bed at 78.0 m.
+- [x] `ruff` + `ruff format` clean; **189 tests green** (184 without `--extra geo`).
+- **Stop and confirm before M6.** ← we are here.
+
+### HANDOFF divergences (small, deliberate)
+§7.1's sketch is followed except in three places, none contradicting §2/§3/§8:
+
+1. **`fixed_stage` is a per-edge table, not a bare string.** §7.1 lists it alongside
+   `closed`/`open` in `default = "..."`. It cannot be: it carries a level (and possibly
+   a curve). So `default` stays string-only and a stage edge is written
+   `east = { type = "fixed_stage", level = 10.35 }`.
+2. **The `inflow` boundary *type* is not built** and is no longer assigned a milestone.
+   `[[inflow]]` cell sources (M3) already cover prescribed discharge and their mass
+   accounting is exact by construction; an edge-flux inflow BC would add a second, less
+   exact path to the same capability. It remains a loud config error.
+3. **`release_rule = "fixed"` needs a `release_m3_s`.** §7.1's example gives the rule
+   name without a discharge; a rule with no magnitude has no meaning, so it is required.
+
+### What the demo caught (both fixed here, not deferred)
+Building the demo scenario surfaced two defects that no unit test had:
+
+1. **A point outlet is a shock.** Operator splitting hands over a whole interval's
+   release at once: 60 m³/s × 900 s = 54,000 m³, which into a single 40 m cell is a
+   **34 m instantaneous column**. `outlet` now accepts a **box** (a single cell is the
+   1×1 case) and the release is spread evenly over it. The splitting error itself is
+   the documented design (§4); its *delivery footprint* was not, and shouldn't be a
+   trap for the next scenario author.
+2. **The pool gauge was fooled by stranded water.** `pool_stage()` read `max(z + h)`
+   over the pool box. Any realistic box spans the valley walls, so a millimetre of
+   water stranded high on a wall reported a near-crest stage — and the draw-down rule
+   kept releasing at full discharge from a reservoir that had already emptied. The
+   gauge is now a **stilling well at the pool's deepest cell**, which is both more
+   robust and what a real reservoir gauge measures.
+
+### Carried limitations (state these honestly)
+- **EA Test 1's spec is reconstructed, not pinned.** The SC080035 figures pinned during
+  M4 were not reachable from this session. The test's *form* is faithful and its
+  docstring separates what is pinned (purpose, qualitative result, ~10 m datum, small
+  domain, rise-and-fall boundary) from what is reconstructed (domain size, cell size,
+  bed elevations, ridge height, stage times and levels). The gate is the published
+  qualitative finding plus the mass gate — never an invented tolerance. **Re-pin the
+  numbers from the report before calling this a quantitative reproduction.**
+- **M4's "Test 1 needs the datum shift" does not hold.** The test is parametrized over
+  both datums and gates both: they agree on every reported depth to three decimals and
+  both clear the mass gate. The shift is worth having, but it earns its keep at
+  hundreds of metres, not ten.
+- **The stage BC's CFL comes from the interior.** `compute_dt` does not see the ghost,
+  so a stage set far above the interior surface is a dam-break at the boundary whose
+  first step can be under-resolved. Not a stability hazard (the donor-β limiter caps
+  outflow; an inflow only raises `h`, which the next `compute_dt` sees), but ramp a
+  stage rather than stepping it.
+- **Operator splitting is first-order in `Δt_slow`**, by design (HANDOFF §8). The
+  15-minute default keeps the `target_stage` feedback meaningful; a much coarser clock
+  will visibly lag the pool.
+- **The `target_stage` rule is proportional, not a real operating policy.** It ramps
+  linearly between target and crest and converges *toward* the target without
+  overshoot. Real rule curves (seasonal storage, flood-control drawdown, minimum
+  environmental flow) are a later addition; the seam for them is `Structure.discharge_at`.
+- **Reservoir stage is a point gauge**, so a pool whose deepest cell dries while water
+  remains elsewhere reads as empty. That is the intended failure direction (it stops
+  releasing) and matches a physical gauge, but it is a modelling choice, not a truth.

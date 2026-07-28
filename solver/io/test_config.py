@@ -210,7 +210,7 @@ def test_structure_parsed(tmp_path):
     assert (s.name, s.kind) == ("upper_dam", "dam")
     assert s.cells == [(6, 4), (7, 4)]
     assert (s.crest_m, s.target_stage_m, s.release_max_m3_s) == (145.0, 143.0, 40.0)
-    assert s.pool == (2, 0, 5, 9) and s.outlet == (8, 4)
+    assert s.pool == (2, 0, 5, 9) and s.outlet == (8, 4, 8, 4)  # cell -> 1x1 box
     assert s.interval_s == 600.0
 
 
@@ -259,7 +259,7 @@ def test_fixed_rule_is_open_loop(tmp_path):
         (
             'type = "dam"\ncell = [1, 1]\ncrest_m = 5.0\nrelease_rule = "fixed"\n'
             "release_m3_s = 1.0\npool = [0, 0, 3, 3]\noutlet = [1, 1]",
-            "sits inside the pool",
+            "overlaps the pool",
         ),
         (
             'type = "dam"\ncell = [1, 1]\ncrest_m = 5.0\nrelease_rule = "target_stage"\n'
@@ -396,4 +396,19 @@ def test_fixed_stage_string_form_is_rejected_with_a_useful_message(tmp_path):
     """`east = "fixed_stage"` cannot work -- it carries no level. Say so."""
     text = _HLLC.replace('default = "closed"', 'default = "closed"\neast = "fixed_stage"')
     with pytest.raises(ConfigError, match="fixed_stage table"):
+        load_config(_write(tmp_path, text))
+
+
+def test_outlet_may_be_a_reach_box(tmp_path):
+    """Spreading a release over a reach avoids the point-outlet delivery spike."""
+    text = _FULL + _DAM.replace("outlet = [8, 4]", "outlet = [8, 2, 10, 6]")
+    (s,) = load_config(_write(tmp_path, text)).structures
+    assert s.outlet == (8, 2, 10, 6)
+
+
+def test_outlet_overlapping_the_pool_is_rejected(tmp_path):
+    text = _FULL + _DAM.replace(
+        "outlet = [8, 4]", "outlet = [4, 2, 10, 6]"
+    )  # rows 4.. hit the pool
+    with pytest.raises(ConfigError, match="overlaps the pool"):
         load_config(_write(tmp_path, text))

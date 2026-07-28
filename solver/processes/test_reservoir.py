@@ -45,7 +45,7 @@ DX = 10.0
 DAM_ROW = 6
 CREST = 5.0
 POOL = (0, 0, 5, NX - 1)  # inclusive box behind the dam
-OUTLET = (9, 4)  # downstream of the dam line
+OUTLET = (8, 2, 10, 5)  # a downstream *reach*, not a point (see the module docs)
 
 
 def _basin() -> np.ndarray:
@@ -152,13 +152,14 @@ def test_release_transfer_conserves_mass_exactly():
     r0, c0, r1, c1 = POOL
     before = st.h.numpy()
     v_before, pool_before = _volume(before), _volume(before[r0 : r1 + 1, c0 : c1 + 1])
-    out_before = float(before[OUTLET]) * DX * DX
+    o0, p0, o1, p1 = OUTLET
+    out_before = _volume(before[o0 : o1 + 1, p0 : p1 + 1])
 
     rec = op.advance(300.0, 300.0)
 
     after = st.h.numpy()
     v_after, pool_after = _volume(after), _volume(after[r0 : r1 + 1, c0 : c1 + 1])
-    out_after = float(after[OUTLET]) * DX * DX
+    out_after = _volume(after[o0 : o1 + 1, p0 : p1 + 1])
     banked = st.loss_volume(st.grid.cell_area)
 
     print(
@@ -307,3 +308,28 @@ def test_operator_rejects_a_pool_outside_the_grid():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-s", "-q"])
+
+
+def test_pool_stage_gauges_the_deepest_cell_not_the_highest_water():
+    """A film stranded high in the pool box must not read as a high stage.
+
+    The M5 demo caught the naive ``max(z + h)`` reading: a realistic pool box spans
+    the valley walls, so a millimetre of water high on a wall reported a near-crest
+    stage and a draw-down rule kept releasing at full discharge from an empty
+    reservoir. The gauge is the *deepest* cell instead.
+    """
+    bed = _basin().copy()
+    bed[0, 0] = 8.0  # a wall cell high inside the pool box
+    bed[3, 3] = 1.0  # the true low point -> this is the gauge
+    st = State.from_bed(bed, dx=DX, depth=0.0, manning=0.03, device=DEV)
+    h = st.h.numpy()
+    h[0, 0] = 0.05  # a film stranded on the wall; the reservoir itself is dry
+    st.h.assign(h)
+
+    op = ReservoirOperator(_dam(), st)
+    assert op._gauge == (3, 3)
+    assert op.pool_stage() is None, "a stranded film read as a pool stage"
+
+    h[3, 3] = 1.5  # now put real water on the reservoir floor
+    st.h.assign(h)
+    assert op.pool_stage() == pytest.approx(2.5, abs=1e-5)

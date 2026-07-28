@@ -141,7 +141,12 @@ class Structure:
     target_stage_m: float | None = None  # "target_stage": the level to draw down to
     release_max_m3_s: float = 0.0  # "target_stage": cap on the release
     pool: tuple[int, int, int, int] | None = None
-    outlet: tuple[int, int] | None = None
+    # Inclusive (row0, col0, row1, col1) box the release is delivered into. A single
+    # cell is written as [row, col] in the TOML and normalised to a 1x1 box here.
+    # It is worth using a *reach* rather than one cell: operator splitting delivers a
+    # whole interval's release in one instant, so a single 40 m cell can receive
+    # metres of water at once -- physically absurd as a state even though it drains.
+    outlet: tuple[int, int, int, int] | None = None
     interval_s: float = _DEFAULT_RELEASE_INTERVAL_S  # slow-clock cadence (sim seconds)
 
     def __post_init__(self) -> None:
@@ -172,10 +177,14 @@ class Structure:
         r0, c0, r1, c1 = self.pool
         if r1 < r0 or c1 < c0:
             raise ValueError(f"structure '{self.name}': pool must be [row0, col0, row1, col1]")
-        oi, oj = self.outlet
-        if r0 <= oi <= r1 and c0 <= oj <= c1:
+        o0, p0, o1, p1 = self.outlet
+        if o1 < o0 or p1 < p0:
             raise ValueError(
-                f"structure '{self.name}': the outlet {self.outlet} sits inside the pool "
+                f"structure '{self.name}': outlet must be [row, col] or [row0, col0, row1, col1]"
+            )
+        if not (o1 < r0 or o0 > r1 or p1 < c0 or p0 > c1):
+            raise ValueError(
+                f"structure '{self.name}': the outlet {self.outlet} overlaps the pool "
                 f"{self.pool}; the release would just shuffle water within the reservoir"
             )
         if self.release_rule == "fixed" and self.release_m3_s <= 0:
@@ -506,7 +515,13 @@ def _parse_structures(doc: dict) -> list[Structure]:
             pool = tuple(int(v) for v in pool)
         outlet = entry.get("outlet")
         if outlet is not None:
-            outlet = _cell_pair(outlet, f"[[structures]] #{k} ('{name}'): 'outlet'")
+            if not (isinstance(outlet, list) and len(outlet) in (2, 4)):
+                raise ConfigError(
+                    f"[[structures]] #{k} ('{name}'): 'outlet' must be [row, col] or "
+                    "[row0, col0, row1, col1]"
+                )
+            vals = tuple(int(v) for v in outlet)
+            outlet = (vals[0], vals[1], vals[0], vals[1]) if len(vals) == 2 else vals
         try:
             out.append(
                 Structure(

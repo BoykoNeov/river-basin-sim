@@ -15,9 +15,16 @@ Two halves, per M5 plan §1.2 (*a dam is geometry plus a rule*):
   this.
 * :class:`ReservoirOperator` is the release rule. At each slow-clock activation it
   reads the pool stage, asks the rule for a discharge ``Q``, and moves
-  ``V = Q * dt_slow`` from the pool to the outlet cell in **one** operator-split
-  step. Between activations it does nothing at all, and the flood scheme sub-cycles
+  ``V = Q * dt_slow`` from the pool to the outlet in **one** operator-split step.
+  Between activations it does nothing at all, and the flood scheme sub-cycles
   freely -- which is the whole point of the multi-rate design.
+
+  *Delivering a whole interval at once is the cost of that splitting*, and it is
+  visible: 60 m^3/s over a 900 s interval is 54,000 m^3, which arriving in a single
+  40 m cell is a 34 m column -- absurd as an instantaneous state even though it
+  drains within the interval. So the outlet is a **box**, and spreading the release
+  over a reach (rather than a point) is the recommended configuration; a single cell
+  is just the 1x1 case.
 
 **Mass exactness (the part that is easy to get wrong).** The transfer is internal,
 so the global ledger must see *zero* net change. Three things make that true to the
@@ -101,21 +108,25 @@ def _withdraw_pool(
 def _deliver_release(
     h: wp.array2d(dtype=wp.float32),
     loss_cum: wp.array2d(dtype=wp.float64),
-    oi: wp.int32,
-    oj: wp.int32,
+    row0: wp.int32,
+    col0: wp.int32,
     add_depth: wp.float64,
 ):
-    """Add the released depth at the outlet, banking the float32 shortfall.
+    """Add the released depth evenly over the outlet box, banking the shortfall.
 
-    ``h[oi,oj] + d`` rounds in float32, so the depth the cell actually gained is not
-    exactly what was removed from the pool. The difference is banked in ``loss_cum``
-    (a real, tiny, *accounted* loss) instead of quietly unbalancing the ledger.
+    ``h + d`` rounds in float32, so the depth a cell actually gained is not exactly
+    its share of what was removed from the pool. Each cell banks its own difference
+    in ``loss_cum`` (a real, tiny, *accounted* loss) instead of quietly unbalancing
+    the ledger; summed over the box that is exactly ``removed - delivered``.
     """
-    avail = h[oi, oj]
+    a, b = wp.tid()
+    i = row0 + a
+    j = col0 + b
+    avail = h[i, j]
     h_new = avail + wp.float32(add_depth)
-    h[oi, oj] = h_new
+    h[i, j] = h_new
     delivered = wp.float64(h_new) - wp.float64(avail)
-    loss_cum[oi, oj] = loss_cum[oi, oj] + (add_depth - delivered)
+    loss_cum[i, j] = loss_cum[i, j] + (add_depth - delivered)
 
 
 @dataclass
@@ -157,15 +168,22 @@ class ReservoirOperator:
             raise ValueError(
                 f"structure '{structure.name}': pool {structure.pool} is outside the {ny}x{nx} grid"
             )
-        oi, oj = structure.outlet
-        if not (0 <= oi < ny and 0 <= oj < nx):
+        o0, p0, o1, p1 = structure.outlet
+        if not (0 <= o0 <= o1 < ny and 0 <= p0 <= p1 < nx):
             raise ValueError(
                 f"structure '{structure.name}': outlet {structure.outlet} is outside the "
                 f"{ny}x{nx} grid"
             )
         self._pool = (r0, c0, r1, c1)
         self._pool_shape = (r1 - r0 + 1, c1 - c0 + 1)
+        self._outlet = (o0, p0)
+        self._outlet_shape = (o1 - o0 + 1, p1 - p0 + 1)
+        self._outlet_cells = self._outlet_shape[0] * self._outlet_shape[1]
         self._taken = wp.zeros(self._pool_shape, dtype=wp.float64, device=state.device)
+        # The stage gauge: the lowest-bed cell in the pool box (see pool_stage).
+        pool_z = state.z.numpy()[r0 : r1 + 1, c0 : c1 + 1]
+        a, b = np.unravel_index(int(np.argmin(pool_z)), pool_z.shape)
+        self._gauge = (r0 + int(a), c0 + int(b))
         state.arm_loss_accumulator()
 
     # --- the SlowProcess interface -------------------------------------------- #
@@ -178,19 +196,25 @@ class ReservoirOperator:
         )
 
     def pool_stage(self) -> float | None:
-        """Water-surface elevation of the pool (m), or ``None`` if it is dry.
+        """Water-surface elevation at the pool's gauge cell (m), or ``None`` if dry.
 
-        The **maximum** ``z + h`` over wet pool cells: for a still pool that is
-        exactly its level, and it degrades gracefully (a slight over-read) when the
-        pool is sloshing, which is the conservative direction for a draw-down rule.
+        The gauge is a **stilling well at the deepest point of the pool** -- the
+        lowest-bed cell in the box, fixed at construction -- and the reading is
+        ``z + h`` there. For a still pool that is exactly its level, and it is what a
+        real reservoir gauge measures.
+
+        It is deliberately *not* ``max(z + h)`` over the box, which the M5 demo caught
+        being badly wrong: a pool box that spans the valley walls (as any realistic one
+        does) reports the surface of a millimetre of water stranded high on a wall, so
+        a draw-down rule keeps releasing at full discharge from a reservoir that has
+        already emptied. The deepest cell cannot be fooled that way: if it is dry,
+        there is no pool.
         """
-        r0, c0, r1, c1 = self._pool
-        h = self.state.h.numpy()[r0 : r1 + 1, c0 : c1 + 1]
-        z = self.state.z.numpy()[r0 : r1 + 1, c0 : c1 + 1]
-        wet = h > H_DRY
-        if not wet.any():
+        gi, gj = self._gauge
+        h = float(self.state.h.numpy()[gi, gj])
+        if h <= H_DRY:
             return None
-        return float((z + h)[wet].max())
+        return float(self.state.z.numpy()[gi, gj]) + h
 
     def advance(self, t: float, dt_slow: float) -> ReleaseRecord:
         """Move one slow interval's release from the pool to the outlet.
@@ -231,11 +255,16 @@ class ReservoirOperator:
         removed_m3 = float(self._taken.numpy().sum()) * area  # exactly what left, in f64
         if removed_m3 <= 0.0:
             return 0.0
-        oi, oj = self.structure.outlet
         wp.launch(
             _deliver_release,
-            dim=1,
-            inputs=[st.h, st.loss_cum, oi, oj, removed_m3 / area],
+            dim=self._outlet_shape,
+            inputs=[
+                st.h,
+                st.loss_cum,
+                self._outlet[0],
+                self._outlet[1],
+                removed_m3 / area / self._outlet_cells,
+            ],
             device=st.device,
         )
         return removed_m3
