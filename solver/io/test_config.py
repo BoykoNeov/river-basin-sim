@@ -237,3 +237,22 @@ def test_scenario_post_init_guards_direct_construction():
         Scenario(output_every=0.0)
     with pytest.raises(ValueError, match="multiple of output_every"):
         Scenario(end_time=3500.0, output_every=300.0)
+
+
+# --- M5: vertical datum ------------------------------------------------------ #
+def test_datum_defaults_to_none(tmp_path):
+    """`[grid] datum` is opt-in: absent means no shift (pre-M5 runs unchanged)."""
+    assert load_config(_write(tmp_path, _FULL)).datum is None
+
+
+@pytest.mark.parametrize("value,expected", [('"auto"', "auto"), ("9.7", 9.7), ("-3", -3.0)])
+def test_datum_values(tmp_path, value, expected):
+    cfg = _FULL.replace('crs = "EPSG:32617"', f'crs = "EPSG:32617"\ndatum = {value}')
+    assert load_config(_write(tmp_path, cfg)).datum == expected
+
+
+@pytest.mark.parametrize("value", ['"sea-level"', "true", "[1, 2]"])
+def test_datum_rejects_nonsense(tmp_path, value):
+    cfg = _FULL.replace('crs = "EPSG:32617"', f'crs = "EPSG:32617"\ndatum = {value}')
+    with pytest.raises(ConfigError, match="datum"):
+        load_config(_write(tmp_path, cfg))

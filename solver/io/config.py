@@ -101,6 +101,9 @@ class Scenario:
     tiles_dir: str = "data/tiles/demo"
     dx: float | None = None  # metres; None -> take from the tile manifest
     crs: str = ""  # "" -> take from the tile manifest
+    # Vertical datum shift (M5): None = no shift, "auto" = floor(min(bed)), or an
+    # explicit reference elevation. See solver.core.datum for why it exists.
+    datum: str | float | None = None
     end_time: float = 3600.0  # simulated seconds
     output_every: float = 300.0
     alpha: float = 0.7  # CFL-like coefficient for the adaptive timestep (TOML: cfl)
@@ -202,7 +205,7 @@ _KNOWN_TABLES = {
 }
 _KNOWN_KEYS = {
     "meta": {"name", "seed", "scheme"},
-    "grid": {"tiles_dir", "dx", "crs"},
+    "grid": {"tiles_dir", "dx", "crs", "datum"},
     "run": {"end_time", "output_every", "cfl", "dt_max"},
     "rainfall": {"type", "rate_mm_hr", "field", "duration_s"},
     "parameters": {"manning_n", "infiltration"},
@@ -350,6 +353,14 @@ def load_config(path: str | Path) -> Scenario:
             "release rules arrive in M5."
         )
 
+    datum = grid.get("datum")
+    if datum is not None and not isinstance(datum, (int, float, str)):
+        raise ConfigError(f"[grid] datum must be a number or 'auto', got {datum!r}")
+    if isinstance(datum, str) and datum != "auto":
+        raise ConfigError(f"[grid] datum must be a number or 'auto', got {datum!r}")
+    if isinstance(datum, bool):  # bool is an int subclass -- reject explicitly
+        raise ConfigError(f"[grid] datum must be a number or 'auto', got {datum!r}")
+
     bc = _parse_boundaries(boundaries)
     manning_n, manning_field = _parse_field_param(
         parameters, "manning_n", base_dir, default_scalar=Scenario().manning_n
@@ -369,6 +380,7 @@ def load_config(path: str | Path) -> Scenario:
             tiles_dir=str(grid.get("tiles_dir", defaults.tiles_dir)),
             dx=(float(grid["dx"]) if "dx" in grid else None),
             crs=str(grid.get("crs", "")),
+            datum=(datum if isinstance(datum, str) or datum is None else float(datum)),
             end_time=float(run.get("end_time", defaults.end_time)),
             output_every=float(run.get("output_every", defaults.output_every)),
             alpha=float(run.get("cfl", defaults.alpha)),

@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
+from solver.core.datum import resolve_datum, shift_bed, unshift_bed
 from solver.core.grid import Grid
 from solver.core.massbalance import MASS_GATE, MassLedger
 from solver.core.schemes import get_scheme
@@ -63,6 +64,20 @@ def pick_device(requested: str | None) -> str:
     return "cuda:0" if wp.get_cuda_devices() else "cpu"
 
 
+def shift_for_datum(scenario: Scenario, bed: np.ndarray) -> tuple[np.ndarray, float]:
+    """Resolve ``[grid] datum`` and put the run into shifted coordinates (M5 §1.5).
+
+    Returns ``(bed_shifted, z_ref)``. **Every absolute elevation the scenario
+    carries shifts here**, in this one function, so the bed and the config's
+    elevations can never disagree by ``z_ref``. Today that is the bed alone;
+    boundary stage levels and structure crests join it as they land. Depth,
+    velocity and all mass accounting are datum-independent, and the canonical store
+    still records the true bed (:func:`solver.core.datum.unshift_bed`).
+    """
+    z_ref = resolve_datum(scenario.datum, bed)
+    return shift_bed(bed, z_ref), z_ref
+
+
 def run_simulation(
     scenario: Scenario,
     bed: np.ndarray,
@@ -95,8 +110,13 @@ def run_simulation(
     manning = load_field(
         scenario.manning_field, grid, scalar=scenario.manning_n, name="manning_n", nonneg=True
     )
+    # Vertical datum (M5, solver.core.datum): step in shifted coordinates so float32
+    # eta = h + z keeps its precision at a high datum; the store gets the true bed
+    # back. Every absolute elevation the scenario carries shifts with it, in one
+    # place (shift_for_datum), so they cannot drift apart.
+    bed_sim, z_ref = shift_for_datum(scenario, bed)
     st = State.from_bed(
-        bed, dx=scenario.dx, depth=scenario.initial_depth, manning=manning, device=device
+        bed_sim, dx=scenario.dx, depth=scenario.initial_depth, manning=manning, device=device
     )
 
     # --- M3 sources/sinks -------------------------------------------------------
@@ -140,11 +160,14 @@ def run_simulation(
         "infiltration_mm_hr": scenario.infiltration_mm_hr,
         "end_time_s": scenario.end_time,
         "output_every_s": scenario.output_every,
+        # Elevation offset the run stepped in (0 unless [grid] datum was set); the
+        # stored bed is *un*shifted, so this is provenance, not a decoding key.
+        "datum_shift_m": z_ref,
         # Static provenance (§2): source hash + resolved scenario -> reproducible.
         "provenance": write_provenance(scenario, out_path),
     }
     writer = ZarrWriter(out_path, grid, n_frames, attrs)
-    writer.write_bed(bed)
+    writer.write_bed(unshift_bed(bed_sim, z_ref))  # §7.2 stores true elevations
 
     # Frame at t = 0 (baseline).
     u0, v0 = st.velocities_numpy()
