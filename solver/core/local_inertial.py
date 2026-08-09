@@ -31,6 +31,7 @@ import math
 
 import warp as wp
 
+from solver.core import sources
 from solver.core.boundaries import apply_closed_bc, apply_open_outflow
 from solver.core.channels import column_depth, eta_subgrid
 from solver.core.friction import manning_denominator, manning_denominator_radius
@@ -663,20 +664,36 @@ def step(
                     device=state.device,
                 )
 
+    # Areal sources: compensated when armed (solver.core.sources). Continuity then
+    # carries no rain of its own -- the source add belongs to the Kahan kernel, which
+    # needs it as a separate rounding to compensate. Unarmed, both stay fused/plain
+    # and the arithmetic is untouched.
+    compensated = state.h_comp is not None
     wp.launch(
         update_h,
         dim=g.shape,
-        inputs=[state.h, state.qx, state.qy, dxf, dtf, float(rain)],
+        inputs=[state.h, state.qx, state.qy, dxf, dtf, 0.0 if compensated else float(rain)],
         device=state.device,
     )
+    # Exactly one compensated source kernel per step, and it keeps launching after
+    # the storm stops (a zero increment) so the outstanding compensation -- up to
+    # half an ulp of `h` per cell, which over a reach-scale grid is itself the order
+    # of the drift being removed -- is repaid into the field rather than stranded.
+    # `state.rain is not None` is exactly field-rain mode: run.py never combines the
+    # two, so uniform and field never both fire.
+    if compensated and state.rain is None:
+        sources.apply_uniform_rain(state, rain, dt)
 
     if state.rain is not None:
-        wp.launch(
-            apply_rain_field,
-            dim=g.shape,
-            inputs=[state.h, state.rain, dtf, float(rain_scale)],
-            device=state.device,
-        )
+        if compensated:
+            sources.apply_rain_field(state, dt, rain_scale)
+        else:
+            wp.launch(
+                apply_rain_field,
+                dim=g.shape,
+                inputs=[state.h, state.rain, dtf, float(rain_scale)],
+                device=state.device,
+            )
     if state.infil is not None:
         wp.launch(
             apply_infiltration,

@@ -1298,6 +1298,7 @@ def step(
     ``h``, which the next ``compute_dt`` sees -- but ramp a stage from the initial
     interior level rather than stepping it discontinuously.
     """
+    from solver.core import sources
     from solver.core.local_inertial import apply_infiltration, apply_rain_field
 
     arm_hllc(state)
@@ -1342,18 +1343,27 @@ def step(
         device=state.device,
     )
 
-    # Sources/sinks (mass only; momentum unchanged) -- reuse the LI kernels.
-    if rain != 0.0:
+    # Sources/sinks (mass only; momentum unchanged) -- reuse the LI kernels, or the
+    # compensated ones when an areal source armed `h_comp` (solver.core.sources).
+    # The compensated kernel launches even at `rain == 0` so the storm's outstanding
+    # compensation is repaid rather than stranded; the plain kernel keeps its guard.
+    compensated = state.h_comp is not None
+    if compensated and state.rain is None:
+        sources.apply_uniform_rain(state, rain, dtf)
+    elif rain != 0.0:
         wp.launch(
             _add_uniform_rain, dim=g.shape, inputs=[state.h, float(rain), dtf], device=state.device
         )
     if state.rain is not None:
-        wp.launch(
-            apply_rain_field,
-            dim=g.shape,
-            inputs=[state.h, state.rain, dtf, float(rain_scale)],
-            device=state.device,
-        )
+        if compensated:
+            sources.apply_rain_field(state, dtf, rain_scale)
+        else:
+            wp.launch(
+                apply_rain_field,
+                dim=g.shape,
+                inputs=[state.h, state.rain, dtf, float(rain_scale)],
+                device=state.device,
+            )
     if state.infil is not None:
         wp.launch(
             apply_infiltration,

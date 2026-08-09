@@ -66,6 +66,11 @@ class State:
     # (ny, nx) float64 cumulative depth of water removed by local sinks
     # (infiltration, open-boundary outflow); summed at output cadence -> outflow.
     loss_cum: wp.array | None = None
+    # (ny, nx) float32 Kahan compensation for **areal** source accumulation
+    # (solver.core.sources). Armed only when a scenario carries uniform rain or a
+    # rain field; unarmed, the schemes launch their original source kernels, so a
+    # run without an areal source is bitwise unchanged.
+    h_comp: wp.array | None = None
     # Names of open (free-outflow) domain edges, subset of {north,south,east,west}.
     # The local-inertial scheme reads this (its post-interior sink is open-only).
     open_edges: frozenset[str] = frozenset()
@@ -129,6 +134,18 @@ class State:
             raise ValueError(f"fixed_stage edges without a stage curve: {sorted(missing)}")
         if self.open_edges or self.stage_curves:
             self._ensure_loss_cum()
+
+    def arm_source_compensation(self) -> None:
+        """Arm per-cell Kahan compensation for areal sources (idempotent).
+
+        Call this for a scenario with uniform rain or a rain field; the schemes
+        then route their source add through :mod:`solver.core.sources` instead of
+        the plain float32 ``h += rate*dt``, which is where a reach-scale
+        rain-on-grid run loses its mass balance. Leaving it unarmed keeps the
+        original kernels and the original arithmetic.
+        """
+        if self.h_comp is None:
+            self.h_comp = wp.zeros(self.grid.shape, dtype=wp.float32, device=self.device)
 
     def arm_loss_accumulator(self) -> None:
         """Ensure the float64 loss accumulator exists (idempotent).

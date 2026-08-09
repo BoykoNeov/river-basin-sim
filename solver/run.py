@@ -227,6 +227,13 @@ def run_simulation(
         rain_field = rain_mm_hr_field / 1000.0 / 3600.0
         st.set_rain_field(rain_field)
         rain_field_sum_m_s = float(rain_field.astype(np.float64).sum())
+    # Areal sources get compensated (Kahan) accumulation -- float32 `h += rate*dt`,
+    # once per cell per step over a reach-scale grid, is what puts a rain-on-grid run
+    # at the mass gate for arithmetic reasons (solver.core.sources). Armed only when
+    # rain actually falls, so every run without an areal source keeps the original
+    # kernels and is bitwise unchanged; point sources are deliberately out of scope.
+    if rain_is_field or (scenario.rain_m_s > 0.0 and scenario.rain_duration > 0.0):
+        st.arm_source_compensation()
     # Inflow hydrographs (prescribed discharge point sources).
     injector = InflowInjector(scenario.inflows, grid, device) if scenario.inflows else None
     # Per-edge boundaries: open (free-outflow) and, from M5, fixed_stage water-level
