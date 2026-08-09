@@ -84,6 +84,60 @@ def column_depth(h: wp.float32, w: wp.float32, d: wp.float32, dx: wp.float32) ->
     return col
 
 
+# --- Face geometry -----------------------------------------------------------
+# A face's channel section is built from the two cells it separates, and it is
+# built in exactly one place. M6 needed it for conveyance; M7's sediment transport
+# needs the *same* numbers -- a channel face's Shields stress is set by the channel
+# flow depth and the hydraulic radius A/P, not by the cell-mean `h` and not by
+# :func:`column_depth`. Those differ by up to `dx/w` (~15x on the reach demo), which
+# is the single most likely physics bug in the morphology milestone (M7 plan §4),
+# so the two consumers share these functions rather than each deriving the section.
+# Each is a single expression, inlined by the Warp code generator, so factoring them
+# out of the M6 flux funcs leaves the arithmetic bit for bit unchanged.
+
+
+@wp.func
+def face_channel_width(w_a: wp.float32, w_b: wp.float32) -> wp.float32:
+    """Conveying channel width at a face: the narrower of the two cells.
+
+    A channel conveys only where it is continuous across the face -- a band that
+    steps sideways faster than it is wide has a wall across it, and nothing in the
+    depth field says so (see the module docstring's honesty note).
+    """
+    return wp.min(w_a, w_b)
+
+
+@wp.func
+def face_channel_bed(
+    z_a: wp.float32, d_a: wp.float32, z_b: wp.float32, d_b: wp.float32
+) -> wp.float32:
+    """Channel-bed elevation at a face: the higher invert controls (the sill)."""
+    return wp.max(z_a - d_a, z_b - d_b)
+
+
+@wp.func
+def channel_flow_depth(eta_max: wp.float32, z_bank: wp.float32, z_ch: wp.float32) -> wp.float32:
+    """Depth of the channel component at a face; saturates at bank full.
+
+    Water above the bank belongs to the floodplain component, so the two never
+    double-count. May be negative if the face is dry below the invert -- callers
+    guard with ``H_DRY``.
+    """
+    return wp.min(eta_max, z_bank) - z_ch
+
+
+@wp.func
+def channel_radius(w_face: wp.float32, h_ch: wp.float32) -> wp.float32:
+    """Hydraulic radius ``A/P = w·h/(w + 2h)`` of the channel component."""
+    return w_face * h_ch / (w_face + 2.0 * h_ch)
+
+
+@wp.func
+def floodplain_flow_depth(eta_max: wp.float32, z_bank: wp.float32) -> wp.float32:
+    """Depth of the floodplain component at a face -- the M1 face depth verbatim."""
+    return eta_max - z_bank
+
+
 def eta_from_h(
     h: np.ndarray | float,
     z: np.ndarray | float,

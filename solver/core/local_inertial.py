@@ -33,7 +33,15 @@ import warp as wp
 
 from solver.core import sources
 from solver.core.boundaries import apply_closed_bc, apply_open_outflow
-from solver.core.channels import column_depth, eta_subgrid
+from solver.core.channels import (
+    channel_flow_depth,
+    channel_radius,
+    column_depth,
+    eta_subgrid,
+    face_channel_bed,
+    face_channel_width,
+    floodplain_flow_depth,
+)
 from solver.core.friction import manning_denominator, manning_denominator_radius
 from solver.core.grid import GRAVITY, H_DRY
 from solver.core.state import State
@@ -299,11 +307,10 @@ def _channel_flux(
     """
     if w_face <= 0.0:
         return 0.0
-    surface = wp.min(eta_max, z_bank)  # channel flow saturates at bank full
-    h_ch = surface - z_ch
+    h_ch = channel_flow_depth(eta_max, z_bank, z_ch)  # saturates at bank full
     if h_ch < H_DRY:
         return 0.0
-    radius = w_face * h_ch / (w_face + 2.0 * h_ch)
+    radius = channel_radius(w_face, h_ch)
     num = q_prev - g * h_ch * dt * slope
     den = manning_denominator_radius(q_prev, h_ch, radius, n_ch, g, dt)
     return num / den
@@ -320,7 +327,7 @@ def _floodplain_flux(
     g: wp.float32,
 ) -> wp.float32:
     """Bates update for the floodplain component -- the M1 face update verbatim."""
-    h_fp = eta_max - z_bank
+    h_fp = floodplain_flow_depth(eta_max, z_bank)
     if h_fp < H_DRY:
         return 0.0
     num = q_prev - g * h_fp * dt * slope
@@ -358,8 +365,8 @@ def update_qx_channels(
     )
     # A channel conveys only where it is continuous across the face; the narrower
     # section controls, and the higher channel bed is the sill.
-    w_face = wp.min(chan_w[i, j - 1], chan_w[i, j])
-    z_ch = wp.max(z[i, j - 1] - chan_d[i, j - 1], z[i, j] - chan_d[i, j])
+    w_face = face_channel_width(chan_w[i, j - 1], chan_w[i, j])
+    z_ch = face_channel_bed(z[i, j - 1], chan_d[i, j - 1], z[i, j], chan_d[i, j])
     q_ch = _channel_flux(
         qx_ch[i, j],
         eta_max,
@@ -406,8 +413,8 @@ def update_qy_channels(
     q_fp = _floodplain_flux(
         qy_fp[i, j], eta_max, slope, z_bank, 0.5 * (n[i - 1, j] + n[i, j]), dt, g
     )
-    w_face = wp.min(chan_w[i - 1, j], chan_w[i, j])
-    z_ch = wp.max(z[i - 1, j] - chan_d[i - 1, j], z[i, j] - chan_d[i, j])
+    w_face = face_channel_width(chan_w[i - 1, j], chan_w[i, j])
+    z_ch = face_channel_bed(z[i - 1, j], chan_d[i - 1, j], z[i, j], chan_d[i, j])
     q_ch = _channel_flux(
         qy_ch[i, j],
         eta_max,

@@ -57,6 +57,25 @@ from __future__ import annotations
 import warp as wp
 
 
+@wp.func
+def kahan_add(total: wp.float32, comp: wp.float32, inc: wp.float32) -> wp.vec2f:
+    """One compensated add: returns ``(new_total, new_comp)``.
+
+    The four lines every accumulator in this module runs, behind one name, so a
+    distributed quantity added into a float32 field has exactly one definition of
+    "how" -- M7's sediment transport integral accumulates through here too
+    (:mod:`solver.core.sediment`), which is the carried requirement M6 left: *any*
+    new distributed source goes through this module rather than a bare ``+=``.
+
+    ``comp`` is the running debt of low-order bits and is **subtracted** from the
+    next increment, so a caller must carry it across steps for the compensation to
+    mean anything.
+    """
+    y = inc - comp
+    t = total + y
+    return wp.vec2f(t, (t - total) - y)
+
+
 @wp.kernel
 def add_uniform_rain_c(
     h: wp.array2d(dtype=wp.float32),
@@ -71,11 +90,9 @@ def add_uniform_rain_c(
     zero increment and simply pays the outstanding remainder back into ``h``.
     """
     i, j = wp.tid()
-    h0 = h[i, j]
-    y = rate * dt - comp[i, j]
-    t = h0 + y
-    comp[i, j] = (t - h0) - y
-    h[i, j] = t
+    out = kahan_add(h[i, j], comp[i, j], rate * dt)
+    h[i, j] = out[0]
+    comp[i, j] = out[1]
 
 
 @wp.kernel
@@ -93,11 +110,9 @@ def add_rain_field_c(
     static, so the ledger's inflow stays analytic.
     """
     i, j = wp.tid()
-    h0 = h[i, j]
-    y = rain[i, j] * scale * dt - comp[i, j]
-    t = h0 + y
-    comp[i, j] = (t - h0) - y
-    h[i, j] = t
+    out = kahan_add(h[i, j], comp[i, j], rain[i, j] * scale * dt)
+    h[i, j] = out[0]
+    comp[i, j] = out[1]
 
 
 def apply_uniform_rain(state, rain: float, dt: float) -> None:
