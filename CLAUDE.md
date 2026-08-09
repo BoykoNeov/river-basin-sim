@@ -69,6 +69,27 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   them). Tests gate **ratios, not thresholds**, plus a **fast-math canary** asserting the
   compensation term is nonzero, because reassociating it away would make every other
   assertion measure an uncompensated add against itself. See `docs/plans/precision-sources.md`.
+- **Viewer terrain mosaic: done (2026-08-09).** M6's second carried debt. The viewer's
+  terrain was still M2's tile-0 load, so a mosaic run's (correct) water rendered over
+  one patch of a possibly unrelated DEM. The fix is a contract addition, not a GDScript
+  mosaic assembler: **`solver/io/viewer_export.py`** ships the canonical store's `bed`
+  into `frames/` as **`manifest["static"]`**, through the *same* tile layout and the
+  same entry shape as a frame — the bed is already mosaic-assembled, windowed,
+  coarsened, gap-filled and datum-un-shifted, so terrain and water share extent, origin
+  and cell size **by construction** (§7.3 records this; `manifest["domain"]` carries the
+  assembly record so **gap fill renders as declared, not as a mystery plateau**).
+  **`results_player.gd`** builds terrain *from results* and is **re-entrant** — a
+  finishing run can change the grid under a live viewer — with one `_apply_geometry`
+  fitting terrain, water plane, `bed_tex` (the shader lifts `η = bed + depth`, so the
+  wrong bed was mis-lifting the surface, not just the backdrop) and camera together.
+  The M0 tile stays as the pre-run/legacy fallback and **warns** when it does not cover
+  the run. **Validated:** `--rbverify` now gates registration (768x768 @ 100.00m,
+  relief 260 m, `run_bed=true`) — the old check passed on the broken composite;
+  `reach_basin` re-run on the 5090 at mass **1.60e-07** (unchanged) renders the whole
+  76.8 km basin; the M2 demo is unchanged and `--rblaunch` reaches `done` at 2.59e-08.
+  **241 tests green.** Carried: the shader still lifts a sub-grid channel by
+  `bed + depth`, not its storage curve, so the sheet sits up to `d` high on the river.
+  See `docs/plans/viewer-terrain-mosaic.md`.
 - **M5 — Multi-physics: done.** The locked time-integration
   decision (HANDOFF §2/§8) is now real code. **`solver/scheduler.py`** owns the single
   simulated clock and *only* that: the fast scheme still computes its own state-derived
@@ -318,12 +339,21 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   manifest**, same naming, told apart only by byte size. `manifest.json` is the only
   record of which files belong to the current run — never reconstruct frame filenames
   by index, never read a directory listing as the last run's output, and pass `--out` /
-  `--frames-dir` when you care about keeping a result.
-- **The viewer's terrain layer loads tile 0 only.** A mosaic run's water is correct and
-  renders at its true extent (manifest-driven geometry), over a single terrain tile from
-  a possibly unrelated DEM — so the composite looks broken while both halves are right.
-  Verified-water and aligned-with-terrain are separate claims; don't let a screenshot
-  merge them.
+  `--frames-dir` when you care about keeping a result. The bed tiles are the sharpest
+  case: `bed.raw` / `bed_r00_c00.raw` carry no frame index, so an untiled run's
+  `bed.raw` sits beside a tiled run's `bed_r00_c00.raw` and only the manifest says
+  which is live (the reader's byte-size check is the backstop, and it yields a hole,
+  not an error).
+- **The viewer's terrain is the run's bed, and only what the manifest ships registers.**
+  It used to be tile 0 of `data/tiles/demo`, which put a 76.8 km mosaic's water over a
+  28.8 km patch of an unrelated DEM — both halves right, composite broken. Now
+  `viewer_export` ships the store's `bed` as `manifest["static"]` and the viewer renders
+  *that* (`_apply_geometry` is the single place terrain, water, `bed_tex` and camera are
+  fitted). Consequences: a store exported before this falls back to tile 0 and **warns**
+  — re-export rather than trusting the picture; anything new the composite depends on
+  must travel through the manifest the same way. Verified-water and aligned-with-terrain
+  are still separate claims — `--rbverify` now asserts the second one, and it took a
+  *screenshot* to catch an empty render that the headless check called OK.
 - **A sub-grid channel conveys only where it is continuous.** `w_face = min(w_L, w_R)`, so
   a channel band that steps sideways faster than it is wide has a wall across it and
   nothing in the depth field says so. Check connectivity when authoring channel geometry

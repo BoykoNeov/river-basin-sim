@@ -28,6 +28,20 @@ per-frame shape exactly -- one ``.raw`` of identical bytes, ``frames[i]["files"]
 no ``tiles`` key -- so existing readers keep working; only the manifest's
 ``tile_grid`` gains the (now non-trivial) geometry fields.
 
+**The bed ships with the frames.** ``manifest["static"]`` carries the run's own bed
+field, exported once through the same tile layout (``bed.raw``, or
+``bed_r00_c00.raw`` ... when tiled) and with the same entry shape as a frame, so one
+reader decodes both. It is not a convenience copy of the M0 tile: through M5 the run
+domain *was* the first terrain tile, but a reach-scale run is a **mosaic**, possibly
+windowed and coarsened, so the only surface that registers with the depth field cell
+for cell is the one the solver actually stepped on. The canonical store already holds
+it (§7.2 ``bed``, in true elevations -- the datum shift is undone on the way out), so
+exporting it here means the viewer's terrain and its water share extent, origin and
+cell size **by construction** rather than by two implementations agreeing.
+``manifest["domain"]`` carries the mosaic assembly record beside it, because
+``assemble_mosaic`` fills uncovered cells at the minimum covered elevation and
+rendering that is a flat plateau no one can tell from a bug.
+
 Byte layout matches the M0 ``.r32`` convention (raw LE f32, row-major) so the
 viewer loads a frame into a Godot ``FORMAT_RF`` image with the *same* orientation
 and origin the M0 terrain loader established -- no transpose, water registers with
@@ -93,6 +107,52 @@ def _tile_layout(ny: int, nx: int, tile_size: int) -> list[dict]:
     return tiles
 
 
+def _write_field(
+    arr: np.ndarray,
+    out_dir: Path,
+    layout: list[dict],
+    *,
+    field: str,
+    stem: str,
+    tiled: bool,
+) -> dict:
+    """Write one ``(ny, nx)`` field as a whole ``.raw`` or as ``layout``'s tiles.
+
+    ``stem`` names the payload on disk (``f0007_depth``, ``bed``); ``field`` is the
+    manifest key it is filed under. Returns the fragment describing where the bytes
+    went -- ``files`` untiled, ``files``/``tiles`` tiled. Frames and the static bed
+    share this so a reader has exactly one payload shape to decode.
+    """
+    if not tiled:
+        name = f"{stem}.raw"
+        (out_dir / name).write_bytes(np.ascontiguousarray(arr, dtype="<f4").tobytes())
+        return {"files": {field: name}}
+    names: list[str] = []
+    for t in layout:
+        block = np.ascontiguousarray(
+            arr[t["y"] : t["y"] + t["height"], t["x"] : t["x"] + t["width"]], dtype="<f4"
+        )
+        tname = f"{stem}_r{t['row']:02d}_c{t['col']:02d}.raw"
+        (out_dir / tname).write_bytes(block.tobytes())
+        names.append(tname)
+    return {"files": {}, "tiles": {field: names}}
+
+
+def _export_bed(ds, out_dir: Path, layout: list[dict], tiled: bool) -> dict | None:
+    """Export the store's static bed through the frame tile layout (viewer terrain).
+
+    Returns the ``manifest["static"]`` entry, or ``None`` for a store written before
+    the bed was part of §7.2 (the viewer then falls back to the M0 terrain tile).
+    """
+    if "bed" not in ds:
+        return None
+    bed = np.ascontiguousarray(ds["bed"].values, dtype="<f4")
+    entry = _write_field(bed, out_dir, layout, field="bed", stem="bed", tiled=tiled)
+    entry["fields"] = ["bed"]
+    entry["bed"] = {"min": float(bed.min()), "max": float(bed.max())}
+    return entry
+
+
 def export_frames(
     zarr_path: str | Path,
     out_dir: str | Path,
@@ -110,7 +170,10 @@ def export_frames(
     specified a ``tile_grid``. The geometry is listed **once** in the manifest and
     each frame lists its tile files in the same row-major order.
 
-    Returns the written ``manifest.json`` path.
+    The store's static ``bed`` rides along through the same layout as
+    ``manifest["static"]`` -- the surface the run actually stepped on, which after M6
+    is a mosaic and need not be any tile on disk. Returns the written
+    ``manifest.json`` path.
     """
     zarr_path = Path(zarr_path)
     out_dir = Path(out_dir)
@@ -135,18 +198,9 @@ def export_frames(
 
     for i in range(n_frames):
         arr = np.ascontiguousarray(ds[field].isel(time=i).values, dtype="<f4")
-        fname = f"f{i:04d}_{field}.raw"
-        tile_files: list[str] = []
-        if tiled:
-            for t in layout:
-                block = np.ascontiguousarray(
-                    arr[t["y"] : t["y"] + t["height"], t["x"] : t["x"] + t["width"]], dtype="<f4"
-                )
-                tname = f"f{i:04d}_{field}_r{t['row']:02d}_c{t['col']:02d}.raw"
-                (out_dir / tname).write_bytes(block.tobytes())
-                tile_files.append(tname)
-        else:
-            (out_dir / fname).write_bytes(arr.tobytes())
+        payload = _write_field(
+            arr, out_dir, layout, field=field, stem=f"f{i:04d}_{field}", tiled=tiled
+        )
 
         fmin, fmax = float(arr.min()), float(arr.max())
         global_max = max(global_max, fmax)
@@ -156,18 +210,9 @@ def export_frames(
             wet = wet[::stride]
         wet_samples.append(wet)
 
-        entry = {
-            "index": i,
-            "time": times[i],
-            "files": {field: fname},
-            field: {"min": fmin, "max": fmax},
-        }
-        if tiled:
-            # The single-file name is not written when tiled; the tile list is the
-            # frame. Keeping both keys would invite a reader to load a file that
-            # does not exist, so `files` is replaced rather than supplemented.
-            entry["files"] = {}
-            entry["tiles"] = {field: tile_files}
+        # When tiled, the tile list *is* the frame and `files` stays empty: keeping
+        # both keys would invite a reader to load a file that does not exist.
+        entry = {"index": i, "time": times[i], **payload, field: {"min": fmin, "max": fmax}}
         frames.append(entry)
 
     all_wet = np.concatenate(wet_samples) if wet_samples else np.empty(0)
@@ -178,6 +223,7 @@ def export_frames(
         "dx": float(ds.attrs.get("dx", 1.0)),
         "crs": str(ds.attrs.get("crs", "")),
         "scheme": str(ds.attrs.get("scheme", "")),
+        "coarsen": int(ds.attrs.get("coarsen", 1)),
         "grid": {"width": nx, "height": ny},
         # Row-major tile geometry, listed once (frames reference it by order).
         "tile_grid": {"cols": cols, "rows": rows, "size": int(tile_size), "tiles": layout},
@@ -187,6 +233,15 @@ def export_frames(
         "global": {field: global_stats},
         "frames": frames,
     }
+    static = _export_bed(ds, out_dir, layout, tiled)
+    if static is not None:
+        manifest["static"] = static
+    domain = ds.attrs.get("domain")
+    if isinstance(domain, dict):
+        # How the mosaic was assembled (M6): uncovered cells are filled at the
+        # minimum covered elevation, which renders as a flat plateau -- the viewer
+        # has to be able to say so rather than let it read as a rendering bug.
+        manifest["domain"] = dict(domain)
     manifest_path = out_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest_path

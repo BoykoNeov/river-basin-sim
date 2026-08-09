@@ -12,6 +12,7 @@ import json
 import numpy as np
 import warp as wp
 import xarray as xr
+import zarr
 
 from solver.io.viewer_export import export_frames
 from solver.run import Scenario, run_simulation
@@ -116,6 +117,85 @@ def test_large_frames_split_into_a_tile_grid_that_reassembles(tmp_path):
             rebuilt[t["y"] : t["y"] + t["height"], t["x"] : t["x"] + t["width"]] = block
         expected = ds["depth"].isel(time=fr["index"]).values.astype(np.float32)
         assert np.array_equal(rebuilt, expected)
+
+
+def test_static_bed_ships_with_the_frames_and_matches_the_store(tmp_path):
+    """The viewer's terrain is the run's own bed, byte-for-byte from the store.
+
+    This is what makes terrain and water register on a mosaic/coarsened domain: the
+    surface the viewer renders is the one the solver stepped on, not a tile that
+    happens to be on disk.
+    """
+    zarr_path = _make_run(tmp_path)
+    out = tmp_path / "frames"
+    export_frames(zarr_path, out)
+
+    ds = xr.open_zarr(zarr_path, consolidated=False)
+    bed = ds["bed"].values.astype("<f4")
+    manifest = json.loads((out / "manifest.json").read_text())
+
+    static = manifest["static"]
+    assert static["fields"] == ["bed"]
+    got = np.fromfile(out / static["files"]["bed"], dtype="<f4").reshape(bed.shape)
+    assert np.array_equal(got, bed)
+    assert static["bed"]["min"] == float(bed.min())
+    assert static["bed"]["max"] == float(bed.max())
+    # The bed shares the frames' grid -- that identity is the whole point.
+    assert bed.shape == (manifest["grid"]["height"], manifest["grid"]["width"])
+
+
+def test_static_bed_is_tiled_with_the_frame_layout(tmp_path):
+    """Tiled export: the bed uses the *same* tile geometry, so one reader decodes both."""
+    zarr_path = _make_run(tmp_path)
+    out = tmp_path / "frames_tiled"
+    export_frames(zarr_path, out, tile_size=8)
+
+    ds = xr.open_zarr(zarr_path, consolidated=False)
+    bed = ds["bed"].values.astype(np.float32)
+    manifest = json.loads((out / "manifest.json").read_text())
+    tiles = manifest["tile_grid"]["tiles"]
+
+    static = manifest["static"]
+    assert static["files"] == {}
+    names = static["tiles"]["bed"]
+    assert len(names) == len(tiles)
+    rebuilt = np.zeros(bed.shape, dtype=np.float32)
+    for t, name in zip(tiles, names, strict=True):
+        block = np.fromfile(out / name, dtype="<f4").reshape(t["height"], t["width"])
+        rebuilt[t["y"] : t["y"] + t["height"], t["x"] : t["x"] + t["width"]] = block
+    assert np.array_equal(rebuilt, bed)
+
+
+def test_manifest_carries_the_mosaic_assembly_record(tmp_path):
+    """Gap cells are declared to the viewer, not just to the solver's log.
+
+    `assemble_mosaic` fills cells no tile covered at the minimum covered elevation.
+    Rendered, that is a flat plateau no one can tell from a rendering bug, so the
+    manifest has to carry the count and the fill value through to the picture.
+    """
+    zarr_path = _make_run(tmp_path)
+    root = zarr.open_group(zarr_path, mode="r+")
+    root.attrs.update(
+        {
+            "coarsen": 2,
+            "domain": {
+                "origin_row": 0,
+                "origin_col": 0,
+                "shape": [16, 20],
+                "gap_cells": 7,
+                "tiles_used": 3,
+                "tiles_total": 4,
+                "fill_value": 12.5,
+            },
+        }
+    )
+    out = tmp_path / "frames"
+    export_frames(zarr_path, out)
+
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["coarsen"] == 2
+    assert manifest["domain"]["gap_cells"] == 7
+    assert manifest["domain"]["fill_value"] == 12.5
 
 
 def test_untiled_export_bytes_are_unchanged_by_the_m6_export(tmp_path):

@@ -9,18 +9,25 @@ shares memory or a process with the solver (HANDOFF §4, §7.4). Responsibilitie
 - On completion, streams the per-frame tile manifest and renders the timeline +
   3D camera, with depth/velocity colormaps and a water surface lifted off the bed.
 
-## Status — M0 (static terrain)
+## Scenes
 
-Implemented: loads one engine-ready terrain tile as a static 3D heightmap, proving
-the pipeline → file → viewer handoff. The timeline scrubber, depth colormap, water
-surface, and subprocess control come in **M2**.
-
-- `scenes/terrain_view.tscn` — main scene; a single `Node3D` running
-  `scripts/terrain_loader.gd`.
-- `scripts/terrain_loader.gd` — reads `data/tiles/demo/tiles.json` + the `.r32`
-  tile and imports it into a Terrain3D node. The tile is raw little-endian float32
-  in **metres**, so it maps 1:1 to a Godot `FORMAT_RF` heightmap image;
+- `scenes/results_view.tscn` — **the main scene** (`scripts/results_player.gd`):
+  terrain + lifted water surface + timeline + a *Run solver* button.
+- `scenes/terrain_view.tscn` — the M0 standalone terrain check
+  (`scripts/terrain_loader.gd`): reads `data/tiles/demo/tiles.json` + the `.r32`
+  tile and imports **tile 0** into a Terrain3D node. The tile is raw little-endian
+  float32 in **metres**, so it maps 1:1 to a Godot `FORMAT_RF` heightmap image;
   `vertex_spacing = dx` fixes horizontal scale. No height rescaling.
+
+### Where the terrain comes from (results view)
+
+Not from `tiles.json`. From M6 a run's domain is a tile **mosaic**, optionally
+windowed and coarsened, so no tile on disk is the surface it stepped on. The solver
+therefore exports its own bed into `frames/` (`manifest["static"]`, §7.3) and the
+viewer renders **that** — one image, one Terrain3D import, extent/origin/cell size
+shared with the water by construction. A results set without a `static` section (an
+older export) falls back to M0 tile 0 and warns if it does not cover the run; the
+pre-run scene shows tile 0 too, since there is no run yet to define a domain.
 
 ## Prerequisites
 
@@ -70,6 +77,13 @@ godot --path viewer -- --rbshot=viewer_screenshot.png
   sampling). `data.get_height_range().x` reports `0` due to a padding texel; the
   rendered surface min is ~365 m (see the headless `true sampled min`).
 - Terrain3D stores its region data under `user://terrain_demo_data` (outside the
-  repo), rebuilt on each load from the `.r32` tile.
+  repo), rebuilt on each load from the `.r32` tile. The results view uses
+  `user://terrain_results_data` and **clears it before every rebuild**: regions are
+  keyed by world position, so importing a smaller domain over a larger one would
+  leave the difference standing after a run changes the grid.
+- Camera clip planes scale with the domain (`near = dx`, `far = 4 x span`). A fixed
+  far plane large enough for a 76.8 km mosaic degenerates the depth range and renders
+  *nothing* (Godot's light culler starts refusing frustums) — which `--rbverify`
+  cannot see, so check a screenshot when the domain scale changes.
 - Godot caches (`.godot/`, `.import/`) and `addons/` are git-ignored. Terrain LOD
   at reach scale is the viewer's one demanding job (HANDOFF §5, §12).

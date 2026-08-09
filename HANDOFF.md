@@ -253,11 +253,21 @@ frames/
 ├── manifest.json           # frame list, times, per-field global min/max, tile grid
 ├── f0000_depth_t00_00.raw  # raw little-endian float32, one tile
 ├── f0000_vel_t00_00.raw
+├── bed_t00_00.raw          # the run's own bed, once (manifest["static"])
 └── ...
 ```
 
 `manifest.json` carries per-frame, per-field min/max so the viewer can colormap without
 scanning data. Godot loads raw floats straight into textures.
+
+The **static** section ships the run's bed through the same tile layout and the same
+entry shape as a frame, so one reader decodes both. It is what the viewer renders as
+terrain: from M6 the domain is a tile *mosaic*, optionally windowed and coarsened, so
+no tile on disk is the surface the run stepped on — only the store's `bed` is, and
+shipping it makes the water register with the terrain by construction rather than by
+the viewer re-deriving the mosaic. `manifest["domain"]` carries the assembly record
+(origin, tiles used, gap cells, fill value) beside it: uncovered cells are filled flat,
+and a picture must be able to say so.
 
 ### 7.4 Solver ↔ Godot subprocess protocol
 

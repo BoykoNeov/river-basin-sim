@@ -25,6 +25,8 @@ Detailed per-milestone plans live alongside this file as `M<n>-*.md`.
    an areal source stay bitwise unchanged; point sources are deliberately out of scope.
    **M7's sediment must go through `sources.py` rather than a bare `+=`.** See
    `precision-sources.md`.
-2. **Viewer terrain path** — still loads tile 0 only, so a mosaic run's (correct,
-   manifest-driven) water renders over a single, possibly unrelated terrain tile. Open.
-   See `M6-reach.md` → carried limitations.
+2. ~~**Viewer terrain path** — loads tile 0 only.~~ **Done 2026-08-09** — the run's own
+   bed now ships with the frames (`manifest["static"]`) and *is* the terrain, so extent,
+   origin and cell size agree by construction; `--rbverify` gates that registration.
+   Remaining: the shader still lifts water as `bed + depth`, so a sub-grid channel's
+   surface is drawn up to `d` high. See `viewer-terrain-mosaic.md`.

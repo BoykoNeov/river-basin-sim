@@ -413,13 +413,13 @@ root.
   benchmark validation, and the two models are not identical by construction (the
   resolved 2D channel has no side-wall drag; the sub-grid one does). Both numbers and
   both analytical sections are printed rather than hidden inside the tolerance.
-- **The viewer's terrain layer still loads tile 0 only.** The water path is verified
-  (see the sign-off section: manifest-driven geometry, tiles blitted, frames exact),
-  but the terrain under it is a single M0 tile — so the reach demo renders 76.8 km of
-  water over a 28.8 km terrain quad from a *different* DEM, and the composite looks
-  wrong while both halves are individually correct. Keep the two claims apart: "water
-  frames reassemble and render" is proven; "water aligns with terrain" is a known gap
-  until the viewer's terrain path learns the mosaic.
+- ~~**The viewer's terrain layer still loads tile 0 only.**~~ **Fixed 2026-08-09**
+  (`viewer-terrain-mosaic.md`). At M6 sign-off the water path was verified
+  (manifest-driven geometry, tiles blitted, frames exact) but the terrain under it was
+  a single M0 tile, so the reach demo rendered 76.8 km of water over a 28.8 km quad
+  from a *different* DEM — both halves correct, composite wrong. The run's own bed now
+  ships with the frames and is what the viewer renders. The two claims stayed apart
+  until each was proven: `--rbverify` gates the alignment one on its own.
 - **Reach scale is still bounded by device memory.** The run prints its resolved
   domain and estimated field memory before stepping, but nothing streams: a domain
   larger than the GPU is a failure, not a slow run.

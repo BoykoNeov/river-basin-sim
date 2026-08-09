@@ -15,6 +15,23 @@ extends Node3D
 ## depth field need not share the terrain tile's shape or cell size -- and a frame
 ## may arrive as a row-major `tile_grid` of `.raw` tiles, blitted into one image.
 ## A small domain still exports one file per frame and takes the same path as M2.
+##
+## The **terrain** follows the same rule. It used to be the M0 tile set's *first*
+## tile, which through M5 was the run domain but at reach scale is one patch of a
+## mosaic under a much wider water sheet -- water and terrain each correct, the
+## composite broken. So when the manifest carries `static.bed` (the solver's own bed,
+## already mosaicked / windowed / coarsened / un-shifted), that is the terrain, and
+## extent, origin and cell size agree by construction. The M0 tile is the fallback,
+## for the pre-run scene and for stores written before the bed shipped with frames.
+##
+## Terrain is therefore built *from results* and rebuilt whenever they change (a run
+## finishing can change the grid under us), not once in `_ready`.
+##
+## Carried limitation: the water shader reconstructs the surface as `bed + depth`,
+## which is the M1 storage relation. With M6 sub-grid channels a channel cell's true
+## surface is `z - d + h*dx/w` below bank full, so the rendered sheet sits up to the
+## channel depth `d` high along the river. Terrain and water register; the *channel*
+## surface is still the floodplain approximation.
 
 const TILES_SUBPATH := "data/tiles/demo"
 const RESULTS_SUBPATH := "data/results"
@@ -30,12 +47,22 @@ const WATER_SEGMENTS := 512
 const PLAY_FPS := 4.0
 
 var _repo_root := ""
+# The bed currently rendered/lifted over: the run's own bed when the results
+# manifest ships one, else the M0 terrain tile.
 var _bed_img: Image = null
+var _bed_from_results := false
+# M0 terrain-tile geometry (the fallback surface, and nothing else).
 var _grid_w := 0
 var _grid_h := 0
 var _dx := 1.0
 
 var _terrain: Node = null
+var _camera: Camera3D = null
+# Geometry the terrain was actually built at. Kept so registration with the results
+# grid is an assertable fact (`--rbverify`) rather than an assumption.
+var _terrain_w := 0
+var _terrain_h := 0
+var _terrain_dx := 0.0
 var _water: MeshInstance3D = null
 var _water_mat: ShaderMaterial = null
 var _depth_tex: ImageTexture = null
@@ -68,7 +95,7 @@ var _run_btn: Button = null
 func _ready() -> void:
 	_repo_root = _repo_root_path()
 
-	if not _load_terrain():
+	if not _load_fallback_bed():
 		return
 	_build_environment()
 	_build_water()
@@ -84,14 +111,22 @@ func _ready() -> void:
 	if FileAccess.file_exists(manifest_path):
 		_load_results(manifest_path)
 	else:
+		# Nothing has been run: show the M0 tile so the scene is not empty. A run
+		# replaces this outright -- the terrain is a property of the results.
+		_apply_geometry(_bed_img, _grid_w, _grid_h, _dx)
 		_set_status("no results yet -- press Run solver")
 
 	_handle_cmdline()
 
 
-# --- terrain (M0 load path) --------------------------------------------------
+# --- terrain -----------------------------------------------------------------
 
-func _load_terrain() -> bool:
+func _load_fallback_bed() -> bool:
+	## Read the M0 terrain tile: the surface shown before anything has been run, and
+	## the fallback for a results store written before the bed shipped with frames.
+	## It is tile 0 on purpose -- an M0 tile set has no run to define a window, so
+	## there is no "right" mosaic to assemble here, and guessing one would render a
+	## domain no run ever used.
 	var tiles_dir := _repo_root.path_join(TILES_SUBPATH)
 	var manifest := _load_json(tiles_dir.path_join("tiles.json"))
 	if manifest.is_empty() or not manifest.has("tiles") or manifest["tiles"].is_empty():
@@ -107,21 +142,68 @@ func _load_terrain() -> bool:
 	_res_h = _grid_h
 	_res_dx = _dx
 	_bed_img = _load_r32_as_rf(tiles_dir.path_join(String(tile["file"])), _grid_w, _grid_h)
-	if _bed_img == null:
-		return false
+	return _bed_img != null
 
-	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(DATA_DIR))
+
+func _build_terrain(bed: Image, w: int, h: int, dx: float) -> void:
+	## (Re)build the Terrain3D node on a given bed. Re-entrant: results can arrive
+	## after `_ready` and can change the grid, so the old node and its region data go
+	## first -- Terrain3D keeps regions keyed by world position, and importing a
+	## smaller domain over a larger one leaves the difference standing. It rebuilds
+	## unconditionally (this runs per *load*, not per frame): matching dimensions do
+	## not mean the same bed, and a stale surface under new water is the bug this
+	## whole path exists to remove.
+	if _terrain != null:
+		remove_child(_terrain)
+		_terrain.queue_free()
+		_terrain = null
+	var data_path := ProjectSettings.globalize_path(DATA_DIR)
+	_clear_dir(data_path)
+	DirAccess.make_dir_recursive_absolute(data_path)
+
 	_terrain = ClassDB.instantiate("Terrain3D")
 	_terrain.name = "Terrain"
-	_terrain.vertex_spacing = _dx
+	_terrain.vertex_spacing = dx
 	_terrain.data_directory = DATA_DIR
 	add_child(_terrain)
-	_terrain.data.import_images([_bed_img, null, null], Vector3.ZERO, 0.0, 1.0)
+	# One assembled image, one import: the mosaic is stitched before Terrain3D sees
+	# it (as frames are), so region placement never has to be reasoned about.
+	_terrain.data.import_images([bed, null, null], Vector3.ZERO, 0.0, 1.0)
 	_terrain.data.calc_height_range(true)
+	_terrain_w = w
+	_terrain_h = h
+	_terrain_dx = dx
 	var hr: Vector2 = _terrain.data.get_height_range()
-	print("River Basin viewer: terrain %dx%d dx=%.2fm height~%.0f..%.0f m"
-		% [_grid_w, _grid_h, _dx, hr.x, hr.y])
-	return true
+	print("River Basin viewer: terrain %dx%d dx=%.2fm (%.1f x %.1f km) height~%.0f..%.0f m %s"
+		% [w, h, dx, w * dx / 1000.0, h * dx / 1000.0, hr.x, hr.y,
+			"[run bed]" if _bed_from_results else "[M0 tile]"])
+
+
+func _clear_dir(abs_path: String) -> void:
+	var d := DirAccess.open(abs_path)
+	if d == null:
+		return
+	d.list_dir_begin()
+	var entry := d.get_next()
+	while entry != "":
+		if not d.current_is_dir():
+			d.remove(entry)
+		entry = d.get_next()
+	d.list_dir_end()
+
+
+func _apply_geometry(bed: Image, w: int, h: int, dx: float) -> void:
+	## Put terrain, water and camera on one grid. Everything that depends on the
+	## domain goes through here, so they cannot be fitted to different extents.
+	if bed == null or w <= 0 or h <= 0:
+		return
+	_build_terrain(bed, w, h, dx)
+	_fit_water(w, h, dx)
+	if _water_mat:
+		# The shader lifts water by sampling the bed: it must be the *run's* bed, or
+		# the surface is reconstructed over elevations the solver never used.
+		_water_mat.set_shader_parameter("bed_tex", ImageTexture.create_from_image(bed))
+	_fit_camera(w, h, dx)
 
 
 # --- water surface -----------------------------------------------------------
@@ -198,7 +280,27 @@ func _load_results(manifest_path: String) -> void:
 	_res_tiles = _manifest.get("tile_grid", {}).get("tiles", [])
 	if _res_tiles.size() <= 1:
 		_res_tiles = []          # one file per frame -- the M2 path
-	_fit_water_to_results()
+
+	# The terrain is the run's own bed when the manifest ships one, which is the only
+	# surface that registers with the depth field on a mosaic/coarsened domain.
+	var run_bed := _read_results_bed()
+	if run_bed != null:
+		_bed_img = run_bed
+		_bed_from_results = true
+		_apply_geometry(_bed_img, _res_w, _res_h, _res_dx)
+	else:
+		# Older export, or a store without a bed: fall back to the M0 tile and say so
+		# if it does not cover the run -- water over an unrelated DEM looks like a
+		# rendering bug and is really a provenance one.
+		_bed_from_results = false
+		_apply_geometry(_bed_img, _grid_w, _grid_h, _dx)
+		_fit_water(_res_w, _res_h, _res_dx)
+		if _res_w != _grid_w or _res_h != _grid_h or not is_equal_approx(_res_dx, _dx):
+			push_warning("River Basin viewer: results %dx%d @ %.2fm but terrain tile is "
+				% [_res_w, _res_h, _res_dx]
+				+ "%dx%d @ %.2fm -- re-export frames to ship the run's bed"
+				% [_grid_w, _grid_h, _dx])
+	_report_domain()
 
 	var gdepth: Dictionary = _manifest.get("global", {}).get("depth", {})
 	var p99 := float(gdepth.get("p99", 1.0))
@@ -218,20 +320,20 @@ func _load_results(manifest_path: String) -> void:
 	print("River Basin viewer: loaded %d result frames" % _frames.size())
 
 
-func _fit_water_to_results() -> void:
+func _fit_water(w: int, h: int, dx: float) -> void:
 	## Resize/reposition the water plane onto the results extent (M6).
 	##
 	## Through M5 the results grid was always the terrain tile, so the plane built in
 	## `_build_water` already fitted. A mosaic or coarsened run breaks that, and a
 	## water sheet stretched over the wrong extent is a silently wrong picture.
-	if _water == null or _res_w <= 0 or _res_h <= 0:
+	if _water == null or w <= 0 or h <= 0:
 		return
-	var span_x := _res_w * _res_dx
-	var span_z := _res_h * _res_dx
+	var span_x := w * dx
+	var span_z := h * dx
 	var plane := _water.mesh as PlaneMesh
 	if plane:
 		plane.size = Vector2(span_x, span_z)
-		var seg := mini(WATER_SEGMENTS, maxi(_res_w, _res_h))
+		var seg := mini(WATER_SEGMENTS, maxi(w, h))
 		plane.subdivide_width = seg
 		plane.subdivide_depth = seg
 	_water.position = Vector3(span_x * 0.5, 0.0, span_z * 0.5)
@@ -264,25 +366,28 @@ func _read_raw(path: String, expect_floats: int) -> PackedByteArray:
 	return bytes
 
 
-func _read_frame_image(i: int) -> Image:
-	var fr: Dictionary = _frames[i]
+func _read_field_image(entry: Dictionary, field: String, what: String) -> Image:
+	## Decode one §7.3 payload -- a whole-frame `.raw`, or the manifest's row-major
+	## tile grid blitted into one image. Frames and the static bed are written in the
+	## same shape by `viewer_export`, so they decode through the same path; `what` is
+	## only for error messages.
 	var blank := Image.create(maxi(_res_w, 1), maxi(_res_h, 1), false, Image.FORMAT_RF)
 	if _res_tiles.is_empty():
-		# One file per frame (small domains; the M2 shape, unchanged).
-		var rel := String(fr.get("files", {}).get("depth", ""))
+		# One file per field (small domains; the M2 shape, unchanged).
+		var rel := String(entry.get("files", {}).get(field, ""))
 		if rel.is_empty():
-			push_error("River Basin viewer: frame %d has no depth file" % i)
+			push_error("River Basin viewer: %s has no %s file" % [what, field])
 			return blank
 		var bytes := _read_raw(_frames_dir().path_join(rel), _res_w * _res_h)
 		if bytes.is_empty():
 			return blank
 		return Image.create_from_data(_res_w, _res_h, false, Image.FORMAT_RF, bytes)
 
-	# Reach scale (M6): the frame is a row-major tile grid; blit each tile into place.
-	var names: Array = fr.get("tiles", {}).get("depth", [])
+	# Reach scale (M6): a row-major tile grid; blit each tile into place.
+	var names: Array = entry.get("tiles", {}).get(field, [])
 	if names.size() != _res_tiles.size():
-		push_error("River Basin viewer: frame %d lists %d tiles, manifest geometry has %d"
-			% [i, names.size(), _res_tiles.size()])
+		push_error("River Basin viewer: %s lists %d %s tiles, manifest geometry has %d"
+			% [what, names.size(), field, _res_tiles.size()])
 		return blank
 	var full := blank
 	for t in range(_res_tiles.size()):
@@ -295,6 +400,39 @@ func _read_frame_image(i: int) -> Image:
 		var tile_img := Image.create_from_data(tw, th, false, Image.FORMAT_RF, tbytes)
 		full.blit_rect(tile_img, Rect2i(0, 0, tw, th), Vector2i(int(geom["x"]), int(geom["y"])))
 	return full
+
+
+func _read_frame_image(i: int) -> Image:
+	return _read_field_image(_frames[i], "depth", "frame %d" % i)
+
+
+func _read_results_bed() -> Image:
+	## The run's own bed from `manifest["static"]`, or null when the export predates
+	## it. Same tile layout as the frames, so the same decoder reads it.
+	var static_entry: Dictionary = _manifest.get("static", {})
+	if static_entry.is_empty():
+		return null
+	if static_entry.get("files", {}).get("bed", "") == "" \
+			and static_entry.get("tiles", {}).get("bed", []).is_empty():
+		return null
+	return _read_field_image(static_entry, "bed", "static bed")
+
+
+func _report_domain() -> void:
+	## Say when part of the rendered surface is fill, not terrain. `assemble_mosaic`
+	## fills cells no tile covered at the minimum covered elevation; rendered, that is
+	## a flat plateau indistinguishable from a bug unless the picture declares it.
+	var domain: Dictionary = _manifest.get("domain", {})
+	var gaps := int(domain.get("gap_cells", 0))
+	if gaps > 0:
+		# Counted on the mosaic's own (pre-coarsen) grid, so use its shape as the
+		# denominator rather than the results grid.
+		var shape: Array = domain.get("shape", [])
+		var total := float(shape[0]) * float(shape[1]) if shape.size() == 2 else 0.0
+		var pct := 100.0 * gaps / total if total > 0.0 else 0.0
+		print("River Basin viewer: %d mosaic cells (%.2f%%) are fill @ %.1f m -- flat by "
+			% [gaps, pct, float(domain.get("fill_value", 0.0))]
+			+ "construction, not by the terrain")
 
 
 func _apply_frame(i: int) -> void:
@@ -444,11 +582,8 @@ func _load_r32_as_rf(path: String, w: int, h: int) -> Image:
 
 
 func _build_environment() -> void:
-	var hr: Vector2 = _terrain.data.get_height_range()
-	var span_x := _grid_w * _dx
-	var span_z := _grid_h * _dx
-	var center := Vector3(span_x * 0.5, (hr.x + hr.y) * 0.5, span_z * 0.5)
-
+	## Sun, sky and camera *node*. The camera's placement depends on the domain, which
+	## is not known until results load, so it is fitted separately (`_fit_camera`).
 	var sun := DirectionalLight3D.new()
 	sun.rotation_degrees = Vector3(-45.0, -130.0, 0.0)
 	sun.light_energy = 1.3
@@ -465,13 +600,34 @@ func _build_environment() -> void:
 	env.environment = e
 	add_child(env)
 
-	var cam := Camera3D.new()
-	cam.far = 400000.0
+	_camera = Camera3D.new()
+	add_child(_camera)
+	_camera.current = true
+
+
+func _fit_camera(w: int, h: int, dx: float) -> void:
+	## Frame the current domain. Re-run on every geometry change: a camera left on the
+	## previous extent is how a correct mosaic ends up looking like a broken one.
+	if _camera == null or _terrain == null:
+		return
+	var hr: Vector2 = _terrain.data.get_height_range()
+	var span_x := w * dx
+	var span_z := h * dx
+	var center := Vector3(span_x * 0.5, (hr.x + hr.y) * 0.5, span_z * 0.5)
 	var relief := maxf(hr.y - hr.x, 100.0)
-	cam.position = center + Vector3(-span_x * 0.42, span_x * 0.20, -span_z * 0.42)
-	add_child(cam)
-	cam.look_at(center + Vector3(span_x * 0.05, -relief * 0.3, span_z * 0.05), Vector3.UP)
-	cam.current = true
+	# Clip planes scale with the domain: a fixed far plane is either too near to see a
+	# 76.8 km mosaic or so far that the depth range degenerates (and Godot's light
+	# culler starts refusing frustums).
+	_camera.near = maxf(dx, 1.0)
+	_camera.far = maxf(span_x, span_z) * 4.0
+	# Low, oblique vantage from a corner: fills the frame and lets the directional
+	# light rake the relief (which is a small fraction of a reach-scale span).
+	_camera.position = center + Vector3(-span_x * 0.42, span_x * 0.20, -span_z * 0.42)
+	_camera.look_at(center + Vector3(span_x * 0.05, -relief * 0.3, span_z * 0.05), Vector3.UP)
+	print("River Basin viewer: camera at (%.0f, %.0f, %.0f) looking at (%.0f, %.0f, %.0f), "
+		% [_camera.position.x, _camera.position.y, _camera.position.z,
+			center.x, center.y, center.z]
+		+ "near=%.1f far=%.0f" % [_camera.near, _camera.far])
 
 
 # --- CLI hooks (headless verify / screenshot / launch-and-quit) --------------
@@ -501,9 +657,28 @@ func _verify_then_quit() -> void:
 			for x in range(0, _res_w, 8):
 				if img.get_pixel(x, y).r >= 0.001:
 					wet += 1
-	print("River Basin viewer: headless verify %s (frames=%d, wet_samples=%d)"
-		% ["OK" if ok and wet > 0 else "FAIL", _frames.size(), wet])
-	get_tree().quit(0 if ok and wet > 0 else 1)
+	# And that the terrain is the *run's* domain. Frames-loaded plus water-visible was
+	# always true of the tile-0 terrain the water floated over, so registration needs
+	# its own assertion: same cell count, same cell size, and a bed with real relief
+	# (an unimported terrain reads back flat, not absent).
+	var registered := (_terrain != null and _terrain_w == _res_w and _terrain_h == _res_h
+		and is_equal_approx(_terrain_dx, _res_dx))
+	var relief := 0.0
+	if _terrain != null:
+		var hr: Vector2 = _terrain.data.get_height_range()
+		relief = hr.y - hr.x
+	var terrain_ok := registered and relief > 0.0
+	if not terrain_ok:
+		push_error("River Basin viewer: terrain %dx%d @ %.2fm does not match results "
+			% [_terrain_w, _terrain_h, _terrain_dx]
+			+ "%dx%d @ %.2fm (relief %.1f m, bed_from_results=%s)"
+			% [_res_w, _res_h, _res_dx, relief, _bed_from_results])
+	var pass_all := ok and wet > 0 and terrain_ok
+	print("River Basin viewer: headless verify %s (frames=%d, wet_samples=%d, "
+		% ["OK" if pass_all else "FAIL", _frames.size(), wet]
+		+ "terrain=%dx%d @ %.2fm relief=%.0fm run_bed=%s)"
+		% [_terrain_w, _terrain_h, _terrain_dx, relief, _bed_from_results])
+	get_tree().quit(0 if pass_all else 1)
 
 
 func _screenshot_then_quit(path: String) -> void:
