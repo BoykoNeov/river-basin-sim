@@ -293,9 +293,57 @@ Say this wherever the coarse run's numbers are reported.
       12 h. The channel deepens from a 1.5 m column at 1 h to 3.75 m at 12 h,
       overbank cells grow 25 → 1201, 11.6 Mm³ leaves the open southern edge, and the
       frames export lands on a **2×2 tile grid**. Mass **2.79e-7**; 2.8 min on the
-      CPU backend (this session has no GPU).
+      CPU backend (this session has no GPU). **Re-run on the RTX 5090 at sign-off:
+      mass 3.08e-7** — see below.
 - [x] `ruff` + `ruff format` clean; **228 tests green** (221 without `--extra geo`).
-- **Stop and confirm before M7.** ← we are here.
+- [x] **Signed off on GPU + Godot** (2026-08-09) — see the next section.
+
+### Sign-off run (GPU + Godot, 2026-08-09)
+
+The two things the authoring session could not run — the demo on real hardware and
+the Godot reader — were run. Pass criteria were written down before the output was
+looked at (mass ≤ 1e-6, and if not, re-run with `[channels]` stripped: an identical
+residual means the documented float32 source drift, a divergent one means a channels
+regression).
+
+- **228 tests green** on the GPU box with `--extra geo` (no skips).
+- **`scripts/make_reach_demo.py`**: 36 tiles, 1536² @ 50 m, 6144 channel cells,
+  `check_continuity` → **connected**.
+- **`scenarios/reach_basin.toml` on the RTX 5090** (Warp 1.14, CUDA 12.9): domain
+  resolved 1536² from 36/36 tiles → **768² @ 100 m**, ~15.8 MB of state fields,
+  **2232 channel cells**. Mass max rel **3.08e-7** vs the CPU backend's 2.79e-7 —
+  the CUDA↔CPU delta is 2.9e-8, an order below the residual itself, so reduction
+  order and FMA are not what sets the number. **Inside the 1e-6 gate; no re-run
+  needed.** `h_max` 2.036 m at 12 h ⇒ a **3.73 m channel column** through the
+  storage curve, reproducing the authoring session's 3.75 m. `status.json` reached
+  `state="done"`.
+- **Frame tiling, on real output**: `manifest.json` reports the expected **2×2**
+  grid with edge tiles clipped (512+256). All **25 frames reassemble byte-exactly**
+  to the Zarr (`max|tiles − zarr| = 0.0`), including the non-square edge tiles.
+- **Godot read path** (`--rbverify`, headless): 25 frames loaded, 8907 wet samples,
+  against the hard case — a coarsened mosaic whose grid matches no terrain tile.
+- **Godot render** (`--rbshot`): frame 24/24, `t = 43200 s`, max **2.04 m** — the
+  solver's `h_max` to the pixel. The water plane draws at 76.8 km against a 28.8 km
+  terrain quad, which is *positive* evidence the manifest-driven geometry is applied
+  (and the reason the composite looks wrong — see the terrain limitation below).
+- **Full loop** (`--rblaunch`): the viewer launched the solver as a subprocess and
+  polled `starting → running → writing → done`, then auto-reloaded. Mass
+  **2.12e-8** — bit-for-bit M2's recorded figure, so M6 left the pre-M6 path alone.
+  That run is 1024², so it **also tiles** (2×2 of 512) and its 13 frames likewise
+  reassemble exactly: the live loop did exercise the new write+read, not just M2's.
+  **The Windows `os.replace`-onto-open-file race did not fire** across 4× the file
+  handoffs — but that is one observation of a race, which is weak evidence, not a
+  proof it is gone.
+
+**New finding (recorded, not fixed): the frames export does not purge its output
+directory.** After the reach run, 13 pre-M6 untiled `f*_depth.raw` files from an
+earlier `demo_basin_rain` export were still sitting beside the new tiled ones, three
+months stale. Harmless today because `manifest.json` names every file the reader
+touches, so nothing reads them — but a reader that reconstructs filenames by
+convention, or a human inspecting the directory, would pick up old data. Either purge
+on export or leave it deliberate and say so.
+
+- **Stop and confirm before M7.** ← M6 is signed off; M7 has not started.
 
 ### HANDOFF divergences (deliberate)
 
@@ -344,13 +392,13 @@ Say this wherever the coarse run's numbers are reported.
   benchmark validation, and the two models are not identical by construction (the
   resolved 2D channel has no side-wall drag; the sub-grid one does). Both numbers and
   both analytical sections are printed rather than hidden inside the tolerance.
-- **The Godot side is unverified in this session.** The frame-tiling and
-  manifest-driven-geometry changes in `results_player.gd` are written against the
-  contract and the Python round-trip tests, but this session has **no Godot and no
-  GPU**: they have not been run. M2's gotcha applies — verify file handoffs with
-  `--rblaunch`, not just `pytest`. The terrain layer still loads tile 0 only, so a
-  mosaic run renders its water over one terrain tile until the viewer's terrain path
-  catches up.
+- **The viewer's terrain layer still loads tile 0 only.** The water path is verified
+  (see the sign-off section: manifest-driven geometry, tiles blitted, frames exact),
+  but the terrain under it is a single M0 tile — so the reach demo renders 76.8 km of
+  water over a 28.8 km terrain quad from a *different* DEM, and the composite looks
+  wrong while both halves are individually correct. Keep the two claims apart: "water
+  frames reassemble and render" is proven; "water aligns with terrain" is a known gap
+  until the viewer's terrain path learns the mosaic.
 - **Reach scale is still bounded by device memory.** The run prints its resolved
   domain and estimated field memory before stepping, but nothing streams: a domain
   larger than the GPU is a failure, not a slow run.

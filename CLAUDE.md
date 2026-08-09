@@ -15,7 +15,7 @@ A faithful research/education sandbox validated against benchmarks — **not a
 regulatory-certification tool**. State that honestly anywhere it matters.
 
 ## Status
-- **M6 — Reach: acceptance met; confirm before M7.** Reach is bought by **choosing the
+- **M6 — Reach: done (signed off on GPU + Godot, 2026-08-09).** Reach is bought by **choosing the
   resolution** and putting the lost river back, not by nesting grids. Three pieces:
   **`solver/io/mosaic.py`** makes the domain the whole **tile mosaic** (`[grid] tiles`
   = `all`/`first`, `[grid] window` = an inclusive box in mosaic coords; only the tiles a
@@ -39,9 +39,13 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   (2000 cells) versus sub-grid at 100 m (20 cells) — agrees to **0.1%** in depth. §7.3's
   `tile_grid` is real now (frames > 512 split row-major; an untiled export is byte-identical
   to M2's), and the Godot reader takes its grid from the manifest and blits tiles —
-  **written but unverified, no Godot/GPU in that session**. Demo
+  **now verified on hardware**: all 25 frames reassemble byte-exactly to the Zarr,
+  `--rbverify` reads the coarsened mosaic, `--rbshot` renders `h_max` to the pixel, and
+  `--rblaunch` drives the full subprocess loop at 2.12e-8 (bit-for-bit M2's figure), with
+  the Windows `os.replace` race not firing across 4× the file handoffs. Demo
   `scenarios/reach_basin.toml`: a **6×6 mosaic, 76.8 km square**, run at 768² @ 100 m with
-  2232 channel cells, mass **2.79e-7**. **228 tests green.** **One loud carried finding:**
+  2232 channel cells, mass **2.79e-7** on CPU / **3.08e-7** on the 5090 (a 2.9e-8 CUDA↔CPU
+  delta — reduction order is *not* what sets the residual). **228 tests green.** **One loud carried finding:**
   the mass gate is now a *precision envelope* — the same demo at `coarsen = 4` **exceeds**
   it (1.8e-6) and does so identically with channels off, i.e. float32 accumulation of
   rain into a thin sheet (§12's drift-at-scale, measured). Check storm depth / cell count /
@@ -275,6 +279,17 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   cell count and step count before suspecting the scheme; the real fix (compensated or
   float64 source accumulation) is a precision pass, and it should land before M7 adds
   sediment to the same fields.
+- **The frames export does not purge its output directory, and `manifest.json` is the
+  only thing that knows which files are current.** A pre-M6 untiled export left 13
+  three-month-old `f*_depth.raw` files sitting beside the new tiled ones after a reach
+  run. Nothing reads them (every path the viewer touches is named in the manifest), but
+  don't reconstruct frame filenames by convention, and don't trust a directory listing
+  as a record of the last run.
+- **The viewer's terrain layer loads tile 0 only.** A mosaic run's water is correct and
+  renders at its true extent (manifest-driven geometry), over a single terrain tile from
+  a possibly unrelated DEM — so the composite looks broken while both halves are right.
+  Verified-water and aligned-with-terrain are separate claims; don't let a screenshot
+  merge them.
 - **A sub-grid channel conveys only where it is continuous.** `w_face = min(w_L, w_R)`, so
   a channel band that steps sideways faster than it is wide has a wall across it and
   nothing in the depth field says so. Check connectivity when authoring channel geometry
