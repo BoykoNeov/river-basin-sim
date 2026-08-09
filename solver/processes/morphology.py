@@ -70,7 +70,7 @@ from solver.core.sediment import (
     rebuild_bed,
 )
 from solver.core.state import State
-from solver.scheduler import SlowProcess
+from solver.scheduler import EPS_T, SlowProcess
 
 
 def bed_change_bounds(
@@ -210,7 +210,25 @@ class MorphologyProcess:
         own time, which is the whole point of accumulating it in the fast loop -- and
         is used only to report the morphological Courant number over the interval
         that actually elapsed.
+
+        It is nonetheless **checked against the configured interval**, because an
+        activation covering more than one interval is a silently coarsened splitting:
+        the integral stays exact and mass is fine, but the bed jumps by several
+        intervals at once and ``interval_s`` stops meaning what the interval-
+        independence gate (M7 plan §3) assumes. A scheduler-driven run cannot produce
+        it -- activations are sync points, so a step is clamped to land on one, and a
+        ``dt_max`` far coarser than ``interval_s`` still yields one activation per
+        interval (verified against :class:`~solver.scheduler.MultiRateScheduler`).
+        The check is therefore aimed at a **hand-driven** caller, which is exactly how
+        the celerity fixture drives this process and how a future harness will.
         """
+        if dt_slow > self.interval_s * (1.0 + 1e-6) + EPS_T:
+            raise SedimentError(
+                f"morphology was handed {dt_slow} s to apply but is configured for "
+                f"{self.interval_s} s: more than one interval has collapsed into a single "
+                "bed update, which coarsens the operator splitting without changing the "
+                "mass balance -- so it would not show up as an error anywhere else"
+            )
         st, sed, g = self.state, self.sediment, self.state.grid
         before = float(sed.dz_cum.numpy().sum())
 

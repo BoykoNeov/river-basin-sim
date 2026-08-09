@@ -469,7 +469,25 @@ sediment.
      reads a stage `z + h` and should read it off the bed the interval's water actually
      flowed over.
 
-   **303 tests green.**
+   - **Two hazards found in review, and the first one's *mechanism* did not survive
+     checking.** The worry was that a coarse `dt_max` against a fine `interval_s`
+     would let several intervals collapse into one `advance` — the bed jumping by all
+     of them at once, exact in mass and silently coarser in splitting, which is
+     precisely what step 8's interval-independence gate would then measure against
+     itself. Checked rather than assumed: with `dt_fn` returning 30 s against a 10 s
+     interval the scheduler still delivers **ten activations of exactly 10 s each**,
+     because activations *are* sync points and M5 clamps every step to land on one.
+     So the scheduler cannot produce it — but a **hand-driven** caller can, and that
+     is how the celerity fixture and every future harness drive this process, so
+     `advance` now refuses a `dt_slow` longer than its configured interval. It caught
+     two of this step's own tests immediately.
+   - **The celerity diagnostic takes the larger of its two components, not the
+     channel one.** A channel cell flowing overbank carries a real floodplain flux
+     across most of its width; selecting the channel component would report exactly
+     zero for a cell whose channel happened to be still — the wrong direction for a
+     warning to fail in, and `reach_basin` scale is exactly the overbank case.
+
+   **305 tests green.**
 6. **`SedimentLedger`** in `massbalance.py` or beside it — same shape as
    `MassLedger`, same Kahan f64 accumulators, same causal peak floor, its own
    relative gate. Masked-cell and clamped transport bank here.

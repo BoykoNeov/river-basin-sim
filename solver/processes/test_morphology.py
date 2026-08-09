@@ -16,7 +16,12 @@ import warp as wp
 
 from solver.core.channels import arm_channels
 from solver.core.local_inertial import compute_dt, step
-from solver.core.sediment import SedimentError, accumulate_transport, arm_sediment
+from solver.core.sediment import (
+    SedimentError,
+    accumulate_transport,
+    arm_sediment,
+    celerity_field,
+)
 from solver.core.state import State
 from solver.processes.morphology import MorphologyProcess, bed_change_bounds
 
@@ -197,7 +202,7 @@ def test_a_bed_update_does_not_touch_the_water_but_does_refresh_eta():
     st, morph = _armed()
     _run(st, 30)
     h_before = st.h.numpy().copy()
-    morph.advance(100.0, 100.0)
+    morph.advance(60.0, 60.0)
 
     assert (st.h.numpy() == h_before).all()
     assert (st.eta.numpy() == (h_before + st.z.numpy()).astype(np.float32)).all()
@@ -282,7 +287,7 @@ def test_an_alluvium_floor_stops_the_scour_and_banks_the_rest():
     st = _state()
     arm_sediment(st, D50, POROSITY)
     lo, hi = bed_change_bounds(st.grid.shape, alluvium_thickness=1.0e-4)
-    morph = MorphologyProcess(st, interval_s=60.0, dz_lo=lo, dz_hi=hi)
+    morph = MorphologyProcess(st, interval_s=120.0, dz_lo=lo, dz_hi=hi)
     assert morph.floored_cells == NY * NX
 
     dts = _run(st, 40)
@@ -308,6 +313,52 @@ def test_the_process_refuses_what_it_cannot_honour():
         MorphologyProcess(st, interval_s=60.0, dz_lo=lo[:2], dz_hi=hi[:2])
     with pytest.raises(SedimentError, match="cross"):
         MorphologyProcess(st, interval_s=60.0, dz_lo=hi, dz_hi=lo)
+
+
+def test_an_activation_covering_more_than_its_interval_is_refused():
+    """A collapsed splitting changes nothing a mass gate can see, so say it here.
+
+    The integral stays exact and the bed ends up in the right place -- it just gets
+    there in one jump of several intervals, which quietly coarsens the operator
+    splitting and makes ``interval_s`` mean something other than what step 8's
+    interval-independence gate assumes. The **scheduler cannot** do this (activations
+    are sync points, so a step is clamped to land on one), which is precisely why the
+    check has to live here: the callers that can are the hand-driven harnesses.
+    """
+    st, morph = _armed()
+    _run(st, 10)
+    with pytest.raises(SedimentError, match="collapsed"):
+        morph.advance(180.0, 180.0)
+    morph.advance(60.0, 60.0)  # the interval it was configured for is fine
+
+
+def test_the_celerity_diagnostic_takes_the_larger_of_its_two_components():
+    """A channel cell flowing overbank must not report the still channel's zero.
+
+    The morphological-CFL diagnostic is what step 8 will gate a scenario on, and
+    ``reach_basin``-scale runs are exactly the overbank case: above bank full most of
+    a channel cell's width is floodplain and carries a real flux across its faces. A
+    hard select on the channel component would report exactly zero for a cell whose
+    channel happened to be still -- the wrong direction for a warning to fail in.
+
+    The flow is **assigned, not spun up**: this is a property of the combination rule,
+    and a closed box that has to reach a transporting regime first would be testing
+    the fixture's hydraulics instead.
+    """
+    st = _state(channels=True, depth=1.2)  # bank full is w*d/dx = 0.4 m, so: overbank
+    arm_sediment(st, D50, POROSITY)
+    row = NY // 2
+
+    st.qx = wp.array(np.full(st.grid.qx_shape, 3.0, np.float32), device=DEV)
+    only_fp = celerity_field(st)
+    assert (only_fp[row] > 0.0).all(), "a still channel must not hide a moving floodplain"
+    # ... and with the channel still, a channel cell reads exactly like a plain one.
+    assert (only_fp[row] == only_fp[0]).all()
+
+    st.channels.qx_ch = wp.array(np.full(st.grid.qx_shape, 12.0, np.float32), device=DEV)
+    both = celerity_field(st)
+    assert (both[row] > only_fp[row]).all(), "a fast channel must raise the cell's celerity"
+    assert (both[0] == only_fp[0]).all(), "off-channel rows are untouched by either"
 
 
 def test_it_advances_on_the_scheduler_like_any_other_slow_process():

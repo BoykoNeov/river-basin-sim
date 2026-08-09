@@ -865,4 +865,9 @@ def celerity_field(state) -> np.ndarray:
         width=w_safe,
         dx=g.dx,
     )
-    return np.where(has, np.where(wet_ch, c_ch, 0.0), c_fp)
+    # The **larger** of the two components, not the channel one selected: a channel
+    # cell flowing overbank (``h > h_bf``) carries a real floodplain flux across its
+    # faces too, and above bank full that component is most of the cell's width. A
+    # hard select would report exactly zero for a channel cell whose channel happens
+    # to be still, which for a warning diagnostic is the wrong way to be wrong.
+    return np.maximum(np.where(has & wet_ch, c_ch, 0.0), c_fp)
