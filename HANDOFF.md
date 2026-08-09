@@ -235,7 +235,7 @@ cfl = 0.45                       # HLLC wants ~0.45; local-inertial tolerates ~0
 dt_max = 30.0
 
 [rainfall]
-type = "uniform"                 # "uniform" | "field"
+type = "uniform"                 # "uniform" | "field"; "timeseries" | "storm_cells" deferred
 rate_mm_hr = 25.0
 duration_s = 7200.0
 
