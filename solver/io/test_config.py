@@ -543,6 +543,10 @@ def test_sediment_fields_parse_as_paths_and_are_hashed(tmp_path):
     assert scn.sediment_d50_field.endswith("grain.r32")
     assert scn.alluvium_thickness_field.endswith("allu.r32")
     assert scn.has_alluvium_floor
+    # Field-wins, so the scalar is an unused fallback here -- NOT "bedrock
+    # everywhere", which is what a bare `alluvium_thickness_m == 0.0` reads as when
+    # no field is set. Pinned so step 5 cannot invert the meaning.
+    assert scn.alluvium_thickness_m == 0.0
     # Provenance hashes every referenced field file (solver/io/provenance.py).
     assert "sediment_d50" in scn.field_paths()
     assert "alluvium_thickness" in scn.field_paths()

@@ -326,9 +326,13 @@ class Scenario:
     sediment_porosity: float = 0.4  # bed porosity p in Exner's 1/(1-p)
     sediment_interval_s: float = _DEFAULT_SEDIMENT_INTERVAL_S  # slow-clock cadence
     # Optional erodible-layer thickness (m) below the initial bed: scalar OR field.
-    # None = unlimited alluvium. A floor does not *clamp* the bed -- the amount not
-    # applied is banked into the sediment ledger (M7 plan §1.5), the same rule that
-    # forbids keeping depth non-negative with a bare max(h, 0).
+    # None = unlimited alluvium, and a *zero* thickness is bedrock everywhere -- but
+    # that reading holds only when no field is set: field-wins is the [parameters]
+    # idiom, so a field-backed floor leaves the scalar at its unused 0.0 fallback
+    # (which load_field needs) and means nothing. Check the field first.
+    # A floor does not *clamp* the bed -- the amount not applied is banked into the
+    # sediment ledger (M7 plan §1.5), the same rule that forbids keeping depth
+    # non-negative with a bare max(h, 0).
     alluvium_thickness_m: float | None = None
     alluvium_thickness_field: str | None = None
     # Rainfall: "uniform" (scalar rate) or "field" (rate raster).
