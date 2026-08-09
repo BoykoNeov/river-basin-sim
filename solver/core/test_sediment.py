@@ -706,17 +706,54 @@ def test_a_scalar_grain_size_broadcasts_to_a_bit_exact_uniform_field():
     assert "d50 = 12.30 mm" in sed.summary()
 
 
-def test_a_grain_size_field_is_carried_per_cell_and_inert_cells_are_counted():
-    """A zero ``d50`` transports nothing; that is allowed, but never silent."""
+def test_a_grain_size_field_is_carried_per_cell_and_its_zeros_are_counted():
+    """A zero ``d50`` is allowed and counted -- but counted as what it *is*."""
     field = np.full((3, 4), 0.004, np.float32)
     field[1, 2] = 0.0
     field[0, 0] = 0.016
     _, sed = _armed(d50=field)
     assert (sed.d50.numpy() == field).all()
-    assert sed.inert_cells == 1
+    assert sed.zero_d50_cells == 1
     assert sed.d50_min == 0.0 and sed.d50_max == pytest.approx(0.016)
-    assert "1 inert cells" in sed.summary()
-    assert sed.as_attrs()["inert_cells"] == 1
+    assert "1 cells with no grain size" in sed.summary()
+    assert sed.as_attrs()["zero_d50_cells"] == 1
+
+
+def test_a_zero_grain_size_does_not_make_a_cell_immobile():
+    """The label counts cells with no grain size, and that is *not* an inert cell.
+
+    ``d50`` is face-averaged like ``n``, so a lone zero cell's faces carry half its
+    neighbours' grain size and transport normally. The error even has a sign:
+    ``theta`` goes as ``1/d50``, so an isolated zero reads as **more** mobile, not
+    less. Pinned here because the honest way to immobilise a cell is
+    ``alluvium_thickness = 0``, whose bound also *banks* what it refused -- and
+    because a "N inert cells" label would print the opposite into a run's log.
+    """
+    st = State.from_bed(np.zeros((1, 3), np.float32), dx=5.0, depth=1.0, manning=0.03, device=DEV)
+    sed = arm_sediment(st, np.array([[0.004, 0.0, 0.004]], np.float32), 0.4)
+    assert sed.zero_d50_cells == 1
+    st.qx.assign(np.array([[0.0, 2.0, 2.6, 0.0]], np.float32))  # a gradient, so no cancellation
+    st.eta.assign(np.full((1, 3), 1.0, np.float32))
+    wp.launch(
+        accumulate_qs_x,
+        dim=(1, 2),
+        inputs=[st.qx, st.eta, st.z, st.n, sed.d50, 60.0, sed.qs_int_x, sed.qs_comp_x],
+        device=DEV,
+    )
+    faces = sed.qs_int_x.numpy()[0]
+    assert (faces[1:3] != 0.0).all(), "both faces of the zero cell carry transport"
+    lo = wp.array(np.full((1, 3), -np.inf, np.float32), dtype=wp.float32, device=DEV)
+    hi = wp.array(np.full((1, 3), np.inf, np.float32), dtype=wp.float32, device=DEV)
+    wp.launch(
+        exner_update,
+        dim=(1, 3),
+        inputs=[
+            sed.qs_int_x, sed.qs_int_y, lo, hi, 5.0,
+            sed.inv_one_minus_p, sed.dz_cum, sed.dz_unapplied,
+        ],
+        device=DEV,
+    )  # fmt: skip
+    assert sed.dz_cum.numpy()[0, 1] != 0.0, "the zero-d50 cell's bed moved, as it must"
 
 
 @pytest.mark.parametrize(
@@ -734,8 +771,9 @@ def test_a_grain_size_that_cannot_mean_anything_is_refused(bad, match):
     assert st.sediment is None, "a refused arming must leave the state unarmed"
 
 
-@pytest.mark.parametrize("p", [1.0, 1.5, -0.1])
+@pytest.mark.parametrize("p", [0.0, 1.0, 1.5, -0.1])
 def test_a_porosity_exner_cannot_divide_by_is_refused(p):
+    """The same open interval `[sediment] porosity` enforces -- the gates agree."""
     st = State.from_bed(np.zeros((3, 4), np.float32), dx=5.0, device=DEV)
     with pytest.raises(SedimentError, match="porosity"):
         arm_sediment(st, 0.008, p)

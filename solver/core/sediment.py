@@ -485,7 +485,7 @@ class SedimentState:
     qs_comp_y: wp.array  # (ny+1, nx)
     d50_min: float  # host-side diagnostics, validated at arm time
     d50_max: float
-    inert_cells: int  # cells with d50 == 0: no transport, counted rather than silent
+    zero_d50_cells: int  # cells with no grain size -- NOT immobile cells, see below
 
     @property
     def inv_one_minus_p(self) -> float:
@@ -518,15 +518,15 @@ class SedimentState:
             if self.d50_min != self.d50_max
             else f"d50 = {1000.0 * self.d50_max:.2f} mm"
         )
-        inert = f", {self.inert_cells} inert cells" if self.inert_cells else ""
-        return f"{grain}, porosity {self.porosity:.2f}{inert}"
+        zeros = f", {self.zero_d50_cells} cells with no grain size" if self.zero_d50_cells else ""
+        return f"{grain}, porosity {self.porosity:.2f}{zeros}"
 
     def as_attrs(self) -> dict:
         return {
             "d50_min_m": self.d50_min,
             "d50_max_m": self.d50_max,
             "porosity": self.porosity,
-            "inert_cells": self.inert_cells,
+            "zero_d50_cells": self.zero_d50_cells,
         }
 
 
@@ -537,14 +537,23 @@ def validate_grain_size(d50: np.ndarray | float, grid) -> np.ndarray:
     ``0.5*(d50 + d50)`` bit-exact -- the ``n`` idiom, so a uniform grain size costs
     nothing in accuracy for the generality.
 
-    Rejects what cannot mean anything (negative, non-finite). A **zero** is
-    accepted and *counted*: :func:`face_capacity` returns zero there, so the cell
-    is inert, which is a coherent thing to want but a silent one to get by typo.
-    ``[sediment] d50`` refuses a zero scalar for that reason (there is no ``d50``
-    that means "off"); a field can carry zeros, and :meth:`SedimentState.summary`
-    says how many. The right way to spell "the bed here cannot move" remains
-    ``alluvium_thickness = 0``, which banks into the ledger instead of quietly
-    transporting nothing.
+    Rejects what cannot mean anything (negative, non-finite). A **zero is accepted
+    and counted, and it does not make that cell immobile** -- ``d50`` is
+    *face-averaged*, so a lone zero cell's faces carry half its neighbours' grain
+    size, transport normally, and move its bed like any other. Worse, the error has
+    a sign: ``theta`` goes as ``1/d50``, so an isolated zero reads as **more**
+    mobile than its neighbours, not less. Only the interior faces of a *contiguous*
+    zero region see ``d50 == 0`` on both sides and carry nothing, and even there the
+    region's fringe stays mobile. ``[sediment] d50`` refuses a zero scalar for a
+    related reason (there is no ``d50`` that means "off"); a field can carry zeros,
+    ``zero_d50_cells`` counts them and :meth:`SedimentState.summary` says how many,
+    named for what they are rather than for what they look like they do.
+
+    The way to spell "the bed here cannot move" is ``alluvium_thickness = 0``, whose
+    bound holds the cell at zero *and banks what it refused* into the sediment
+    ledger -- rather than quietly transporting at a grain size nobody chose.
+    ``test_a_zero_grain_size_does_not_make_a_cell_immobile`` pins the real behaviour
+    so the label cannot drift back into a claim.
     """
     ny, nx = grid.shape
     if np.isscalar(d50):
@@ -587,8 +596,12 @@ def arm_sediment(state, d50: np.ndarray | float, porosity: float) -> SedimentSta
             "state is already armed for morphology; re-arming would recapture z0 from "
             "a moved bed and discard the cumulative change that moved it"
         )
-    if not 0.0 <= porosity < 1.0:
-        raise SedimentError(f"porosity must be in [0, 1), got {porosity}")
+    # The same open interval `[sediment] porosity` enforces, so a state armed
+    # directly (a fixture, a test) cannot be legal where a scenario would be refused.
+    # Zero is arithmetically harmless -- 1/(1-0) = 1 -- and excluded anyway, because
+    # a bed with no pore space is not a bed Exner's 1/(1-p) was written for.
+    if not 0.0 < porosity < 1.0:
+        raise SedimentError(f"porosity must be in (0, 1), got {porosity}")
     g = state.grid
     grain = validate_grain_size(d50, g)
     dev = state.device
@@ -604,7 +617,7 @@ def arm_sediment(state, d50: np.ndarray | float, porosity: float) -> SedimentSta
         qs_comp_y=wp.zeros(g.qy_shape, dtype=wp.float32, device=dev),
         d50_min=float(grain.min()),
         d50_max=float(grain.max()),
-        inert_cells=int((grain == 0).sum()),
+        zero_d50_cells=int((grain == 0).sum()),
     )
     state.sediment = sed
     return sed

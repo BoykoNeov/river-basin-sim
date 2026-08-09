@@ -379,6 +379,18 @@ sediment.
      computed per-face from the flow and fused into its own kernel, so it cannot use
      a generic wrapper: the helper would have shipped with zero callers.
 
+   - **A zero `d50` does *not* make a cell immobile, and the first draft's label said
+     it did.** `d50` is face-averaged like `n`, so a lone zero cell's faces carry half
+     its neighbours' grain size and move its bed like any other — measured, −0.077 m
+     in one activation — and the error has a sign, since `θ ∝ 1/d50` makes an isolated
+     zero read as *more* mobile. Only a contiguous zero region's interior faces carry
+     nothing. The count is kept (it is useful) but named `zero_d50_cells` for what it
+     is, and a test pins the real behaviour. Immobilising a cell is
+     `alluvium_thickness = 0`, whose bound also *banks* what it refused. Same class as
+     `e8c6d85`: a docstring that inverts a meaning right before step 5 reads it.
+   - **`arm_sediment` now enforces the same open `(0, 1)` porosity interval `[sediment]`
+     does**, so a directly-armed fixture cannot be legal where a scenario is refused.
+
    **Verified by repointing the step-3 fixture** at the arming path rather than by a
    fresh unit test — `validation/test_bed_wave.py` hand-rolled exactly these seven
    arrays, and every recorded number reproduces bit for bit (xcorr **0.993 c_b**,
@@ -386,7 +398,7 @@ sediment.
    free-end inlet −1.1226 m / outlet +0.9071 m / reach 1.9439 m, pinned ends exactly
    0.0). At this step the bitwise invariant is *structural* — unarmed means the
    attribute is `None` and nothing is allocated — with the suite's stored baselines
-   as the regression. **290 tests green.**
+   as the regression. **292 tests green.**
 5. **`solver/processes/morphology.py`** — the slow process, modelled on
    `reservoir.py`: constructed after `State`, exposes `as_slow_process()`,
    `advance(t, dt_slow)` returns a record, `series` lands in `.zattrs`. Plus the
