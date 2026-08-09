@@ -52,25 +52,32 @@ Every one of these is a constraint, and they pull against each other:
    cheap to run and physically absurd.
 2. **The bump must be short compared to the backwater adjustment length ``h/S``.**
    This is the constraint that decides whether the analytical celerity is the right
-   reference at all (see *What the analytic reference assumes*). Measured: at
-   ``sigma/(h/S) = 0.02`` the numerical wave lands within 1% of ``c_b``; at 0.07 it
-   drops to ~0.9; at 0.30 -- a shallow steep flume whose bump was a third of its
-   adjustment length -- it collapses to 0.37, and no amount of grid refinement
-   recovers it, because it is not a discretisation error.
+   reference at all (see *What the analytic reference assumes*). Three design points
+   were run: this one at ``sigma/(h/S) = 0.02`` lands within 1% of ``c_b``; a steeper
+   ``Fr = 0.77`` point at 0.065 read 0.92 and *stayed* there when ``dx`` was halved
+   twice (0.85 / 0.92 / 0.92), so its 8% deficit is physics and not the grid; and a
+   shallow steep flume at 0.30 read 0.37, and moved only between 0.27 and 0.38 over
+   its own amplitude and bump-length sweeps. Those points differ in Froude as well,
+   so this is a joint observation rather than a clean one-variable sweep -- but the
+   direction is unambiguous and the mechanism is named in (3).
 3. **Froude well below 1.** The surface adjustment over the bump scales as
    ``1/(1 - Fr^2)``, which is 1.24 here and 2.5 at ``Fr = 0.77``; the local-inertial
    scheme also drops advection, so a near-critical fixture measures the scheme's
    weakest regime instead of the transport law.
-4. **The bump must be resolved.** ``sigma = 6`` cells; at 3 cells the same physical
-   bump measured 0.85-0.92 of ``c_b`` with a clear grid dependence, and at
-   ``dx/2`` the answer moved by <1%, so 6 cells is past the knee.
+4. **The bump must be resolved.** ``sigma = 6`` cells. Measured *on this design
+   point*, halving and doubling ``dx`` at a fixed physical bump and a fixed Courant
+   number gives 0.973 (3 cells) / **0.993** (6) / 1.001 (12), so 6 cells is past the
+   knee at a 0.8% cost -- while the crest keeps 0.64 / 0.72 / 0.77 of its height, so
+   what a coarser grid mostly costs is the *amplitude*, and the shape estimator is
+   what survives it. The rejected ``Fr = 0.77`` point was far more grid-sensitive at
+   the same 3 cells (0.85), which is the other half of why it was rejected.
 5. **The reach must be longer than everything happening in it.** The bump starts
    200 m in and migrates 40 m; upstream of it the backwater deposits a broad, low
    plateau that reaches back ~``h/S``, and the measurement window has to sit clear
    of both ends (see :meth:`BedWave.window`).
-6. **Small amplitude.** 15 mm on 1.5 m of water. At 30 mm the crest travelled ~3%
-   fast -- nonlinear steepening, since ``c_b`` rises with bed elevation -- which is
-   real physics but not what the gate is written against.
+6. **Small amplitude.** 15 mm on 1.5 m of water. At 30 mm the crest travelled 3%
+   fast and the shape 2% fast -- nonlinear steepening, since ``c_b`` rises with bed
+   elevation -- which is real physics but not what the gate is written against.
 7. **The activation interval is the fixture's own, not the 900 s default.** At
    900 s this bed wave crosses 3.1 cells per activation, which is a splitting
    artefact rather than a result (M7 plan §1.3). Measured stability in the
@@ -541,4 +548,12 @@ def _xcorr_lag(ref: np.ndarray, final: np.ndarray, lo: int, hi: int, max_lag: in
     corr = np.array(
         [float(np.dot(ref[lo - k : hi - k], seg)) for k in range(max_lag + 1)], dtype=np.float64
     )
+    if int(np.argmax(corr)) == max_lag:
+        # The correlation peak is *at* the search limit, so the real lag is somewhere
+        # beyond it and the parabolic fit would silently report the limit as the
+        # answer. Loud, because a re-parametrised fixture is exactly how this happens.
+        raise ValueError(
+            f"cross-correlation saturated at its {max_lag}-cell search limit: the bump "
+            "moved further than the fixture expected"
+        )
     return _parabolic_peak(corr)

@@ -87,7 +87,9 @@ def _drive(fx: BedWave, *, morphology: bool = True, end_s: float | None = None) 
     """Run the fixture: local-inertial water, plus (optionally) the M7 kernels.
 
     Provisional -- see the module docstring. ``end_s`` stops early (the design-point
-    check only needs the warm-up); ``morphology=False`` leaves the bed untouched.
+    check needs only the warm-up and a few intervals past it); ``morphology=False``
+    leaves the bed untouched, and takes no notice of activation boundaries because
+    there are none.
     """
     nx = fx.nx
     st = fx.state(DEV)
@@ -112,11 +114,20 @@ def _drive(fx: BedWave, *, morphology: bool = True, end_s: float | None = None) 
     while t < end - _EPS:
         dt = compute_dt(st, alpha=0.7, dt_max=_DT_MAX)
         # Land exactly on the warm-up boundary and on every activation, so an
-        # interval is an interval (the scheduler does this for real runs, M5).
-        edge = fx.warmup_s if t < fx.warmup_s - _EPS else fx.warmup_s + (acts + 1) * fx.interval_s
+        # interval is an interval (the scheduler does this for real runs, M5). With
+        # morphology off there is nothing to land on -- and the activation counter
+        # never advances either, so keeping the clamp would freeze `dt` at zero and
+        # spin here forever the first time `t` passed one interval.
+        if morphology:
+            edge = (
+                fx.warmup_s if t < fx.warmup_s - _EPS else fx.warmup_s + (acts + 1) * fx.interval_s
+            )
+        else:
+            edge = end
         edge = min(edge, end)
         if t + dt > edge:
             dt = edge - t
+        assert dt > 0.0, f"harness made no progress at t={t} (edge={edge}, acts={acts})"
 
         transporting = morphology and t >= fx.warmup_s - _EPS
         ledger.add_inflow(inj.apply(st, t, dt))
@@ -207,9 +218,14 @@ def test_the_design_point_is_what_the_solver_actually_delivers():
     the wrong denominator -- and a 1.01 ratio against the wrong number is worse than
     a 0.9 against the right one. It also confirms the water-only warm-up is long
     enough, and that with morphology off the bed is bit-for-bit untouched.
+
+    Run a few intervals *past* the warm-up rather than stopping on it: an unarmed run
+    has no activations to land on, and the harness must therefore not try to land on
+    them -- when it did, ``dt`` clamped to zero at the first boundary and the loop
+    spun forever, which no test that stopped exactly at the warm-up could see.
     """
     fx = BedWave()
-    res = _drive(fx, morphology=False, end_s=fx.warmup_s)
+    res = _drive(fx, morphology=False, end_s=fx.warmup_s + 3.0 * fx.interval_s)
 
     h = res.median_depth(fx.interior)
     q = res.median_unit_discharge(fx.interior)
@@ -219,7 +235,7 @@ def test_the_design_point_is_what_the_solver_actually_delivers():
     c_flow = fx.celerity_at(q, h)
 
     print(
-        f"\n[design point] after {fx.warmup_s:g} s ({res.steps} steps)\n"
+        f"\n[design point] after {res.t:g} s ({res.steps} steps, morphology off)\n"
         f"  depth    {h:.4f} m vs design {fx.normal_depth:.4f} "
         f"({100 * (h - fx.normal_depth) / fx.normal_depth:+.2f}%)\n"
         f"  q        {q:.4f} m2/s vs design {fx.unit_discharge:.4f}\n"
