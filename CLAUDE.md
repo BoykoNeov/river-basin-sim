@@ -81,9 +81,15 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   5.0 and 1.0; and **EA SC080035 Test 1** (disconnected water body) — the far pond floods
   to 0.393 m and still holds 0.317 m after 5 h at the 10.10 m ridge crest while the
   connected pond returns exactly to the 9.700 m boundary. Demo
-  `scenarios/reservoir_release.toml` fills a valley reservoir to 0.52 Mm³ then draws it
-  down under proportional control (Q easing 40.6 → 12.7 m³/s as the stage falls toward
-  its target), mass 4.6e-7. **189 tests green.**
+  `scenarios/reservoir_release.toml` fills a valley reservoir to 0.5 Mm³ then draws it
+  down under proportional control (Q easing 40.8 → 12.7 m³/s as the stage falls toward
+  its target). **Signed off on GPU + CPU, 2026-08-09, out of order — after M6**: mass
+  **1.36e-7 CPU / 3.15e-7 CUDA** (a 1.8e-7 backend delta, so reduction order is not what
+  sets it), pool peaks at 77.04 m under the 78 m crest and never overtops, the rule
+  engages at 75.11 m and eases monotonically to 12.7 m³/s while the stage falls to
+  75.63 m. Because M6 refactored `solver/io/` underneath this scenario, that run is also
+  a **regression check on the mosaic loader**. **189 tests green** at authoring, 228 at
+  sign-off.
   **Two carried honesty notes:** EA Test 1's SC080035 figures were not reachable from
   this session, so its geometry is *faithful in form, reconstructed in detail* (the
   docstring separates pinned from reconstructed; the gate is the qualitative finding

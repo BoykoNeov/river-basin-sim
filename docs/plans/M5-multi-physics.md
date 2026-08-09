@@ -276,7 +276,59 @@ tolerances. Same policy M4 used for Tests 2 and 3.
       `fixed_stage` southern edge passes water both ways. Mass **4.6e-7** over 5 h;
       `h_max` 5.9 m; the dam is in the stored bed at 78.0 m.
 - [x] `ruff` + `ruff format` clean; **189 tests green** (184 without `--extra geo`).
-- **Stop and confirm before M6.** ← we are here.
+- [x] **Confirmed by the user 2026-08-09** — *out of order*: M6 was built, merged and
+      signed off first, so this §9 checkpoint was carried open across M6 rather than
+      gating it. See the sign-off run below.
+
+### Sign-off run (2026-08-09) — confirmed on hardware, after M6
+
+The figures above were produced by the authoring session pre-merge. M6 then refactored
+`solver/io/` (mosaic, coarsening, grid loading) underneath this scenario, so the
+confirm run is **also a regression check** on that path: `reservoir_release.toml` loads
+its single tile through the mosaic loader now.
+
+Re-run on this machine (RTX 5090, Warp 1.14.0 / CUDA 12.9), both backends, output kept
+out of `data/results/` so nothing interleaves with another scenario's frames:
+
+```
+uv run python scripts/make_reservoir_demo.py
+uv run python -m solver.run --config scenarios/reservoir_release.toml --device cuda:0 \
+    --out <dir>/cuda.zarr --frames-dir <dir>/cuda_frames
+uv run python -m solver.run --config scenarios/reservoir_release.toml --device cpu ...
+```
+
+**Hard gate — mass balance.** CPU **1.36e-07**, CUDA **3.15e-07**, both under the 1e-6
+gate; a **1.8e-07 backend delta**, the same order as the residual itself, so CUDA
+reduction order is not what sets it (the same conclusion M6's sign-off reached). 16
+frames each, `h.min() == 0.0` throughout — the positivity limiter never went negative.
+
+**Acceptance claims — all hold, on both backends.** The pool fills to **77.04 m**,
+below the 78.0 m crest, and never overtops; the dam is in the stored bed at exactly
+**78.0 m** across the line; the `target_stage` rule engages at **75.11 m with
+2.27 m³/s**, peaks at **40.8 m³/s**, then eases monotonically over its 900 s clock —
+39.1 → 36.6 → 33.6 → 30.8 → 28.1 → 25.3 → 22.8 → 20.5 → 18.3 → 16.3 → 14.4 → **12.7**
+— as the stage falls **77.04 → 75.63 m** toward its 75 m target. The sequence quoted in
+the acceptance bullet above is every *second* activation of this one, and reproduces to
+three significant figures.
+
+**Small differences from the pre-merge figures, stated rather than smoothed.** Peak
+`h_max` is **6.05 m** here versus the recorded 5.9 m, and peak volume in the pool box is
+**0.495 Mm³** versus the recorded 0.52 Mm³ (whole-domain peak is 0.63 Mm³, so the two
+figures may not be measuring the same box). The recorded mass residual was 4.6e-07;
+both backends here come in *below* that. These are the informational part of the
+acceptance record, not the gate — and the release trajectory, which is the actual
+closed-loop behaviour under test, matches. Note that this trajectory is feedback
+sampled every 900 s: a float32-scale difference in pool stage at one activation shifts
+that activation's Q and therefore every stage after it, so divergence in the tail is the
+controller working, not a defect.
+
+**Scope call: no viewer leg.** M5's acceptance list has no viewer item, the Zarr
+contract is scheme-agnostic, M4 step 11 already rendered an HLLC store, and M6 signed
+the tiled reader on hardware. Frames were exported (16, manifest written) but not opened
+in Godot.
+
+`ruff` + `ruff format` clean; **228 tests green** at sign-off (the 189 above is this
+milestone's historical count)..
 
 ### HANDOFF divergences (small, deliberate)
 §7.1's sketch is followed except in three places, none contradicting §2/§3/§8:
