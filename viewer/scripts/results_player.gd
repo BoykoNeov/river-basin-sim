@@ -51,6 +51,9 @@ var _repo_root := ""
 # manifest ships one, else the M0 terrain tile.
 var _bed_img: Image = null
 var _bed_from_results := false
+# Exported bed min/max from `manifest["static"]`, to check the *imported* surface
+# against. Zero when the results ship no bed.
+var _bed_range := Vector2.ZERO
 # M0 terrain-tile geometry (the fallback surface, and nothing else).
 var _grid_w := 0
 var _grid_h := 0
@@ -287,12 +290,15 @@ func _load_results(manifest_path: String) -> void:
 	if run_bed != null:
 		_bed_img = run_bed
 		_bed_from_results = true
+		var brange: Dictionary = _manifest.get("static", {}).get("bed", {})
+		_bed_range = Vector2(float(brange.get("min", 0.0)), float(brange.get("max", 0.0)))
 		_apply_geometry(_bed_img, _res_w, _res_h, _res_dx)
 	else:
 		# Older export, or a store without a bed: fall back to the M0 tile and say so
 		# if it does not cover the run -- water over an unrelated DEM looks like a
 		# rendering bug and is really a provenance one.
 		_bed_from_results = false
+		_bed_range = Vector2.ZERO
 		_apply_geometry(_bed_img, _grid_w, _grid_h, _dx)
 		_fit_water(_res_w, _res_h, _res_dx)
 		if _res_w != _grid_w or _res_h != _grid_h or not is_equal_approx(_res_dx, _dx):
@@ -659,26 +665,56 @@ func _verify_then_quit() -> void:
 					wet += 1
 	# And that the terrain is the *run's* domain. Frames-loaded plus water-visible was
 	# always true of the tile-0 terrain the water floated over, so registration needs
-	# its own assertion: same cell count, same cell size, and a bed with real relief
-	# (an unimported terrain reads back flat, not absent).
+	# its own assertion: same cell count, same cell size, and -- the claim this whole
+	# path rests on -- an imported surface that is the *exported bed*, checked by
+	# sampling Terrain3D and bracketing it against the manifest's own min/max.
+	# (`get_height_range().x` cannot do this job: it reads 0 off an uninitialised
+	# padding texel, so its "relief" is really the maximum elevation.)
 	var registered := (_terrain != null and _terrain_w == _res_w and _terrain_h == _res_h
 		and is_equal_approx(_terrain_dx, _res_dx))
-	var relief := 0.0
-	if _terrain != null:
-		var hr: Vector2 = _terrain.data.get_height_range()
-		relief = hr.y - hr.x
-	var terrain_ok := registered and relief > 0.0
+	var sampled := _sampled_height_range()
+	var relief := sampled.y - sampled.x
+	var surface_ok := relief > 0.0
+	var against := "no exported bed"
+	if _bed_range != Vector2.ZERO:
+		# Bilinear sampling cannot leave the data range; a stale or partial import
+		# shows up as a range that does not sit inside the exported one, or collapses.
+		var tol := maxf(1e-3 * (_bed_range.y - _bed_range.x), 0.01)
+		surface_ok = (relief >= 0.5 * (_bed_range.y - _bed_range.x)
+			and sampled.x >= _bed_range.x - tol and sampled.y <= _bed_range.y + tol)
+		against = "bed %.1f..%.1f m" % [_bed_range.x, _bed_range.y]
+	var terrain_ok := registered and surface_ok
 	if not terrain_ok:
-		push_error("River Basin viewer: terrain %dx%d @ %.2fm does not match results "
-			% [_terrain_w, _terrain_h, _terrain_dx]
-			+ "%dx%d @ %.2fm (relief %.1f m, bed_from_results=%s)"
-			% [_res_w, _res_h, _res_dx, relief, _bed_from_results])
+		push_error("River Basin viewer: terrain %dx%d @ %.2fm sampled %.1f..%.1f m does "
+			% [_terrain_w, _terrain_h, _terrain_dx, sampled.x, sampled.y]
+			+ "not match results %dx%d @ %.2fm / %s (bed_from_results=%s)"
+			% [_res_w, _res_h, _res_dx, against, _bed_from_results])
 	var pass_all := ok and wet > 0 and terrain_ok
 	print("River Basin viewer: headless verify %s (frames=%d, wet_samples=%d, "
 		% ["OK" if pass_all else "FAIL", _frames.size(), wet]
-		+ "terrain=%dx%d @ %.2fm relief=%.0fm run_bed=%s)"
-		% [_terrain_w, _terrain_h, _terrain_dx, relief, _bed_from_results])
+		+ "terrain=%dx%d @ %.2fm sampled %.1f..%.1f m vs %s, run_bed=%s)"
+		% [_terrain_w, _terrain_h, _terrain_dx, sampled.x, sampled.y, against,
+			_bed_from_results])
 	get_tree().quit(0 if pass_all else 1)
+
+
+func _sampled_height_range() -> Vector2:
+	## Min/max of the *imported* surface, sampled on a coarse grid. Trustworthy where
+	## `get_height_range()` is not: that one includes an uninitialised region-padding
+	## texel, which reads 0 and turns any "relief" derived from it into the maximum.
+	if _terrain == null:
+		return Vector2.ZERO
+	var lo := INF
+	var hi := -INF
+	var step := maxi(1, mini(_terrain_w, _terrain_h) / 96)
+	for iy in range(0, _terrain_h, step):
+		for ix in range(0, _terrain_w, step):
+			var hv: float = _terrain.data.get_height(
+				Vector3(ix * _terrain_dx, 0.0, iy * _terrain_dx))
+			if not is_nan(hv):
+				lo = minf(lo, hv)
+				hi = maxf(hi, hv)
+	return Vector2.ZERO if lo > hi else Vector2(lo, hi)
 
 
 func _screenshot_then_quit(path: String) -> void:

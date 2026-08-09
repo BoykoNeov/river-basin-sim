@@ -81,8 +81,22 @@ the headless check passed on the frame that rendered nothing.
 
 - **`--rbverify` now gates registration.** It previously asserted frames-loaded +
   water-visible, both of which were true of the broken composite. It now also asserts
-  the terrain's cell count and cell size equal the results grid's and that the bed has
-  real relief: `terrain=768x768 @ 100.00m relief=260m run_bed=true`.
+  that the terrain's cell count and cell size equal the results grid's **and that the
+  imported surface is the exported bed** — Terrain3D is sampled and its range bracketed
+  against `manifest["static"]["bed"]`, which catches a stale or partial import, not just
+  an absent one:
+
+  ```
+  terrain=768x768 @ 100.00m sampled 86.4..260.0 m vs bed 85.0..260.0 m, run_bed=true
+  ```
+
+  The sampling is deliberate: `get_height_range().x` reads `0` off an uninitialised
+  region-padding texel (a known Terrain3D quirk, already noted in `terrain_loader.gd`),
+  so any "relief" derived from it is really the *maximum elevation* — 260 m on a basin
+  whose true relief is 175 m. **The gate has teeth**: strip `static` from a manifest and
+  the tile-0 fallback fails it, exit 1, because a 1024² @ 28.15 m terrain under a
+  768² @ 100 m run *is* non-registration. That is the intended verdict for a legacy
+  export, not a regression — re-export the frames.
 - **`reach_basin.toml` on the 5090** (the mosaic scenario, re-run): mass **1.60e-07**,
   unchanged from the M6 sign-off, and `--rbshot` renders the whole 76.8 km basin with
   the channel traced down the valley and the storm sheet across it — the water ends

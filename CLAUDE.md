@@ -83,8 +83,11 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   fitting terrain, water plane, `bed_tex` (the shader lifts `η = bed + depth`, so the
   wrong bed was mis-lifting the surface, not just the backdrop) and camera together.
   The M0 tile stays as the pre-run/legacy fallback and **warns** when it does not cover
-  the run. **Validated:** `--rbverify` now gates registration (768x768 @ 100.00m,
-  relief 260 m, `run_bed=true`) — the old check passed on the broken composite;
+  the run. **Validated:** `--rbverify` now gates registration — same grid, same `dx`,
+  and the *imported* surface sampled and bracketed against the exported bed
+  (768x768 @ 100.00m, sampled 86.4..260.0 m vs bed 85.0..260.0 m) — where the old
+  check passed on the broken composite; note `get_height_range().x` reads 0 off a
+  padding texel, so it cannot be used for this (its "relief" is the max elevation);
   `reach_basin` re-run on the 5090 at mass **1.60e-07** (unchanged) renders the whole
   76.8 km basin; the M2 demo is unchanged and `--rblaunch` reaches `done` at 2.59e-08.
   **241 tests green.** Carried: the shader still lifts a sub-grid channel by
