@@ -31,7 +31,7 @@ import math
 
 import warp as wp
 
-from solver.core import sources
+from solver.core import sediment, sources
 from solver.core.boundaries import apply_closed_bc, apply_open_outflow
 from solver.core.channels import (
     channel_flow_depth,
@@ -577,6 +577,12 @@ def step(
     recombined into the same total ``qx``/``qy`` continuity already reads. Unarmed,
     none of that code is launched, so pre-M6 runs are bitwise-identical.
 
+    ``state.sediment`` (M7, :mod:`solver.core.sediment`) adds one launch per axis
+    between the limiter and continuity, integrating the bedload transport the slow
+    clock will later apply to the bed (:mod:`solver.processes.morphology`). It reads
+    the post-limiter faces and does not write any field this step goes on to use, so
+    the water is unaffected; unarmed, nothing is launched.
+
     ``limit`` enables the per-cell donor limiter that keeps depths non-negative
     when the scheme is pushed out of regime (steep thin-sheet flow). It is
     inactive (``beta == 1``) whenever no cell is over-drained, so it does not
@@ -670,6 +676,15 @@ def step(
                     inputs=[state.qy, chan.qy_ch, chan.qy_fp, state.beta],
                     device=state.device,
                 )
+
+    # M7 morphology: the bedload transport integral is accumulated **here and
+    # nowhere else** -- after the limiter, so `q_s` sees the discharge that actually
+    # moved water (in steep cells the donor limiter rescales it hard), and before
+    # continuity, so `eta` is still the surface those fluxes were computed from.
+    # Driven off `state.sediment` like every other optional physics on this path;
+    # unarmed, nothing is launched and the run is bitwise the M6 one.
+    if state.sediment is not None:
+        sediment.accumulate_transport(state, dt)
 
     # Areal sources: compensated when armed (solver.core.sources). Continuity then
     # carries no rain of its own -- the source add belongs to the Kahan kernel, which

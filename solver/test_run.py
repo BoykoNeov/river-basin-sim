@@ -250,20 +250,43 @@ def test_datum_shift_is_recorded_and_the_store_keeps_true_elevations(tmp_path):
     assert np.allclose(ds["bed"].values, bed)  # stored un-shifted
 
 
-def test_a_sediment_scenario_is_refused_until_morphology_is_wired(tmp_path):
-    """M7 step 1 parses [sediment]; the run loop refuses it until step 5.
+def test_a_sediment_scenario_runs_and_records_what_its_slow_clock_did(tmp_path):
+    """M7 step 5: [sediment] now *runs* -- the inverse of the refusal it replaces.
 
-    Without this the intervening commits would run a morphology scenario as a plain
-    flood run and report success -- exactly the silent under-delivery the config
-    scope gate exists to prevent. Delete alongside the guard in run_simulation when
-    solver/processes/morphology.py lands.
+    The run-loop half of the milestone in one assertion: the scenario is accepted,
+    the morphology process is built and scheduled on its own cadence, and the store
+    is self-describing about it -- the static configuration in ``sediment`` and the
+    activation history in ``morphology``, beside the reservoir's release series for
+    the same reason. The ``bed_change`` *field* is build step 7; this is the record
+    of the activations that will produce it.
+
+    Rain over a bowl, so there is real flow to transport with, and the water mass
+    gate must stay green **with the bed moving** -- "the bed update quietly ate
+    water" is precisely the failure this milestone can produce.
     """
     scn = Scenario(
-        dx=20.0, end_time=60.0, output_every=30.0, sediment_law="mpm", sediment_d50_m=0.008
+        dx=20.0,
+        end_time=600.0,
+        output_every=300.0,
+        dt_max=5.0,
+        rain_mm_hr=120.0,
+        rain_duration=600.0,
+        sediment_law="mpm",
+        sediment_d50_m=0.002,
+        sediment_interval_s=150.0,
     )
     assert scn.has_sediment
-    with pytest.raises(NotImplementedError, match="M7 build step 5"):
-        run_simulation(scn, _bowl(16, 16), tmp_path / "s.zarr", device="cpu", verbose=False)
+    ledger = run_simulation(scn, _bowl(16, 16), tmp_path / "s.zarr", device="cpu", verbose=False)
+    assert ledger.max_rel_error < MASS_GATE
+
+    ds = xr.open_zarr(tmp_path / "s.zarr", consolidated=False)
+    assert ds.attrs["sediment"]["law"] == "mpm"
+    assert ds.attrs["sediment"]["interval_s"] == 150.0
+    series = ds.attrs["morphology"]
+    assert [r["time"] for r in series] == [150.0, 300.0, 450.0, 600.0]
+    assert any(r["applied_m3"] != 0.0 for r in series), "no sediment moved at all"
+    # Unbounded bed: nothing was refused, so the ledger is owed nothing (step 6).
+    assert all(r["banked_m3"] == 0.0 for r in series)
 
 
 def test_field_memory_counts_the_two_widths_separately_for_morphology():

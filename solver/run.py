@@ -27,6 +27,7 @@ from solver.core.datum import resolve_datum, shift_bed, unshift_bed
 from solver.core.grid import Grid
 from solver.core.massbalance import MASS_GATE, MassLedger
 from solver.core.schemes import get_scheme
+from solver.core.sediment import arm_sediment
 from solver.core.state import State
 from solver.io.coarsen import (
     block_reduce,
@@ -43,6 +44,7 @@ from solver.io.status import StatusWriter
 from solver.io.viewer_export import export_frames
 from solver.io.zarr_writer import ZarrWriter
 from solver.processes.inflow import InflowInjector
+from solver.processes.morphology import MorphologyProcess, bed_change_bounds
 from solver.processes.reservoir import apply_barriers, build_operators
 from solver.scheduler import EPS_T, MultiRateScheduler
 
@@ -164,18 +166,6 @@ def run_simulation(
     # the scheme-owned compute_dt/step pair. LI is the default coverage scheme;
     # hllc_fv is the M4 fidelity option (raises NotImplementedError until wired up).
     scheme = get_scheme(scenario.scheme)
-    # M7 build step 1 lands the [sediment] contract; nothing consumes it until the
-    # morphology process arrives at step 5. Refuse loudly in between, rather than
-    # running a morphology scenario as a plain flood run -- the same shape as a
-    # known-but-unwired scheme (solver.core.schemes), and the reason config.py
-    # parses the full schema instead of ignoring what it cannot yet honour.
-    # Delete this guard when solver/processes/morphology.py is wired in.
-    if scenario.has_sediment:
-        raise NotImplementedError(
-            "[sediment] parses but morphology is not wired into the run loop yet "
-            "(M7 build step 5, solver/processes/morphology.py). Drop the [sediment] "
-            "table to run this scenario as a flood run."
-        )
     # Resolution choice (M6, solver.io.coarsen): fields are authored at tile
     # resolution, so they are loaded on the *source* grid and aggregated once,
     # before any water moves -- one uniform grid per run, no resolution interface.
@@ -237,6 +227,39 @@ def run_simulation(
         if verbose:
             print(f"  channels      : {channels.summary()}")
 
+    # --- M7 morphology ----------------------------------------------------------
+    # Armed after the bed is final (barriers applied, State built): `arm_sediment`
+    # captures `z0` here and the bed is *rebuilt* from it at every activation, so
+    # arming earlier would delete every dam at the first one.
+    morphology = None
+    if scenario.has_sediment:
+        # d50 aggregates by mean (a grain size is a per-cell property, not a volume);
+        # so does an alluvium thickness, where the mean *is* volume-preserving --
+        # unlike M6's channel width, which needs max (solver.io.coarsen).
+        d50 = _field(scenario.sediment_d50_field, scenario.sediment_d50_m, "d50")
+        arm_sediment(st, d50, scenario.sediment_porosity)
+        thickness = None
+        if scenario.has_alluvium_floor:
+            # Field wins, as everywhere in [parameters] -- and it must, because a
+            # field-backed floor leaves the scalar at its unused 0.0 fallback, which
+            # read on its own would say "bedrock everywhere" and freeze the bed with
+            # no error anywhere (solver.io.config.Scenario).
+            thickness = _field(
+                scenario.alluvium_thickness_field,
+                scenario.alluvium_thickness_m or 0.0,
+                "alluvium thickness",
+            )
+        # A dam is engineered, not alluvial: freeze every structure cell, or the flow
+        # can scour one out from under its own release rule (M7 plan §1.5). What the
+        # freeze refuses is banked for the sediment ledger, never discarded.
+        frozen = [cell for s in elev.structures for cell in s.cells]
+        dz_lo, dz_hi = bed_change_bounds(
+            grid.shape, alluvium_thickness=thickness, frozen_cells=frozen
+        )
+        morphology = MorphologyProcess(st, scenario.sediment_interval_s, dz_lo=dz_lo, dz_hi=dz_hi)
+        if verbose:
+            print(f"  morphology    : {morphology.summary()}")
+
     # --- M3 sources/sinks -------------------------------------------------------
     # Infiltration (constant-rate sink, mm/hr -> m/s); armed only when nonzero.
     infil = _field(scenario.infiltration_field, scenario.infiltration_mm_hr, "infiltration")
@@ -292,6 +315,8 @@ def run_simulation(
     }
     if channels is not None:
         attrs["channels"] = channels.as_attrs()
+    if morphology is not None:
+        attrs["sediment"] = {"law": scenario.sediment_law, **morphology.as_attrs()}
     if domain is not None:
         # How the domain was assembled from the tile set (M6): origin, tile count and
         # any uncovered cells, so a stored result says which patch of the world it is.
@@ -316,7 +341,14 @@ def run_simulation(
         end_time=scenario.end_time,
         output_every=scenario.output_every,
         events=[scenario.rain_duration, *inflow_events, *scenario.stage_events],
-        processes=[r.as_slow_process() for r in reservoirs],
+        # Order is the order they advance in on a tick both are due (M5's reservoirs
+        # first): a release rule reads a stage `z + h` and should read it off the bed
+        # the interval's water actually flowed over, not one morphology is about to
+        # move underneath it.
+        processes=[
+            *(r.as_slow_process() for r in reservoirs),
+            *([morphology.as_slow_process()] if morphology is not None else []),
+        ],
     )
 
     for tick in sched.ticks(
@@ -362,6 +394,11 @@ def run_simulation(
                 )
 
     final_attrs = dict(ledger.as_attrs())
+    if morphology is not None:
+        # The bed-change history beside the mass series, for the same reason: a
+        # stored run says what its slow clock did. The bed_change *field* is M7
+        # build step 7; this is the record of the activations that produced it.
+        final_attrs["morphology"] = morphology.series
     if reservoirs:
         # The release history is the evidence the slow clock actually ran; it lives
         # with the mass series so a stored run is self-describing (§7.2).

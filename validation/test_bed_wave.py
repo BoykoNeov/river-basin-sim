@@ -21,15 +21,21 @@ Three findings from sizing it, each now asserted rather than remembered:
 * the 900 s activation interval that follows the reservoir would move this bed wave
   3.1 cells per activation, which is why the fixture carries its own.
 
-**The harness here is provisional.** ``_drive`` hand-wires what
-``solver/processes/morphology.py`` will own at build step 5: accumulate the transport
-integral every fast step, apply Exner and rebuild the bed at each activation. It
-accumulates *after* :func:`solver.core.local_inertial.step` returns, which for the
-local-inertial scheme is **the same inputs** as the in-``step`` hook step 5 will
-install -- ``eta`` is computed once at the top of the step and never rewritten, the
-face discharges are final after the limiter, and the post-continuity sinks touch only
-``h``. So the numbers recorded here transfer unchanged, and step 5 owes exactly one
-assertion that the equivalence still holds.
+**The harness is no longer provisional.** ``_drive`` was written at build step 3
+hand-wiring what :mod:`solver.processes.morphology` would own at step 5 -- accumulate
+every fast step, apply Exner and rebuild the bed at each activation -- and
+accumulating *after* :func:`solver.core.local_inertial.step` returned. Step 5 landed
+the real thing and this file now drives it: the accumulation happens **inside**
+``step`` (off ``state.sediment``, after the limiter and before continuity) and the
+activation is ``MorphologyProcess.advance``. Every number recorded below reproduced
+bit for bit across that change, which is what the equivalence held out for:
+``test_the_in_step_hook_is_the_same_inputs_as_accumulating_after_the_step``
+(:mod:`solver.processes.test_morphology`) asserts the property directly, and this
+fixture is the evidence that it transfers to a measured result.
+
+The warm-up needs no enable flag either, and that is a consequence of the same
+design: the state is armed **at** the warm-up boundary, where ``z0`` is still the
+pristine bed because nothing has moved it, and morphology begins with the next step.
 """
 
 from __future__ import annotations
@@ -42,15 +48,9 @@ import warp as wp
 
 from solver.core.local_inertial import compute_dt, step
 from solver.core.massbalance import MASS_GATE, MassLedger
-from solver.core.sediment import (
-    accumulate_qs_x,
-    arm_sediment,
-    exner_update,
-    morphological_courant,
-    rebuild_bed,
-    shields_from_flow,
-)
+from solver.core.sediment import arm_sediment, morphological_courant, shields_from_flow
 from solver.processes.inflow import InflowInjector
+from solver.processes.morphology import MorphologyProcess
 from validation.bedwave import BedWave
 
 wp.init()
@@ -75,6 +75,7 @@ class Run:
     steps: int
     activations: int
     t: float
+    courant: float = 0.0  # largest morphological Courant number the process measured
 
     def median_depth(self, where: slice) -> float:
         return float(np.median(self.depth[where]))
@@ -84,28 +85,22 @@ class Run:
 
 
 def _drive(fx: BedWave, *, morphology: bool = True, end_s: float | None = None) -> Run:
-    """Run the fixture: local-inertial water, plus (optionally) the M7 kernels.
+    """Run the fixture: local-inertial water, plus (optionally) the M7 morphology.
 
-    Provisional -- see the module docstring. ``end_s`` stops early (the design-point
-    check needs only the warm-up and a few intervals past it); ``morphology=False``
-    leaves the bed untouched, and takes no notice of activation boundaries because
-    there are none.
+    ``end_s`` stops early (the design-point check needs only the warm-up and a few
+    intervals past it); ``morphology=False`` never arms the state, so nothing is
+    launched, the bed is untouched, and there are no activation boundaries to land on.
+
+    The bed update is :class:`~solver.processes.morphology.MorphologyProcess` driven
+    by hand rather than by the scheduler, because the fixture's water-only warm-up is
+    not a scheduler concept -- the sync-point algebra itself is M5's and is tested
+    there. What is *not* hand-wired any more is the physics: the transport integral
+    accumulates inside ``step`` and the activation is one ``advance`` call.
     """
-    nx = fx.nx
     st = fx.state(DEV)
     inj = InflowInjector(fx.inflows(), st.grid, DEV)
     ledger = MassLedger.from_state(st)
-
-    # Every accumulator comes from the arming path (M7 build step 4), not from
-    # hand-rolled allocations: `z0` is `state.z` at arm time, and one row means
-    # there are no interior y-faces, so the y integral is allocated and stays zero
-    # rather than being special-cased. The **bounds** are deliberately not part of
-    # it -- they are the fixture's own equilibrium sediment BC, which is exactly the
-    # case `[sediment]` cannot express and step 5 must therefore accept whole.
-    sed = arm_sediment(st, fx.d50, fx.porosity)
-    lo_h, hi_h = fx.bed_bounds()
-    dz_lo = wp.array(lo_h, dtype=wp.float32, device=DEV)
-    dz_hi = wp.array(hi_h, dtype=wp.float32, device=DEV)
+    morph: MorphologyProcess | None = None
 
     end = fx.end_time_s if end_s is None else float(end_s)
     t, steps, acts = 0.0, 0, 0
@@ -127,55 +122,40 @@ def _drive(fx: BedWave, *, morphology: bool = True, end_s: float | None = None) 
             dt = edge - t
         assert dt > 0.0, f"harness made no progress at t={t} (edge={edge}, acts={acts})"
 
-        transporting = morphology and t >= fx.warmup_s - _EPS
+        # Arm *at* the warm-up boundary: `z0` is captured here and is still the
+        # pristine bed, so morphology begins with the very next step and every
+        # earlier step ran the untouched M6 kernels. The **bounds** are handed in
+        # whole -- they are the fixture's equilibrium sediment BC, which is exactly
+        # the case `[sediment]` cannot express (validation.bedwave, M7 plan §2).
+        if morphology and morph is None and t >= fx.warmup_s - _EPS:
+            arm_sediment(st, fx.d50, fx.porosity)
+            lo_h, hi_h = fx.bed_bounds()
+            morph = MorphologyProcess(st, fx.interval_s, dz_lo=lo_h, dz_hi=hi_h)
+
         ledger.add_inflow(inj.apply(st, t, dt))
-        step(st, dt=dt)
+        step(st, dt=dt)  # accumulates the transport integral in-step once armed
         steps += 1
-        if transporting:
-            # Post-`step` == the step-5 in-`step` hook for LI: post-limiter face
-            # discharge, `eta` still the one those fluxes were computed from.
-            wp.launch(
-                accumulate_qs_x,
-                dim=(1, nx - 1),
-                inputs=[
-                    st.qx,
-                    st.eta,
-                    st.z,
-                    st.n,
-                    sed.d50,
-                    float(dt),
-                    sed.qs_int_x,
-                    sed.qs_comp_x,
-                ],
-                device=DEV,
-            )
         t += dt
 
-        if morphology and t >= fx.warmup_s + (acts + 1) * fx.interval_s - _EPS:
-            wp.launch(
-                exner_update,
-                dim=(1, nx),
-                inputs=[
-                    sed.qs_int_x, sed.qs_int_y, dz_lo, dz_hi, float(fx.dx),
-                    sed.inv_one_minus_p, sed.dz_cum, sed.dz_unapplied,
-                ],
-                device=DEV,
-            )  # fmt: skip
-            wp.launch(rebuild_bed, dim=(1, nx), inputs=[sed.z0, sed.dz_cum, st.z], device=DEV)
-            sed.clear_integral()
+        if morph is not None and t >= fx.warmup_s + (acts + 1) * fx.interval_s - _EPS:
+            morph.advance(t, fx.interval_s)
             acts += 1
     ledger.record(st, t)
 
+    sed = st.sediment
     return Run(
         bed=st.z.numpy()[0].astype(np.float64),
         depth=st.h.numpy()[0].astype(np.float64),
         face_q=st.qx.numpy()[0].astype(np.float64),
-        dz_cum=sed.bed_change_numpy()[0],
-        banked_m=float(sed.dz_unapplied.numpy().sum()),
+        dz_cum=(
+            sed.bed_change_numpy()[0] if sed is not None else np.zeros(fx.nx, dtype=np.float64)
+        ),
+        banked_m=0.0 if sed is None else float(sed.dz_unapplied.numpy().sum()),
         mass_rel_error=ledger.max_rel_error,
         steps=steps,
         activations=acts,
         t=t,
+        courant=0.0 if morph is None else morph.peak_courant,
     )
 
 
@@ -292,11 +272,20 @@ def test_the_bump_migrates_at_the_analytical_bed_wave_celerity():
         f"(retained {mig.amplitude_retained:.2f}); background outside the window "
         f"{1000 * mig.background_m:.2f} mm (signal/background {mig.signal_to_background:.1f})\n"
         f"  bed change {1000 * res.dz_cum.min():+.2f} .. {1000 * res.dz_cum.max():+.2f} mm; "
-        f"banked {res.banked_m:.4f} m; mass {res.mass_rel_error:.2e}"
+        f"banked {res.banked_m:.4f} m; mass {res.mass_rel_error:.2e}\n"
+        f"  morphological Courant: measured peak {res.courant:.3f} vs {fx.courant:.3f} designed"
     )
 
     assert res.mass_rel_error < MASS_GATE
     assert res.activations == fx.activations
+    # The process measures its own morphological Courant number from the flow it
+    # really has (solver.core.sediment.celerity_field), so this is a cross-check of
+    # that diagnostic against the fixture's independently derived `c_b`: the peak is
+    # over every cell, including the bump crest where the bed is locally faster, so
+    # it may sit above the design value -- but not by a factor. Gating a *scenario*
+    # on it is build step 8.
+    assert 0.5 * fx.courant < res.courant < 2.0 * fx.courant
+    assert res.courant < 0.25, "(7) the bed wave crosses too much of a cell per activation"
     # The wave is still a wave, and it is the thing being measured.
     assert 0.5 < mig.amplitude_retained < 1.05
     assert mig.signal_to_background > 5.0

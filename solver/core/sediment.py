@@ -424,6 +424,75 @@ def rebuild_bed(
     z[i, j] = wp.float32(wp.float64(z0[i, j]) + dz_cum[i, j])
 
 
+def accumulate_transport(state, dt: float) -> None:
+    """Integrate ``q_s*dt`` onto every interior face -- the whole fast-step cost of M7.
+
+    **Where this is called from is not a free choice** (see the module docstring):
+    :func:`solver.core.local_inertial.step` calls it after ``limit_qx``/``limit_qy``
+    and before ``update_h``, because that is the only point where the face discharge
+    is the water that actually moved *and* ``eta`` is still the surface those fluxes
+    were computed from. It is driven off ``state.sediment`` exactly as the scheme
+    drives its other optional physics off ``state.channels`` / ``state.rain`` /
+    ``state.infil``, so an unarmed run launches nothing and stays bitwise identical.
+
+    Dispatch mirrors the momentum update one-for-one: with channels armed each face
+    carries a channel component (its own flow depth and hydraulic radius ``A/P``) plus
+    the M1 floodplain component, recombined by area fraction. The interior-face
+    ``nx > 1`` / ``ny > 1`` guards the kernels need are owed by this function, and a
+    single-row fixture (``ny == 1``) therefore leaves the y integral allocated and
+    zero rather than being special-cased anywhere else.
+    """
+    sed = state.sediment
+    if sed is None:
+        raise SedimentError("accumulate_transport requires arm_sediment(); nothing is armed")
+    g = state.grid
+    chan = state.channels
+    dtf = float(dt)
+    if chan is None:
+        if g.nx > 1:
+            wp.launch(
+                accumulate_qs_x,
+                dim=(g.ny, g.nx - 1),
+                inputs=[
+                    state.qx, state.eta, state.z, state.n, sed.d50, dtf,
+                    sed.qs_int_x, sed.qs_comp_x,
+                ],
+                device=state.device,
+            )  # fmt: skip
+        if g.ny > 1:
+            wp.launch(
+                accumulate_qs_y,
+                dim=(g.ny - 1, g.nx),
+                inputs=[
+                    state.qy, state.eta, state.z, state.n, sed.d50, dtf,
+                    sed.qs_int_y, sed.qs_comp_y,
+                ],
+                device=state.device,
+            )  # fmt: skip
+    else:
+        dxf = float(g.dx)
+        if g.nx > 1:
+            wp.launch(
+                accumulate_qs_x_channels,
+                dim=(g.ny, g.nx - 1),
+                inputs=[
+                    chan.qx_ch, chan.qx_fp, state.eta, state.z, state.n, sed.d50,
+                    chan.w, chan.d, chan.n, dxf, dtf, sed.qs_int_x, sed.qs_comp_x,
+                ],
+                device=state.device,
+            )  # fmt: skip
+        if g.ny > 1:
+            wp.launch(
+                accumulate_qs_y_channels,
+                dim=(g.ny - 1, g.nx),
+                inputs=[
+                    chan.qy_ch, chan.qy_fp, state.eta, state.z, state.n, sed.d50,
+                    chan.w, chan.d, chan.n, dxf, dtf, sed.qs_int_y, sed.qs_comp_y,
+                ],
+                device=state.device,
+            )  # fmt: skip
+
+
 def clear_transport_integral(qs_int_x: wp.array, qs_int_y: wp.array) -> None:
     """Zero the transport integrals after an activation has consumed them.
 
@@ -725,3 +794,75 @@ def morphological_courant(celerity: float, interval_s: float, dx: float) -> floa
     it bites.
     """
     return float(celerity) * float(interval_s) / float(dx)
+
+
+def celerity_field(state) -> np.ndarray:
+    """Per-cell bed-wave celerity (m/s) from the flow the state is carrying *now*.
+
+    :func:`bed_celerity` evaluated cell by cell, so a morphology run can report the
+    morphological Courant number it **achieved** over an interval
+    (:mod:`solver.processes.morphology`) rather than one assumed from a nominal flow.
+    There is no useful pre-run number to compute instead: at ``t = 0`` a scenario
+    usually has no flow at all, and a Courant number derived from a flow that has not
+    happened would be a reassurance rather than a warning.
+
+    Host-side numpy over a few field copies, called once per *activation* (900 s of
+    simulated time by default), so it is noise beside the fast loop -- and it is
+    deliberately not a kernel, because nothing in the physics reads it.
+
+    **A channel cell is evaluated as a channel**, with the channel component's own
+    discharge, its column depth, its roughness and the ``w/dx`` conveyance fraction
+    that spreads a per-channel-width flux over the whole cell. Reading those cells
+    with the floodplain form would under-report the celerity by orders of magnitude
+    exactly where the transport is, which for a warning diagnostic is the dangerous
+    direction to be wrong in.
+
+    Dry cells, cells with no grain size and cells with no flow return exactly zero.
+    """
+    sed = state.sediment
+    if sed is None:
+        raise SedimentError("celerity_field requires arm_sediment(); nothing is armed")
+    g = state.grid
+    h = state.h.numpy().astype(np.float64)
+    n = state.n.numpy().astype(np.float64)
+    d50 = sed.d50.numpy().astype(np.float64)
+    p = sed.porosity
+
+    def centred(qa: np.ndarray, qb: np.ndarray) -> np.ndarray:
+        """Cell-centred flow magnitude from the two pairs of bounding faces."""
+        return np.hypot(0.5 * (qa[:, :-1] + qa[:, 1:]), 0.5 * (qb[:-1, :] + qb[1:, :]))
+
+    # Guards first, so nothing below divides by a dry depth or a zero grain size; the
+    # mask decides what survives and the substituted values never reach the output.
+    grain_ok = d50 > 0.0
+    d50_safe = np.where(grain_ok, d50, 1.0)
+    q = centred(state.qx.numpy().astype(np.float64), state.qy.numpy().astype(np.float64))
+    wet = (h >= H_DRY) & grain_ok & (q > 0.0)
+    c_fp = np.where(
+        wet, bed_celerity(np.where(wet, q, 0.0), np.where(wet, h, 1.0), n, d50_safe, p), 0.0
+    )
+
+    chan = state.channels
+    if chan is None:
+        return c_fp
+
+    w = chan.w.numpy().astype(np.float64)
+    d = chan.d.numpy().astype(np.float64)
+    has = (w > 0.0) & (d > 0.0)
+    w_safe = np.where(has, w, 1.0)
+    # The M6 storage curve, host-side (solver.core.channels.column_depth): below bank
+    # full the cell's water is all in the channel and stands dx/w deeper than the mean.
+    h_bf = w_safe * d / g.dx
+    h_col = np.where(h <= h_bf, h * g.dx / w_safe, d + (h - h_bf))
+    q_ch = centred(chan.qx_ch.numpy().astype(np.float64), chan.qy_ch.numpy().astype(np.float64))
+    wet_ch = has & (h_col >= H_DRY) & grain_ok & (q_ch > 0.0)
+    c_ch = bed_celerity(
+        np.where(wet_ch, q_ch, 0.0),
+        np.where(wet_ch, h_col, 1.0),
+        chan.n.numpy().astype(np.float64),
+        d50_safe,
+        p,
+        width=w_safe,
+        dx=g.dx,
+    )
+    return np.where(has, np.where(wet_ch, c_ch, 0.0), c_fp)

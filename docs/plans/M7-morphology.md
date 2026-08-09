@@ -402,8 +402,7 @@ sediment.
 5. **`solver/processes/morphology.py`** — the slow process, modelled on
    `reservoir.py`: constructed after `State`, exposes `as_slow_process()`,
    `advance(t, dt_slow)` returns a record, `series` lands in `.zattrs`. Plus the
-   per-fast-step accumulation hook in `run.py` (beside the inflow injector, which
-   is already wired that way). Two requirements step 3 hands it:
+   per-fast-step accumulation hook. Two requirements step 3 hands it:
    - **It must accept explicit `dz_lo`/`dz_hi` arrays (or a frozen-cell mask) at
      construction**, not only bounds derived from `[sediment]`. `alluvium_thickness
      = 0` pins the floor and leaves the ceiling open, so nothing in the config can
@@ -415,6 +414,62 @@ sediment.
      and never rewritten, the faces are final after the limiter, and the
      post-continuity sinks touch only `h`. A future reordering would silently move
      the gate.
+
+   **Done** — `MorphologyProcess` + `bed_change_bounds`, `sediment.accumulate_transport`,
+   and the run-loop wiring; the step-1 `NotImplementedError` is inverted into an
+   end-to-end run. Six decisions worth naming:
+   - **The hook is *not* in `run.py`, and this bullet's own text was the weaker
+     statement.** "Beside the inflow injector" points at code that runs *before*
+     `scheme.step` — the wrong anchor entirely for reading post-limiter faces. Step 2's
+     committed `sediment.py` docstring is the later and more specific instruction and
+     it names the place: after `limit_qx`/`limit_qy`, before `update_h`. So the
+     accumulation is driven **off `state.sediment` inside `local_inertial.step`**, the
+     sixth optional branch on a path that already reads `channels`/`h_comp`/`rain`/
+     `infil`/`open_edges` the same way. No signature change, nothing LI-only leaking
+     through the `scheme.step` dispatch seam, and the bitwise invariant stays
+     *structural* — unarmed means `state.sediment is None` and no kernel is launched.
+     `run.py` still owns constructing the process and driving the activation half.
+   - **The equivalence is asserted twice, and the second one is the evidence.**
+     Directly, in `test_morphology`, in-step vs the step-3 pattern (accumulators
+     allocated, then hidden from `step`) over 12 steps with **channels + rain +
+     infiltration + an open boundary** all armed — precisely the tail kernels that
+     could falsify it — bit-identical on both arms, plus the depth field bitwise equal
+     to a run that never armed morphology. And empirically, by repointing the step-3
+     fixture at the real process: **every recorded number reproduces bit for bit**
+     (xcorr 0.993 c_b, crest 1.004, centroid 0.942, retention 0.72, signal/background
+     29.7, free ends −1.1226 / +0.9071 m and a 1.9439 m reach, pinned ends exactly 0).
+     The write-sets were *read* before the test was written, not assumed:
+     `update_h`, `sources.*`, `apply_infiltration` and `apply_open_outflow` touch only
+     `h`, `h_comp` and `loss_cum`.
+   - **The fixture's warm-up flag disappeared rather than moving.** State-armed
+     accumulation means "start transporting now" is spelled `arm_sediment` *at* the
+     warm-up boundary, where `z0` is still pristine because nothing has moved the bed.
+     One less enable to keep in sync with a `transporting` predicate.
+   - **The morphological Courant number is measured, not assumed** —
+     `sediment.celerity_field` evaluates `bed_celerity` per cell from the flow the
+     state actually has (channel cells through the channel form: its own discharge,
+     column depth and `w/dx` fraction, because reading them as floodplain would
+     under-report by orders of magnitude exactly where the transport is), and every
+     `BedChangeRecord` carries the peak. There is deliberately **no pre-run print**:
+     at `t = 0` a scenario usually has no flow, and a Courant number from a flow that
+     has not happened is a reassurance, not a warning. Gating it is step 8. First
+     cross-check: the fixture measures **0.163 against its independently derived
+     0.155**, the 5% being the bump crest, where the bed really is locally faster.
+   - **Two obligations that were easy to drop, and one silent-failure trap.**
+     Structure cells are frozen (`dz_lo == dz_hi == 0`) from `elev.structures`, or the
+     flow scours a dam out from under its own release rule — §1.5, and not restated in
+     this bullet. And the alluvium thickness must be read **field before scalar**: a
+     field-backed floor leaves `alluvium_thickness_m` at the unused `0.0` fallback that
+     `load_field` needs, which read on its own says "bedrock everywhere" and freezes
+     the whole bed with no error anywhere.
+   - **`eta` is refreshed with the bed, and reservoirs advance first.** The next fast
+     step recomputes `eta` anyway, so the extra launch changes no physics — but a state
+     whose `eta` disagrees with its own `z` is a trap for anything reading between
+     ticks. On a tick where both processes are due, the release rule runs first: it
+     reads a stage `z + h` and should read it off the bed the interval's water actually
+     flowed over.
+
+   **303 tests green.**
 6. **`SedimentLedger`** in `massbalance.py` or beside it — same shape as
    `MassLedger`, same Kahan f64 accumulators, same causal peak floor, its own
    relative gate. Masked-cell and clamped transport bank here.
