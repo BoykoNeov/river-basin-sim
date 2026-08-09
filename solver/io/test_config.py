@@ -494,3 +494,96 @@ def test_coarsen_parses_and_validates(tmp_path):
         text = _FULL.replace('tiles_dir = "data/tiles/demo"', f"tiles_dir = 'd'\ncoarsen = {bad}")
         with pytest.raises(ConfigError, match="coarsen"):
             load_config(_write(tmp_path, text))
+
+
+# --- M7 morphology: the [sediment] stanza (plan build step 1) -------------------
+
+_SEDIMENT = """
+[sediment]
+d50 = 0.008
+porosity = 0.35
+law = "mpm"
+interval_s = 600.0
+alluvium_thickness = 2.0
+"""
+
+
+def test_sediment_parses_every_field(tmp_path):
+    scn = load_config(_write(tmp_path, _FULL + _SEDIMENT))
+    assert scn.has_sediment
+    assert scn.sediment_law == "mpm"
+    assert scn.sediment_d50_m == 0.008
+    assert scn.sediment_d50_field is None
+    assert scn.sediment_porosity == 0.35
+    assert scn.sediment_interval_s == 600.0
+    assert scn.alluvium_thickness_m == 2.0
+    assert scn.has_alluvium_floor
+
+
+def test_no_sediment_section_means_no_morphology(tmp_path):
+    scn = load_config(_write(tmp_path, _FULL))
+    assert not scn.has_sediment
+    assert scn.sediment_law is None
+    assert not scn.has_alluvium_floor
+
+
+def test_sediment_defaults_follow_the_reservoir_cadence(tmp_path):
+    """An armed table needs only a grain size; the rest have defaults."""
+    scn = load_config(_write(tmp_path, _FULL + "\n[sediment]\nd50 = 0.01\n"))
+    assert scn.has_sediment
+    assert scn.sediment_law == "mpm"
+    assert scn.sediment_porosity == 0.4
+    assert scn.sediment_interval_s == 900.0
+    assert scn.alluvium_thickness_m is None  # unlimited alluvium, not zero thickness
+
+
+def test_sediment_fields_parse_as_paths_and_are_hashed(tmp_path):
+    text = _FULL + '\n[sediment]\nd50 = "grain.r32"\nalluvium_thickness = "allu.r32"\n'
+    scn = load_config(_write(tmp_path, text))
+    assert scn.sediment_d50_field.endswith("grain.r32")
+    assert scn.alluvium_thickness_field.endswith("allu.r32")
+    assert scn.has_alluvium_floor
+    # Provenance hashes every referenced field file (solver/io/provenance.py).
+    assert "sediment_d50" in scn.field_paths()
+    assert "alluvium_thickness" in scn.field_paths()
+
+
+def test_sediment_is_rejected_on_the_hllc_scheme(tmp_path):
+    """Morphology is local-inertial-only (M7 plan §1.4) -- loudly, naming both."""
+    text = _FULL.replace('scheme = "local_inertial"', 'scheme = "hllc_fv"') + _SEDIMENT
+    with pytest.raises(ConfigError, match="requires scheme='local_inertial'"):
+        load_config(_write(tmp_path, text))
+
+
+def test_an_armed_sediment_table_without_a_grain_size_is_rejected(tmp_path):
+    """The table arms morphology, so there is no d50 that quietly means 'off'."""
+    with pytest.raises(ConfigError, match="needs a grain size"):
+        load_config(_write(tmp_path, _FULL + "\n[sediment]\nporosity = 0.4\n"))
+    with pytest.raises(ConfigError, match="needs a grain size"):
+        load_config(_write(tmp_path, _FULL + "\n[sediment]\nd50 = 0.0\n"))
+
+
+def test_a_mistyped_sediment_key_warns_and_still_fails_loudly(tmp_path):
+    """The typo guard is why arming is table presence, not `d50 > 0`.
+
+    Unknown keys only *warn*, so arming on a positive d50 would let one mistyped
+    key turn a morphology run into a flood run with nothing raised anywhere.
+    """
+    text = _FULL + "\n[sediment]\nd_50 = 0.008\n"
+    with pytest.warns(UserWarning, match="unknown key 'd_50'"):
+        with pytest.raises(ConfigError, match="needs a grain size"):
+            load_config(_write(tmp_path, text))
+
+
+def test_sediment_scalars_are_validated(tmp_path):
+    for bad, match in (
+        ("porosity = 0.0", r"porosity must be in \(0, 1\)"),
+        ("porosity = 1.0", r"porosity must be in \(0, 1\)"),
+        ("interval_s = 0.0", "interval_s must be > 0"),
+        ("alluvium_thickness = -1.0", "alluvium_thickness must be >= 0"),
+        ('law = "engelund_hansen"', "not a transport law M7 ships"),
+        ('porosity = "wet"', r"\[sediment\] porosity must be a number"),
+    ):
+        text = _FULL + f"\n[sediment]\nd50 = 0.008\n{bad}\n"
+        with pytest.raises(ConfigError, match=match):
+            load_config(_write(tmp_path, text))

@@ -248,3 +248,19 @@ def test_datum_shift_is_recorded_and_the_store_keeps_true_elevations(tmp_path):
     ds = xr.open_zarr(tmp_path / "d.zarr", consolidated=False)
     assert ds.attrs["datum_shift_m"] == 9.0  # floor(min(bed))
     assert np.allclose(ds["bed"].values, bed)  # stored un-shifted
+
+
+def test_a_sediment_scenario_is_refused_until_morphology_is_wired(tmp_path):
+    """M7 step 1 parses [sediment]; the run loop refuses it until step 5.
+
+    Without this the intervening commits would run a morphology scenario as a plain
+    flood run and report success -- exactly the silent under-delivery the config
+    scope gate exists to prevent. Delete alongside the guard in run_simulation when
+    solver/processes/morphology.py lands.
+    """
+    scn = Scenario(
+        dx=20.0, end_time=60.0, output_every=30.0, sediment_law="mpm", sediment_d50_m=0.008
+    )
+    assert scn.has_sediment
+    with pytest.raises(NotImplementedError, match="M7 build step 5"):
+        run_simulation(scn, _bowl(16, 16), tmp_path / "s.zarr", device="cpu", verbose=False)

@@ -152,6 +152,18 @@ def run_simulation(
     # the scheme-owned compute_dt/step pair. LI is the default coverage scheme;
     # hllc_fv is the M4 fidelity option (raises NotImplementedError until wired up).
     scheme = get_scheme(scenario.scheme)
+    # M7 build step 1 lands the [sediment] contract; nothing consumes it until the
+    # morphology process arrives at step 5. Refuse loudly in between, rather than
+    # running a morphology scenario as a plain flood run -- the same shape as a
+    # known-but-unwired scheme (solver.core.schemes), and the reason config.py
+    # parses the full schema instead of ignoring what it cannot yet honour.
+    # Delete this guard when solver/processes/morphology.py is wired in.
+    if scenario.has_sediment:
+        raise NotImplementedError(
+            "[sediment] parses but morphology is not wired into the run loop yet "
+            "(M7 build step 5, solver/processes/morphology.py). Drop the [sediment] "
+            "table to run this scenario as a flood run."
+        )
     # Resolution choice (M6, solver.io.coarsen): fields are authored at tile
     # resolution, so they are loaded on the *source* grid and aggregated once,
     # before any water moves -- one uniform grid per run, no resolution interface.

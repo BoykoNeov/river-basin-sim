@@ -45,6 +45,22 @@ M6 adds: ``[grid] tiles`` (``"all"`` -- the domain is the whole tile mosaic -- o
 
 Channels are **local-inertial-only** (M6 plan §0) and rejected with ``hllc_fv``.
 
+M7 adds **morphology** -- sediment transport (Exner + transport capacity) on the
+slow clock::
+
+    [sediment]   d50 = 0.008              # m, scalar OR field path (required)
+                 porosity = 0.4           # bed porosity p, 0 < p < 1
+                 law = "mpm"              # Meyer-Peter-Mueller (the only law M7 ships)
+                 interval_s = 900.0       # slow-clock cadence -- a scheduler sync point
+                 alluvium_thickness = 2.0 # optional erodible depth, scalar OR field
+
+The **presence of the table arms morphology** (:attr:`Scenario.has_sediment`),
+which is why a ``[sediment]`` stanza without a usable ``d50`` is an error rather
+than a silent no-op: unknown keys only *warn*, so arming on ``d50 > 0`` would let
+one typo disarm the whole milestone. Sediment is **local-inertial-only** (M7 plan
+§1.4) -- morphology in a river happens in the channel, and sub-grid channels are
+LI-only -- and rejected with ``hllc_fv``, naming both.
+
 Rejected until a later milestone: temporal rainfall ``timeseries``/``storm_cells``
 (later) and the ``inflow`` boundary *type* (deferred indefinitely -- ``[[inflow]]``
 cell sources cover prescribed discharge and their mass accounting is exact).
@@ -239,6 +255,16 @@ class Structure:
         return float(self.release_max_m3_s) * min(max(frac, 0.0), 1.0)
 
 
+# Bedload transport laws M7 ships. One, deliberately: the gates (M7 plan §3) are
+# derived for the law actually implemented -- the analytical bed-wave celerity is
+# MPM's -- so a second law is an addition with its own gate, not a config flag.
+_SEDIMENT_LAWS = {"mpm"}
+# Default slow-clock cadence for the bed update. 900 s follows the reservoir, and it
+# is **provisional**: M7 plan §5 (open decision #2) wants it checked against the
+# morphological CFL on the demo before it stands as a default.
+_DEFAULT_SEDIMENT_INTERVAL_S = 900.0
+
+
 @dataclass
 class Scenario:
     """Solver run configuration (§7.1).
@@ -290,6 +316,21 @@ class Scenario:
     # None -> the channel inherits the floodplain roughness.
     channel_manning: float | None = None
     channel_manning_field: str | None = None
+    # Morphology (M7, solver.processes.morphology): sediment transport at capacity,
+    # with the Exner bed update on the slow clock. Armed by the *presence* of the
+    # [sediment] table, recorded here as a non-None law -- not by a positive d50, so
+    # that a mistyped key cannot quietly disarm the milestone. Local-inertial only.
+    sediment_law: str | None = None  # None = no morphology; "mpm" = Meyer-Peter-Mueller
+    sediment_d50_m: float = 0.0  # median grain size (m): scalar OR field path
+    sediment_d50_field: str | None = None
+    sediment_porosity: float = 0.4  # bed porosity p in Exner's 1/(1-p)
+    sediment_interval_s: float = _DEFAULT_SEDIMENT_INTERVAL_S  # slow-clock cadence
+    # Optional erodible-layer thickness (m) below the initial bed: scalar OR field.
+    # None = unlimited alluvium. A floor does not *clamp* the bed -- the amount not
+    # applied is banked into the sediment ledger (M7 plan §1.5), the same rule that
+    # forbids keeping depth non-negative with a bare max(h, 0).
+    alluvium_thickness_m: float | None = None
+    alluvium_thickness_field: str | None = None
     # Rainfall: "uniform" (scalar rate) or "field" (rate raster).
     rain_type: str = "uniform"
     rain_mm_hr: float = 50.0
@@ -394,6 +435,45 @@ class Scenario:
             )
         if self.channel_manning is not None and self.channel_manning <= 0:
             raise ValueError(f"[channels] manning must be > 0, got {self.channel_manning}")
+        # Morphology (M7). Everything here is checked only once the table has armed
+        # it, so an unarmed Scenario keeps its defaults without having to justify them.
+        if self.has_sediment:
+            if self.sediment_law not in _SEDIMENT_LAWS:
+                raise ValueError(
+                    f"[sediment] law='{self.sediment_law}' is not a transport law M7 ships; "
+                    f"use one of {sorted(_SEDIMENT_LAWS)} ('mpm' is Meyer-Peter-Mueller, the "
+                    "law the bed-wave celerity gate is derived for)"
+                )
+            # Sediment is local-inertial-only (M7 plan §1.4), for a specific reason:
+            # morphology in a river happens in the channel, sub-grid channels are
+            # LI-only, and HLLC's well-balanced hydrostatic reconstruction would have
+            # to be re-derived against a bed that moves. Loud, not a degradation.
+            if self.scheme != "local_inertial":
+                raise ValueError(
+                    f"[sediment] requires scheme='local_inertial'; the '{self.scheme}' scheme "
+                    "has no morphology (M7 plan §1.4) -- its well-balancedness is derived "
+                    "against a static bed, and sub-grid channels, where the transport is, "
+                    "are local-inertial-only too."
+                )
+            if self.sediment_d50_field is None and self.sediment_d50_m <= 0:
+                raise ValueError(
+                    "[sediment] needs a grain size: set d50 (a scalar in metres or a field "
+                    f"path), got {self.sediment_d50_m}. The table itself arms morphology, so "
+                    "there is no d50 that means 'off' -- drop [sediment] instead."
+                )
+            if not 0.0 < self.sediment_porosity < 1.0:
+                raise ValueError(
+                    f"[sediment] porosity must be in (0, 1), got {self.sediment_porosity}; "
+                    "Exner's bed update scales by 1/(1-p)"
+                )
+            if self.sediment_interval_s <= 0:
+                raise ValueError(
+                    f"[sediment] interval_s must be > 0, got {self.sediment_interval_s}"
+                )
+            if self.alluvium_thickness_m is not None and self.alluvium_thickness_m < 0:
+                raise ValueError(
+                    f"[sediment] alluvium_thickness must be >= 0 m, got {self.alluvium_thickness_m}"
+                )
         stage_edges = sorted(e for e, v in self.boundaries.items() if v == "fixed_stage")
         if stage_edges and self.scheme != "hllc_fv":
             raise ValueError(
@@ -419,6 +499,22 @@ class Scenario:
         return self.channel_width_field is not None or self.channel_width_m > 0.0
 
     @property
+    def has_sediment(self) -> bool:
+        """Whether the scenario runs morphology (M7).
+
+        Armed by the *presence* of the ``[sediment]`` table, which the loader records
+        as a non-``None`` law. Deliberately not "d50 > 0": unknown keys only warn, so
+        one mistyped key would otherwise turn a morphology run into a flood run with
+        no error anywhere.
+        """
+        return self.sediment_law is not None
+
+    @property
+    def has_alluvium_floor(self) -> bool:
+        """Whether an erodible-layer thickness limits how far the bed may erode."""
+        return self.alluvium_thickness_field is not None or self.alluvium_thickness_m is not None
+
+    @property
     def rain_m_s(self) -> float:
         return self.rain_mm_hr / 1000.0 / 3600.0
 
@@ -442,6 +538,8 @@ class Scenario:
                 ("channel_width", self.channel_width_field),
                 ("channel_depth", self.channel_depth_field),
                 ("channel_manning", self.channel_manning_field),
+                ("sediment_d50", self.sediment_d50_field),
+                ("alluvium_thickness", self.alluvium_thickness_field),
             )
             if p
         }
@@ -458,6 +556,7 @@ _KNOWN_TABLES = {
     "inflow",
     "structures",
     "channels",
+    "sediment",
 }
 _KNOWN_KEYS = {
     "meta": {"name", "seed", "scheme"},
@@ -467,6 +566,7 @@ _KNOWN_KEYS = {
     "parameters": {"manning_n", "infiltration"},
     "boundaries": {"default", *_EDGES},
     "channels": {"width", "depth", "manning"},
+    "sediment": {"d50", "porosity", "law", "interval_s", "alluvium_thickness"},
 }
 
 
@@ -770,6 +870,39 @@ def load_config(path: str | Path) -> Scenario:
         channels, "manning", base_dir, default_scalar=0.0, table="channels"
     )
 
+    # Morphology (M7): the table's presence arms it, so `sediment_law` is None for
+    # every scenario that does not carry one. `d50` and `alluvium_thickness` follow
+    # the [parameters] scalar-or-field idiom; an absent thickness means unlimited
+    # alluvium, which is why it is read as None rather than 0 (a *zero* thickness is
+    # bedrock everywhere -- a meaningful and very different scenario).
+    sediment = doc.get("sediment")
+    sed_law: str | None = None
+    sed_d50, sed_d50_field = 0.0, None
+    sed_defaults = Scenario()
+    sed_porosity = sed_defaults.sediment_porosity
+    sed_interval = sed_defaults.sediment_interval_s
+    allu_m, allu_field = None, None
+    if sediment is not None:
+        if not isinstance(sediment, dict):
+            raise ConfigError(f"[sediment] must be a table, got {sediment!r}")
+        _warn_unknown("sediment", sediment)
+        sed_law = str(sediment.get("law", "mpm"))
+        sed_d50, sed_d50_field = _parse_field_param(
+            sediment, "d50", base_dir, default_scalar=0.0, table="sediment"
+        )
+        for key, current in (("porosity", sed_porosity), ("interval_s", sed_interval)):
+            val = sediment.get(key, current)
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                raise ConfigError(f"[sediment] {key} must be a number, got {val!r}")
+            if key == "porosity":
+                sed_porosity = float(val)
+            else:
+                sed_interval = float(val)
+        if "alluvium_thickness" in sediment:
+            allu_m, allu_field = _parse_field_param(
+                sediment, "alluvium_thickness", base_dir, default_scalar=0.0, table="sediment"
+            )
+
     # Domain selection (M6): which tiles of the manifest, and which sub-window.
     tiles_select = grid.get("tiles", Scenario().tiles)
     if not isinstance(tiles_select, str) or tiles_select not in TILE_SELECTIONS:
@@ -823,6 +956,13 @@ def load_config(path: str | Path) -> Scenario:
             channel_depth_field=chan_depth_field,
             channel_manning=(chan_n if (chan_n > 0.0 or chan_n_field) else None),
             channel_manning_field=chan_n_field,
+            sediment_law=sed_law,
+            sediment_d50_m=sed_d50,
+            sediment_d50_field=sed_d50_field,
+            sediment_porosity=sed_porosity,
+            sediment_interval_s=sed_interval,
+            alluvium_thickness_m=allu_m,
+            alluvium_thickness_field=allu_field,
             rain_duration=float(rainfall.get("duration_s", defaults.rain_duration)),
             inflows=inflows,
             structures=structures,

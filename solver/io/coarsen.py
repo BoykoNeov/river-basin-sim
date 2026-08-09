@@ -22,7 +22,20 @@ channel width/depth  **max**     a river passes *through* a block; averaging its
                                  width with the dry cells beside it would thin it
                                  away, which is the failure mode sub-grid channels
                                  exist to prevent
+sediment d50         mean        an *engineering choice*, not a conservation law --
+                                 see the note below
+alluvium thickness   mean        volume-preserving: a thickness times an area is a
+                                 volume, so a block's mean thickness holds the same
+                                 erodible sediment (unlike a channel width)
 ===================  ==========  ===============================================
+
+**Not every "mean" above conserves something.** The bed, the rates and an alluvium
+thickness do: each is a quantity per unit area whose block mean preserves the block
+total. ``d50`` (M7) does not -- transport goes as roughly ``d50^1.5``, so the mean of
+a block's grain sizes is not the grain size of their union, and a coarse cell mixing
+sand and cobbles transports like neither. It is the best scalar available without
+graded sediment (which M7 declares out of scope), and it is stated here so a coarse
+morphology result is read as what it is.
 
 Cell **indices** in the scenario (``[[inflow]] cell``, ``[[structures]] cells``,
 ``pool``, ``outlet``) are authored in the *assembled-domain* frame -- after
@@ -34,7 +47,9 @@ crest inside a 4x4 block is averaged away, and the coarse run will not hold wate
 the fine run holds. Engineered barriers survive because ``[[structures]]`` are
 applied *after* coarsening at their authored crest elevation; natural ridges do
 not. That is a property of coarsening, not a bug -- state it wherever a coarse
-run's numbers are reported.
+run's numbers are reported. An alluvium thickness has the same shape of limitation
+in reverse: a block containing one bedrock cell (thickness 0) coarsens to a nonzero
+thickness, so the coarse run erodes where the fine run hits rock.
 """
 
 from __future__ import annotations
