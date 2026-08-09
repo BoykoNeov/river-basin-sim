@@ -60,6 +60,13 @@ class State:
     # channel fields; unarmed, the local-inertial scheme runs its M1 kernels
     # untouched, so pre-M6 runs are bitwise-identical.
     channels: object | None = None
+    # M7 optional morphology accumulators + the grain size the fast loop reads
+    # (solver.core.sediment.SedimentState, armed by `arm_sediment`). Unarmed, no
+    # transport kernel is launched and the bed never moves, so every pre-M7 run is
+    # bitwise-identical. The *bounds* on the bed change deliberately do not live
+    # here -- solver.processes.morphology owns them, because a scenario needs to
+    # pin cells the [sediment] table cannot describe (M7 plan §2 step 5).
+    sediment: object | None = None
     # M3 optional source/sink fields (None unless the scenario needs them):
     infil: wp.array | None = None  # (ny, nx) infiltration rate, m/s
     rain: wp.array | None = None  # (ny, nx) spatial rainfall rate, m/s (temporally scaled)

@@ -64,17 +64,29 @@ def load_r32_bed(tiles_dir: str | Path) -> tuple[np.ndarray, dict]:
     return m.bed, m.manifest
 
 
-def field_memory_mb(shape: tuple[int, int]) -> float:
-    """Rough device memory for one run's float32 state fields, in MB (M6 §4).
+def field_memory_mb(shape: tuple[int, int], *, sediment: bool = False) -> float:
+    """Rough device memory for one run's state fields, in MB (M6 §4).
 
     Counts the local-inertial working set -- ``h, z, n, eta, beta`` at cell centres
     plus ``qx, qy`` on faces, i.e. ~7 arrays of ``ny*nx`` float32 -- so a reach-scale
     domain's cost is printed *before* stepping rather than discovered as a CUDA
     out-of-memory. Optional fields (momentum, channels, loss ledger) add to this;
     the number is an order-of-magnitude guide, and says so.
+
+    ``sediment`` adds M7's morphology working set, and the two widths are summed
+    **separately** rather than folded into a "count x 4 bytes": six of those arrays
+    are float32 (``d50``, ``z0``, and the four face accumulators) but ``dz_cum`` and
+    ``dz_unapplied`` are float64 by necessity (M7 plan §1.1), and at 768^2 that pair
+    alone is ~9 MB -- the single largest contributor, and exactly what a hard-coded
+    4-byte width would hide.
     """
     ny, nx = shape
-    return 7 * 4 * ny * nx / (1024.0 * 1024.0)
+    cells = ny * nx
+    f32, f64 = 7, 0
+    if sediment:
+        f32 += 6  # d50, z0, qs_int_x/y + their compensation terms
+        f64 += 2  # dz_cum, dz_unapplied
+    return (4 * f32 + 8 * f64) * cells / (1024.0 * 1024.0)
 
 
 def pick_device(requested: str | None) -> str:
@@ -437,7 +449,9 @@ def main(argv: list[str] | None = None) -> None:
                 f"  resolution    : coarsen={scenario.coarsen} -> {run_shape[0]}x{run_shape[1]} "
                 f"cells @ dx={scenario.dx * scenario.coarsen:.2f} m"
             )
-        print(f"  field memory  : ~{field_memory_mb(run_shape):.1f} MB (float32 state fields)")
+        mem = field_memory_mb(run_shape, sediment=scenario.has_sediment)
+        kind = "state fields + morphology" if scenario.has_sediment else "float32 state fields"
+        print(f"  field memory  : ~{mem:.1f} MB ({kind})")
         if mosaic.gap_cells:
             print(f"  WARNING: {mosaic.gap_cells} cells are not covered by any tile (filled flat)")
         status.write("starting", message=f"{scenario.name}: {mosaic.summary()}")

@@ -110,6 +110,8 @@ mass exactly the way a bare ``max(h, 0)`` invents water (M4).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import warp as wp
 
@@ -434,6 +436,178 @@ def clear_transport_integral(qs_int_x: wp.array, qs_int_y: wp.array) -> None:
     """
     qs_int_x.zero_()
     qs_int_y.zero_()
+
+
+# --- What a morphology run carries, and where it lives -------------------------
+# The kernels above fix every shape and dtype here, so arming is read off them
+# rather than off prose: `accumulate_qs_x` writes `qs_int[i, jj+1]` over
+# `(ny, nx-1)`, so the face accumulators are the grid's own `qx_shape`/`qy_shape`;
+# `exner_update` and `rebuild_bed` declare their dtypes outright.
+#
+# **The split between what lives here and what lives on the process is by clock.**
+# `d50` is read by the transport kernel every *fast* step, so it is state, exactly
+# as M6's channel geometry is. `interval_s`, the alluvium thickness and the
+# `dz_lo`/`dz_hi` bounds derived from it are read only at an *activation*, so they
+# belong to :mod:`solver.processes.morphology`. That is not tidiness: the bounds
+# must stay something a scenario can hand in whole, since `alluvium_thickness = 0`
+# pins the floor and leaves the ceiling open and nothing in the `[sediment]` table
+# can hold an outlet cell *down* -- which is exactly what the celerity fixture's
+# pinned ends need (M7 plan §2 step 5, §4).
+
+
+class SedimentError(ValueError):
+    """Sediment inputs are inconsistent with the grid or with themselves."""
+
+
+@dataclass
+class SedimentState:
+    """Device-side morphology accumulators, plus the grain size the fast loop reads.
+
+    Two accumulators with opposite arithmetic decisions, for the reason the module
+    docstring gives: ``qs_int_*`` is **float32 + Kahan** because its increments are
+    the same order as the interval sum, and ``dz_cum`` is **float64** because a
+    sub-millimetre increment onto an O(100 m) elevation is below ``eps(z)`` and a
+    float32 add would delete it outright rather than merely drift.
+
+    ``dz_unapplied`` banks in **metres** what the bounds refused; the sediment
+    ledger (M7 build step 6) converts it once at ``A*(1-p)``, the same conversion
+    :meth:`solid_volume` makes for the applied part.
+    """
+
+    d50: wp.array  # (ny, nx) float32 median grain size, m
+    porosity: float  # bed porosity p; dz -> solid volume is A*(1-p)*dz
+    z0: wp.array  # (ny, nx) float32 pristine bed -- see `arm_sediment` on *when*
+    dz_cum: wp.array  # (ny, nx) float64 cumulative bed change, m
+    dz_unapplied: wp.array  # (ny, nx) float64 bed change the bounds refused, m
+    qs_int_x: wp.array  # (ny, nx+1) float32 transport integral, m^2
+    qs_comp_x: wp.array  # (ny, nx+1) float32 its Kahan compensation
+    qs_int_y: wp.array  # (ny+1, nx)
+    qs_comp_y: wp.array  # (ny+1, nx)
+    d50_min: float  # host-side diagnostics, validated at arm time
+    d50_max: float
+    inert_cells: int  # cells with d50 == 0: no transport, counted rather than silent
+
+    @property
+    def inv_one_minus_p(self) -> float:
+        """Exner's ``1/(1-p)``, the factor :func:`exner_update` takes."""
+        return 1.0 / (1.0 - self.porosity)
+
+    def bed_change_numpy(self) -> np.ndarray:
+        """Cumulative bed change as a host ``(ny, nx)`` float64 array (metres)."""
+        return self.dz_cum.numpy()
+
+    def solid_volume(self, cell_area: float) -> float:
+        """Net solid volume the bed has gained (m^3), float64-summed.
+
+        Negative when the domain has net-eroded. The sediment ledger's headline
+        term; mirrors :meth:`solver.core.state.State.loss_volume` for water.
+        """
+        return float(self.dz_cum.numpy().sum()) * cell_area * (1.0 - self.porosity)
+
+    def banked_volume(self, cell_area: float) -> float:
+        """Solid volume (m^3) the bounds refused to apply -- banked, never discarded."""
+        return float(self.dz_unapplied.numpy().sum()) * cell_area * (1.0 - self.porosity)
+
+    def clear_integral(self) -> None:
+        """Zero the transport integrals, keeping the compensation debt."""
+        clear_transport_integral(self.qs_int_x, self.qs_int_y)
+
+    def summary(self) -> str:
+        grain = (
+            f"d50 = {1000.0 * self.d50_min:.2f}..{1000.0 * self.d50_max:.2f} mm"
+            if self.d50_min != self.d50_max
+            else f"d50 = {1000.0 * self.d50_max:.2f} mm"
+        )
+        inert = f", {self.inert_cells} inert cells" if self.inert_cells else ""
+        return f"{grain}, porosity {self.porosity:.2f}{inert}"
+
+    def as_attrs(self) -> dict:
+        return {
+            "d50_min_m": self.d50_min,
+            "d50_max_m": self.d50_max,
+            "porosity": self.porosity,
+            "inert_cells": self.inert_cells,
+        }
+
+
+def validate_grain_size(d50: np.ndarray | float, grid) -> np.ndarray:
+    """Check and broadcast the grain-size field against the grid.
+
+    A scalar broadcasts to a uniform field, which keeps the face mean
+    ``0.5*(d50 + d50)`` bit-exact -- the ``n`` idiom, so a uniform grain size costs
+    nothing in accuracy for the generality.
+
+    Rejects what cannot mean anything (negative, non-finite). A **zero** is
+    accepted and *counted*: :func:`face_capacity` returns zero there, so the cell
+    is inert, which is a coherent thing to want but a silent one to get by typo.
+    ``[sediment] d50`` refuses a zero scalar for that reason (there is no ``d50``
+    that means "off"); a field can carry zeros, and :meth:`SedimentState.summary`
+    says how many. The right way to spell "the bed here cannot move" remains
+    ``alluvium_thickness = 0``, which banks into the ledger instead of quietly
+    transporting nothing.
+    """
+    ny, nx = grid.shape
+    if np.isscalar(d50):
+        arr = np.full((ny, nx), float(d50), dtype=np.float32)
+    else:
+        arr = np.ascontiguousarray(d50, dtype=np.float32).copy()
+        if arr.shape != (ny, nx):
+            raise SedimentError(f"d50 shape {arr.shape} != grid {(ny, nx)}")
+    if not np.isfinite(arr).all():
+        raise SedimentError("d50 field contains non-finite values")
+    if (arr < 0).any():
+        raise SedimentError("d50 must be >= 0 everywhere (0 = an inert cell)")
+    return arr
+
+
+def arm_sediment(state, d50: np.ndarray | float, porosity: float) -> SedimentState:
+    """Attach the morphology accumulators to ``state`` and return them.
+
+    **Call this after the bed is final, not before.** ``z0`` is captured from
+    ``state.z`` here and the bed is *rebuilt* from it at every activation
+    (:func:`rebuild_bed`), so arming before
+    :func:`solver.processes.reservoir.apply_barriers` would delete every dam at the
+    first activation. The run loop owes this ordering; it is not something the
+    kernels can check.
+
+    Arming is what makes a run a morphology run: unarmed, nothing launches a
+    transport kernel and the bed is static, so every pre-M7 scenario is bitwise
+    unchanged. All accumulators start at zero, so the initial bed *is* ``z0`` and
+    the stored ``bed`` and ``bed_change`` agree by construction rather than by
+    accumulation (M7 plan §1.1).
+
+    Arming is **not** idempotent and refuses to run twice, unlike
+    :func:`solver.core.hllc.arm_hllc`. Re-arming would recapture ``z0`` from a bed
+    that has already moved and zero the cumulative change that moved it -- a silent
+    ledger reset, and the bed would then look pristine while carrying its whole
+    history. Better a loud error than a run whose ``bed_change`` is a lie.
+    """
+    if getattr(state, "sediment", None) is not None:
+        raise SedimentError(
+            "state is already armed for morphology; re-arming would recapture z0 from "
+            "a moved bed and discard the cumulative change that moved it"
+        )
+    if not 0.0 <= porosity < 1.0:
+        raise SedimentError(f"porosity must be in [0, 1), got {porosity}")
+    g = state.grid
+    grain = validate_grain_size(d50, g)
+    dev = state.device
+    sed = SedimentState(
+        d50=wp.array(grain, dtype=wp.float32, device=dev),
+        porosity=float(porosity),
+        z0=wp.clone(state.z),
+        dz_cum=wp.zeros(g.shape, dtype=wp.float64, device=dev),
+        dz_unapplied=wp.zeros(g.shape, dtype=wp.float64, device=dev),
+        qs_int_x=wp.zeros(g.qx_shape, dtype=wp.float32, device=dev),
+        qs_comp_x=wp.zeros(g.qx_shape, dtype=wp.float32, device=dev),
+        qs_int_y=wp.zeros(g.qy_shape, dtype=wp.float32, device=dev),
+        qs_comp_y=wp.zeros(g.qy_shape, dtype=wp.float32, device=dev),
+        d50_min=float(grain.min()),
+        d50_max=float(grain.max()),
+        inert_cells=int((grain == 0).sum()),
+    )
+    state.sediment = sed
+    return sed
 
 
 # --- Host-side reference + the celerity the gates are written against ----------

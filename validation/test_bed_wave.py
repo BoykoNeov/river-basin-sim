@@ -44,7 +44,7 @@ from solver.core.local_inertial import compute_dt, step
 from solver.core.massbalance import MASS_GATE, MassLedger
 from solver.core.sediment import (
     accumulate_qs_x,
-    clear_transport_integral,
+    arm_sediment,
     exner_update,
     morphological_courant,
     rebuild_bed,
@@ -96,15 +96,13 @@ def _drive(fx: BedWave, *, morphology: bool = True, end_s: float | None = None) 
     inj = InflowInjector(fx.inflows(), st.grid, DEV)
     ledger = MassLedger.from_state(st)
 
-    z0 = wp.array(fx.bed(), dtype=wp.float32, device=DEV)
-    d50 = wp.array(np.full((1, nx), fx.d50, np.float32), dtype=wp.float32, device=DEV)
-    qs_int = wp.zeros((1, nx + 1), dtype=wp.float32, device=DEV)
-    qs_comp = wp.zeros((1, nx + 1), dtype=wp.float32, device=DEV)
-    # One row means there are no interior y-faces; the divergence still reads the
-    # y integral, so it is allocated (and stays zero) rather than special-cased.
-    qs_int_y = wp.zeros((2, nx), dtype=wp.float32, device=DEV)
-    dz_cum = wp.zeros((1, nx), dtype=wp.float64, device=DEV)
-    dz_unapplied = wp.zeros((1, nx), dtype=wp.float64, device=DEV)
+    # Every accumulator comes from the arming path (M7 build step 4), not from
+    # hand-rolled allocations: `z0` is `state.z` at arm time, and one row means
+    # there are no interior y-faces, so the y integral is allocated and stays zero
+    # rather than being special-cased. The **bounds** are deliberately not part of
+    # it -- they are the fixture's own equilibrium sediment BC, which is exactly the
+    # case `[sediment]` cannot express and step 5 must therefore accept whole.
+    sed = arm_sediment(st, fx.d50, fx.porosity)
     lo_h, hi_h = fx.bed_bounds()
     dz_lo = wp.array(lo_h, dtype=wp.float32, device=DEV)
     dz_hi = wp.array(hi_h, dtype=wp.float32, device=DEV)
@@ -139,7 +137,16 @@ def _drive(fx: BedWave, *, morphology: bool = True, end_s: float | None = None) 
             wp.launch(
                 accumulate_qs_x,
                 dim=(1, nx - 1),
-                inputs=[st.qx, st.eta, st.z, st.n, d50, float(dt), qs_int, qs_comp],
+                inputs=[
+                    st.qx,
+                    st.eta,
+                    st.z,
+                    st.n,
+                    sed.d50,
+                    float(dt),
+                    sed.qs_int_x,
+                    sed.qs_comp_x,
+                ],
                 device=DEV,
             )
         t += dt
@@ -149,13 +156,13 @@ def _drive(fx: BedWave, *, morphology: bool = True, end_s: float | None = None) 
                 exner_update,
                 dim=(1, nx),
                 inputs=[
-                    qs_int, qs_int_y, dz_lo, dz_hi, float(fx.dx),
-                    1.0 / (1.0 - fx.porosity), dz_cum, dz_unapplied,
+                    sed.qs_int_x, sed.qs_int_y, dz_lo, dz_hi, float(fx.dx),
+                    sed.inv_one_minus_p, sed.dz_cum, sed.dz_unapplied,
                 ],
                 device=DEV,
             )  # fmt: skip
-            wp.launch(rebuild_bed, dim=(1, nx), inputs=[z0, dz_cum, st.z], device=DEV)
-            clear_transport_integral(qs_int, qs_int_y)
+            wp.launch(rebuild_bed, dim=(1, nx), inputs=[sed.z0, sed.dz_cum, st.z], device=DEV)
+            sed.clear_integral()
             acts += 1
     ledger.record(st, t)
 
@@ -163,8 +170,8 @@ def _drive(fx: BedWave, *, morphology: bool = True, end_s: float | None = None) 
         bed=st.z.numpy()[0].astype(np.float64),
         depth=st.h.numpy()[0].astype(np.float64),
         face_q=st.qx.numpy()[0].astype(np.float64),
-        dz_cum=dz_cum.numpy()[0],
-        banked_m=float(dz_unapplied.numpy().sum()),
+        dz_cum=sed.bed_change_numpy()[0],
+        banked_m=float(sed.dz_unapplied.numpy().sum()),
         mass_rel_error=ledger.max_rel_error,
         steps=steps,
         activations=acts,

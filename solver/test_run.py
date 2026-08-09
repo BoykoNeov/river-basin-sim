@@ -11,7 +11,7 @@ import xarray as xr
 
 from solver.core.massbalance import MASS_GATE
 from solver.io.config import ConfigError, Inflow
-from solver.run import Scenario, main, run_simulation
+from solver.run import Scenario, field_memory_mb, main, run_simulation
 
 wp.init()
 
@@ -264,3 +264,29 @@ def test_a_sediment_scenario_is_refused_until_morphology_is_wired(tmp_path):
     assert scn.has_sediment
     with pytest.raises(NotImplementedError, match="M7 build step 5"):
         run_simulation(scn, _bowl(16, 16), tmp_path / "s.zarr", device="cpu", verbose=False)
+
+
+def test_field_memory_counts_the_two_widths_separately_for_morphology():
+    """The f64 pair is the *largest* contributor, and a `count x 4` would hide it.
+
+    M7's working set is six float32 arrays (``d50``, ``z0`` and the four face
+    accumulators) plus **two float64** ones (``dz_cum``, ``dz_unapplied``) -- the
+    ledger arrays a sub-millimetre bed increment needs (M7 plan §1.1). At 768^2 that
+    pair alone is ~9 MB -- **two** arrays weighing exactly what the **four** face
+    accumulators do -- so the print that exists to warn before a CUDA out-of-memory
+    has to weigh the widths separately rather than count arrays at 4 bytes.
+    """
+    shape = (768, 768)
+    cells = shape[0] * shape[1]
+    mb = lambda b: b * cells / (1024.0 * 1024.0)  # noqa: E731
+    assert field_memory_mb(shape) == pytest.approx(mb(7 * 4))
+    assert field_memory_mb(shape, sediment=False) == field_memory_mb(shape)
+    assert field_memory_mb(shape, sediment=True) == pytest.approx(mb(13 * 4 + 2 * 8))
+    added = field_memory_mb(shape, sediment=True) - field_memory_mb(shape)
+    assert added == pytest.approx(mb(6 * 4 + 2 * 8))
+    # Two f64 arrays weigh what four f32 face accumulators do: counting arrays at a
+    # single 4-byte width would under-report morphology by a third (~9 MB here).
+    assert mb(2 * 8) == pytest.approx(mb(4 * 4)) == pytest.approx(9.0)
+    assert field_memory_mb(shape, sediment=True) == pytest.approx(
+        field_memory_mb(shape) + mb(6 * 4) + 9.0
+    )

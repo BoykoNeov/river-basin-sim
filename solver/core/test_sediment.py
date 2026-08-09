@@ -28,9 +28,11 @@ from solver.core.sediment import (
     MPM_COEFFICIENT,
     SHIELDS_CRITICAL,
     SUBMERGED_SG,
+    SedimentError,
     accumulate_qs_x,
     accumulate_qs_x_channels,
     accumulate_qs_y,
+    arm_sediment,
     bed_celerity,
     capacity_from_flow,
     clear_transport_integral,
@@ -42,6 +44,7 @@ from solver.core.sediment import (
     shields_from_flow,
     shields_number,
 )
+from solver.core.state import State
 
 wp.init()
 
@@ -617,3 +620,156 @@ def test_no_shear_means_no_celerity():
     deep = 20.0  # so slow that theta < theta_c
     assert shields_from_flow(1.0, deep, 0.03, 0.008) < SHIELDS_CRITICAL
     assert bed_celerity(1.0, deep, 0.03, 0.008, 0.4) == 0.0
+
+
+# --- arming: the state a morphology run carries (M7 build step 4) --------------
+
+
+def _armed(ny=3, nx=4, d50=0.008, porosity=0.4, bed=None):
+    if bed is None:
+        bed = np.arange(ny * nx, dtype=np.float32).reshape(ny, nx) * 0.01 + 100.0
+    st = State.from_bed(bed, dx=5.0, depth=0.2, device=DEV)
+    return st, arm_sediment(st, d50, porosity)
+
+
+def test_an_unarmed_state_carries_no_morphology_at_all():
+    """The bitwise invariant at this build step is structural: nothing is allocated.
+
+    Every pre-M7 scenario runs the same kernels on the same arrays it always did,
+    because there is no morphology attribute for anything to branch on.
+    """
+    st = State.from_bed(np.zeros((3, 4), np.float32), dx=5.0)
+    assert st.sediment is None
+
+
+def test_arming_allocates_exactly_the_shapes_and_dtypes_the_kernels_index():
+    """Read off the kernels, not off prose -- a mismatch here is a step-5 crash.
+
+    ``accumulate_qs_*`` write the interior faces of the grid's own face arrays, and
+    ``exner_update``/``rebuild_bed`` declare their dtypes outright: the two f64
+    arrays are the ledger (a sub-millimetre increment onto an O(100 m) elevation is
+    below ``eps(z)``), the rest are f32.
+    """
+    st, sed = _armed()
+    g = st.grid
+    for arr, shape in (
+        (sed.d50, g.shape),
+        (sed.z0, g.shape),
+        (sed.dz_cum, g.shape),
+        (sed.dz_unapplied, g.shape),
+        (sed.qs_int_x, g.qx_shape),
+        (sed.qs_comp_x, g.qx_shape),
+        (sed.qs_int_y, g.qy_shape),
+        (sed.qs_comp_y, g.qy_shape),
+    ):
+        assert tuple(arr.shape) == shape
+    for arr in (sed.d50, sed.z0, sed.qs_int_x, sed.qs_comp_x, sed.qs_int_y, sed.qs_comp_y):
+        assert arr.dtype == wp.float32
+    for arr in (sed.dz_cum, sed.dz_unapplied):
+        assert arr.dtype == wp.float64
+    assert st.sediment is sed
+
+
+def test_every_accumulator_starts_at_zero_so_the_initial_bed_is_z0():
+    """`bed` and `bed_change` agree by construction, not by accumulation (§1.1)."""
+    st, sed = _armed()
+    assert (sed.dz_cum.numpy() == 0.0).all()
+    assert (sed.dz_unapplied.numpy() == 0.0).all()
+    for arr in (sed.qs_int_x, sed.qs_comp_x, sed.qs_int_y, sed.qs_comp_y):
+        assert (arr.numpy() == 0.0).all()
+    assert (sed.z0.numpy() == st.z.numpy()).all()
+    assert sed.solid_volume(25.0) == 0.0
+    assert sed.banked_volume(25.0) == 0.0
+
+
+def test_z0_is_the_bed_at_arm_time_and_a_rebuild_restores_it():
+    """The ordering the kernels cannot check: arm *after* barriers raise the bed.
+
+    Arming before :func:`solver.processes.reservoir.apply_barriers` would capture a
+    pre-dam bed, and the first activation's rebuild would delete every dam. Here the
+    bed is moved *after* arming and the rebuild pulls it back to ``z0``, which is
+    the same mechanism seen from the other side.
+    """
+    st, sed = _armed()
+    pristine = st.z.numpy().copy()
+    st.z.assign(pristine + 7.0)  # a "dam" raised after arming -- not in z0
+    wp.launch(rebuild_bed, dim=st.grid.shape, inputs=[sed.z0, sed.dz_cum, st.z], device=DEV)
+    assert (st.z.numpy() == pristine).all(), "rebuild must restore the bed z0 captured"
+
+
+def test_a_scalar_grain_size_broadcasts_to_a_bit_exact_uniform_field():
+    """The ``n`` idiom: a uniform field's face mean ``0.5*(d+d)`` is exact."""
+    _, sed = _armed(d50=0.0123)
+    grain = sed.d50.numpy()
+    assert (grain == np.float32(0.0123)).all()
+    assert sed.d50_min == sed.d50_max == pytest.approx(np.float32(0.0123))
+    assert "d50 = 12.30 mm" in sed.summary()
+
+
+def test_a_grain_size_field_is_carried_per_cell_and_inert_cells_are_counted():
+    """A zero ``d50`` transports nothing; that is allowed, but never silent."""
+    field = np.full((3, 4), 0.004, np.float32)
+    field[1, 2] = 0.0
+    field[0, 0] = 0.016
+    _, sed = _armed(d50=field)
+    assert (sed.d50.numpy() == field).all()
+    assert sed.inert_cells == 1
+    assert sed.d50_min == 0.0 and sed.d50_max == pytest.approx(0.016)
+    assert "1 inert cells" in sed.summary()
+    assert sed.as_attrs()["inert_cells"] == 1
+
+
+@pytest.mark.parametrize(
+    "bad, match",
+    [
+        (np.zeros((2, 2), np.float32), "shape"),
+        (np.full((3, 4), -1.0, np.float32), ">= 0"),
+        (np.full((3, 4), np.nan, np.float32), "non-finite"),
+    ],
+)
+def test_a_grain_size_that_cannot_mean_anything_is_refused(bad, match):
+    st = State.from_bed(np.zeros((3, 4), np.float32), dx=5.0, device=DEV)
+    with pytest.raises(SedimentError, match=match):
+        arm_sediment(st, bad, 0.4)
+    assert st.sediment is None, "a refused arming must leave the state unarmed"
+
+
+@pytest.mark.parametrize("p", [1.0, 1.5, -0.1])
+def test_a_porosity_exner_cannot_divide_by_is_refused(p):
+    st = State.from_bed(np.zeros((3, 4), np.float32), dx=5.0, device=DEV)
+    with pytest.raises(SedimentError, match="porosity"):
+        arm_sediment(st, 0.008, p)
+
+
+def test_arming_twice_is_refused_rather_than_silently_resetting_the_ledger():
+    """Re-arming would recapture z0 from a moved bed and zero what moved it."""
+    st, _ = _armed()
+    with pytest.raises(SedimentError, match="already armed"):
+        arm_sediment(st, 0.008, 0.4)
+
+
+def test_the_volume_terms_convert_bed_change_once_at_one_minus_p():
+    """Applied and refused change convert identically -- the ledger adds them once."""
+    _, sed = _armed(porosity=0.25)
+    dz = np.zeros((3, 4), np.float64)
+    dz[0, 0] = 0.5
+    dz[2, 3] = -0.125
+    sed.dz_cum.assign(dz)
+    sed.dz_unapplied.assign(np.full((3, 4), 0.001))
+    area = 25.0
+    assert sed.inv_one_minus_p == pytest.approx(1.0 / 0.75)
+    assert sed.solid_volume(area) == pytest.approx(0.375 * area * 0.75)
+    assert sed.banked_volume(area) == pytest.approx(12 * 0.001 * area * 0.75)
+    assert (sed.bed_change_numpy() == dz).all()
+
+
+def test_clearing_the_integral_keeps_the_compensation_debt_through_the_state():
+    """The method delegates; the debt survives an activation (see the free function)."""
+    _, sed = _armed()
+    sed.qs_int_x.assign(np.full(sed.qs_int_x.shape, 3.0, np.float32))
+    sed.qs_comp_x.assign(np.full(sed.qs_comp_x.shape, 1e-9, np.float32))
+    sed.qs_int_y.assign(np.full(sed.qs_int_y.shape, 2.0, np.float32))
+    sed.clear_integral()
+    assert (sed.qs_int_x.numpy() == 0.0).all()
+    assert (sed.qs_int_y.numpy() == 0.0).all()
+    assert (sed.qs_comp_x.numpy() == np.float32(1e-9)).all()

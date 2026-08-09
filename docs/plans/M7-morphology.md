@@ -349,6 +349,44 @@ sediment.
    generalise the exact-accumulation helpers to take a target array; extend
    `field_memory_mb`. Assert the bitwise-unchanged invariant for every existing
    scenario with sediment unarmed.
+   **Done** — `sediment.arm_sediment` / `SedimentState` (attached to
+   `State.sediment`, the `arm_hllc`/`arm_channels` idiom), and the arming is read
+   off step 2's kernel signatures rather than off this prose: **seven** arrays, not
+   §1.3's four, because §1.3 counts only the face set. Four decisions worth naming:
+   - **The split between state and process is by clock.** `d50` is read every *fast*
+     step, so it is state, exactly as M6's channel geometry is; `interval_s`, the
+     alluvium thickness and the `dz_lo`/`dz_hi` bounds are read only at an
+     *activation*, so they belong to the step-5 process. That is not tidiness —
+     putting config-derived bounds on `State` would build the very trap step 5's
+     first requirement warns about, since nothing in `[sediment]` can hold an outlet
+     cell *down*. The celerity fixture keeps owning its own pinned ends and proves
+     the seam works before step 5 exists.
+   - **`field_memory_mb` sums the two widths separately**, not "count × 4 bytes":
+     six of the seven are f32, but `dz_cum` + `dz_unapplied` are f64, and at 768²
+     that **pair of two** weighs exactly what the **four** face accumulators do
+     (~9 MB each) — a 4-byte hard-code would have under-reported morphology by a
+     third, hiding precisely the arrays §1.1 forced to f64.
+   - **Arming is deliberately *not* idempotent.** Re-arming would recapture `z0`
+     from a bed that has already moved and zero the change that moved it — a silent
+     ledger reset leaving `bed_change` a lie. It raises instead. (`z0`-after-barriers
+     stays a run-loop obligation the kernels cannot check; step 4 pins it in the
+     docstring and in a test that moves the bed after arming and rebuilds.)
+   - **The "generalise the exact-accumulation helpers to take a target array" item
+     was dropped, not deferred.** `kahan_add` is already a generic `@wp.func`, the
+     rain kernels already take `h`/`comp` as parameters, and `sediment.py` already
+     imports it — §1.1's actual requirement (one module owns *how* a distributed
+     quantity is accumulated into a field) holds today. Sediment's increment is
+     computed per-face from the flow and fused into its own kernel, so it cannot use
+     a generic wrapper: the helper would have shipped with zero callers.
+
+   **Verified by repointing the step-3 fixture** at the arming path rather than by a
+   fresh unit test — `validation/test_bed_wave.py` hand-rolled exactly these seven
+   arrays, and every recorded number reproduces bit for bit (xcorr **0.993 c_b**,
+   crest 1.004, centroid 0.942, crest retention 0.72, signal/background 29.7,
+   free-end inlet −1.1226 m / outlet +0.9071 m / reach 1.9439 m, pinned ends exactly
+   0.0). At this step the bitwise invariant is *structural* — unarmed means the
+   attribute is `None` and nothing is allocated — with the suite's stored baselines
+   as the regression. **290 tests green.**
 5. **`solver/processes/morphology.py`** — the slow process, modelled on
    `reservoir.py`: constructed after `State`, exposes `as_slow_process()`,
    `advance(t, dt_slow)` returns a record, `series` lands in `.zattrs`. Plus the
