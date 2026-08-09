@@ -293,8 +293,11 @@ Say this wherever the coarse run's numbers are reported.
       12 h. The channel deepens from a 1.5 m column at 1 h to 3.75 m at 12 h,
       overbank cells grow 25 → 1201, 11.6 Mm³ leaves the open southern edge, and the
       frames export lands on a **2×2 tile grid**. Mass **2.79e-7**; 2.8 min on the
-      CPU backend (this session has no GPU). **Re-run on the RTX 5090 at sign-off:
-      mass 3.08e-7** — see below.
+      CPU backend (this session has no GPU). **The sign-off re-run on the RTX 5090
+      re-measured only some of these**: the resolved domain, the 2232 channel cells,
+      `h_max` → channel column, the 2×2 tile grid and mass (3.08e-7). The **overbank
+      25 → 1201 and 11.6 Mm³ out figures remain the CPU session's** — the solver does
+      not print them and they were not instrumented at sign-off.
 - [x] `ruff` + `ruff format` clean; **228 tests green** (221 without `--extra geo`).
 - [x] **Signed off on GPU + Godot** (2026-08-09) — see the next section.
 
@@ -316,7 +319,8 @@ regression).
   order and FMA are not what sets the number. **Inside the 1e-6 gate; no re-run
   needed.** `h_max` 2.036 m at 12 h ⇒ a **3.73 m channel column** through the
   storage curve, reproducing the authoring session's 3.75 m. `status.json` reached
-  `state="done"`.
+  `state="done"`. The overbank-cell growth and outflow volume were **not**
+  re-measured — those stay the CPU session's numbers.
 - **Frame tiling, on real output**: `manifest.json` reports the expected **2×2**
   grid with edge tiles clipped (512+256). All **25 frames reassemble byte-exactly**
   to the Zarr (`max|tiles − zarr| = 0.0`), including the non-square edge tiles.
@@ -336,12 +340,20 @@ regression).
   proof it is gone.
 
 **New finding (recorded, not fixed): the frames export does not purge its output
-directory.** After the reach run, 13 pre-M6 untiled `f*_depth.raw` files from an
-earlier `demo_basin_rain` export were still sitting beside the new tiled ones, three
-months stale. Harmless today because `manifest.json` names every file the reader
-touches, so nothing reads them — but a reader that reconstructs filenames by
-convention, or a human inspecting the directory, would pick up old data. Either purge
-on export or leave it deliberate and say so.
+directory, and every scenario writes to the same default one.** `reach_basin` and
+`demo_basin_rain` both landed in `data/results/demo.zarr` + `frames/` — the default
+output path ignores `[meta] name` — so running them back to back interleaved two
+grids in one directory. After the second run, **61 of the 113 `.raw` files there were
+orphans**: 13 pre-M6 untiled frames from July, and — the dangerous ones — **48 tiled
+files (`f0013`–`f0024`) from the 768² reach run, sitting beside a manifest that
+declares 1024²**, under an identical naming convention and distinguishable only by
+byte size. Nothing reads them today, because `manifest.json` names every file the
+viewer touches and the frame count shrank, so the survivors are past the end of the
+list. But a reader that reconstructs filenames by index would decode a 768²-geometry
+tile as 1024², and a human listing the directory has no way to tell which run a file
+belongs to. The missing purge is what makes it possible; the shared default output
+path is what makes it likely. Fix either end — or both — but the shared path is the
+root.
 
 - **Stop and confirm before M7.** ← M6 is signed off; M7 has not started.
 

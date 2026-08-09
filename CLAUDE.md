@@ -279,12 +279,15 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   cell count and step count before suspecting the scheme; the real fix (compensated or
   float64 source accumulation) is a precision pass, and it should land before M7 adds
   sediment to the same fields.
-- **The frames export does not purge its output directory, and `manifest.json` is the
-  only thing that knows which files are current.** A pre-M6 untiled export left 13
-  three-month-old `f*_depth.raw` files sitting beside the new tiled ones after a reach
-  run. Nothing reads them (every path the viewer touches is named in the manifest), but
-  don't reconstruct frame filenames by convention, and don't trust a directory listing
-  as a record of the last run.
+- **Every scenario writes to the same default output, and the frames export never
+  purges it.** `[meta] name` does not pick the output path — `reach_basin` and
+  `demo_basin_rain` both land in `data/results/demo.zarr` + `frames/`. Run them back to
+  back and the directory holds two grids at once: after the M6 sign-off, 61 of 113
+  `.raw` files were orphans, including 48 **768²-geometry tiles beside a 1024²
+  manifest**, same naming, told apart only by byte size. `manifest.json` is the only
+  record of which files belong to the current run — never reconstruct frame filenames
+  by index, never read a directory listing as the last run's output, and pass `--out` /
+  `--frames-dir` when you care about keeping a result.
 - **The viewer's terrain layer loads tile 0 only.** A mosaic run's water is correct and
   renders at its true extent (manifest-driven geometry), over a single terrain tile from
   a possibly unrelated DEM — so the composite looks broken while both halves are right.
