@@ -41,15 +41,34 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   to M2's), and the Godot reader takes its grid from the manifest and blits tiles —
   **now verified on hardware**: all 25 frames reassemble byte-exactly to the Zarr,
   `--rbverify` reads the coarsened mosaic, `--rbshot` renders `h_max` to the pixel, and
-  `--rblaunch` drives the full subprocess loop at 2.12e-8 (bit-for-bit M2's figure), with
+  `--rblaunch` drives the full subprocess loop (2.12e-8 at sign-off; **2.59e-8** since the
+  precision pass, which by design ends the bit-for-bit identity with M2's figure), with
   the Windows `os.replace` race not firing across 4× the file handoffs. Demo
   `scenarios/reach_basin.toml`: a **6×6 mosaic, 76.8 km square**, run at 768² @ 100 m with
-  2232 channel cells, mass **2.79e-7** on CPU / **3.08e-7** on the 5090 (a 2.9e-8 CUDA↔CPU
-  delta — reduction order is *not* what sets the residual). **228 tests green.** **One loud carried finding:**
-  the mass gate is now a *precision envelope* — the same demo at `coarsen = 4` **exceeds**
-  it (1.8e-6) and does so identically with channels off, i.e. float32 accumulation of
-  rain into a thin sheet (§12's drift-at-scale, measured). Check storm depth / cell count /
-  step count before calling a reach-scale gate failure a bug. See `docs/plans/M6-reach.md`.
+  2232 channel cells, mass **7.21e-8** on CPU / **1.60e-7** on the 5090 (was 2.79e-7 /
+  3.08e-7 before the precision pass). **234 tests green.** M6's loud carried finding — the
+  same demo at `coarsen = 4` exceeding the gate — **is fixed**: see the precision pass
+  below. See `docs/plans/M6-reach.md`.
+- **Precision pass — compensated areal sources: done (2026-08-09).** The first of M6's two
+  carried debts, landed before M7 puts a second distributed source on the same fields.
+  float32 `h += rate*dt`, once per cell per step, was what put a reach-scale rain-on-grid
+  run at the mass gate for *arithmetic* reasons — measured, not guessed: the residual
+  climbed ~220 m³ per 1800 s **while it rained**, hit 647 m³ when the storm stopped, then
+  went flat over the next 10 h with water still moving and draining. Fluxes were never the
+  leak. **`solver/core/sources.py`** gives each cell its own float32 **Kahan compensation**
+  term — the ledger's own idiom (`massbalance._Kahan`) moved onto the grid — so the bits an
+  add discards are repaid by the next one. `h` stays float32 (**§2 untouched**, no field
+  promoted, one extra f32 array). Armed **only when rain actually falls**, so every run
+  without an areal source is **bitwise unchanged** (dam-break, lake-at-rest, the EA
+  benchmarks, M5's `reservoir_release`); **point sources are deliberately out of scope**
+  (inflow measured ~1.3% of the residual, and arming on it would perturb rain-free
+  scenarios). **Result: 3.77e-6 → 1.28e-7** on the failing `coarsen = 4` case — 647 m³ of
+  storm drift becomes −3.15 m³, and the ~21 m³ left is flux/limiter round-off, the floor a
+  source-only fix can reach. Every rain-bearing figure was re-measured (all improved except
+  the M1/M2 demos, 2.12e-8 → 2.59e-8 — at that magnitude source drift was never what set
+  them). Tests gate **ratios, not thresholds**, plus a **fast-math canary** asserting the
+  compensation term is nonzero, because reassociating it away would make every other
+  assertion measure an uncompensated add against itself. See `docs/plans/precision-sources.md`.
 - **M5 — Multi-physics: done.** The locked time-integration
   decision (HANDOFF §2/§8) is now real code. **`solver/scheduler.py`** owns the single
   simulated clock and *only* that: the fast scheme still computes its own state-derived
@@ -119,7 +138,8 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   vs 0.0740, front 0.0101 vs 0.0953) under one parametrized test gating both schemes;
   **Manning normal depth 0.59%** on a transcritical channel; drain-to-empty 3.0e-8;
   **UK EA SC080035 Test 2 + Test 3**. GPU demo `scenarios/river_reach_hllc.toml` mass
-  6.66e-7 vs the LI baseline's 1.24e-7 on the same scenario. No viewer change — the
+  6.66e-7 vs the LI baseline's 1.24e-7 on the same scenario (**1.31e-7 vs 1.68e-8**
+  since the precision pass — both scenarios carry rain). No viewer change — the
   Zarr contract is scheme-agnostic. 111 tests green. **Read the plan's carried
   limitations before extending this**: EA Test 3 is a *within-HLLC momentum* gate, not
   a scheme discriminator (Bates LI keeps `∂q/∂t`, so it is on HLLC's side and both
@@ -142,7 +162,7 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   scenario into `.zattrs` + a `<store>.provenance.json` sidecar. **Validated:** a
   mild steady channel reaches **Manning normal depth within 1%**; a steep basin
   drains with `h.min() >= 0`. Two GPU demos green (`river_reach` mass 1.24e-7,
-  `spatial_fields` 7.57e-8). 82 tests green. See `docs/plans/M3-real-scenarios.md`.
+  `spatial_fields` 7.57e-8; **1.68e-8 / 7.36e-9** since the precision pass). 82 tests green. See `docs/plans/M3-real-scenarios.md`.
 - **M2 — The loop closes: done.** The §7 contracts
   are live end to end: **§7.1 config-in** (`solver/io/config.py` — TOML → `Scenario`,
   parses the full schema but *rejects* not-yet-built features with a milestone-naming
@@ -158,7 +178,8 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   auto-loads results, and renders a **lifted depth-coloured water surface**
   (`water_surface.gdshader`: η = bed + depth reconstructed in-shader, dry-cell
   discard) with a timeline scrubber. Full loop verified from Godot (`--rblaunch`)
-  on the RTX 5090; mass gate 2.12e-8; error path writes `state="error"` (viewer
+  on the RTX 5090; mass gate 2.12e-8 (**2.59e-8** since the precision pass — the loop
+  itself is unchanged and still green); error path writes `state="error"` (viewer
   never hangs); 38 tests green. See `docs/plans/M2-loop-closes.md`.
 - **M1 — Water moves: done.** Local-inertial (Bates
   2010) shallow-water solver in Warp on the staggered raster: uniform rainfall,
@@ -167,7 +188,8 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   mass 2.5e-9, nRMSE 0.074; dry-bed Ritter diagnostic). The real M0 Smoky Mtns
   tile is steep — LI's worst case — so M1 also has a **mass-conservative per-cell
   flux limiter** (donor-cell β scaling) that keeps depths non-negative out of
-  regime; the demo runs stably (mass 2.1e-8, mean depth = rain input). Note: on
+  regime; the demo runs stably (mass 2.1e-8, **2.59e-8** since the precision pass;
+  mean depth = rain input). Note: on
   the steep tile mass + spatial pattern are sound, but steep-cell velocities are
   limiter-shaped, **not** validated LI hydraulics — don't carry that as a fidelity
   claim into M2. Runs are bitwise-deterministic (verified). See
@@ -275,16 +297,19 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   a single 40 m cell that is a 34 m instantaneous column. Deliver over a *reach* (the
   `outlet` box), and sanity-check `Q · interval_s / (area · cells)` before believing a
   release-driven result.
-- **At reach scale the mass gate is a *precision envelope*, not a margin.** A
-  rain-on-grid run over hundreds of thousands of cells accumulates float32 round-off in
-  `h` while it rains: M6's demo is 2.8e-7 at 15 mm/hr but the *same* scenario at
-  `coarsen = 4` trips the gate at 1.8e-6 — **identically with sub-grid channels disabled**,
-  so it is the source accumulation, not the new code (HANDOFF §12's drift-at-scale). The
-  residual is roughly fixed in absolute terms and stops growing when the rain stops, so the
-  relative error *falls* as the basin fills. Diagnose a reach-scale failure by storm depth,
-  cell count and step count before suspecting the scheme; the real fix (compensated or
-  float64 source accumulation) is a precision pass, and it should land before M7 adds
-  sediment to the same fields.
+- **A distributed source is an accumulator, and float32 accumulators need
+  compensating.** A rain-on-grid run adds `rate*dt` to every cell, every step: at reach
+  scale that used to drift a *closed* domain past the gate with nothing wrong in the
+  physics (`reach_basin` at `coarsen = 4`, 3.77e-6, identically with channels off).
+  **Fixed** by per-cell Kahan compensation on the areal sources
+  (`solver/core/sources.py`, 1.28e-7), so the envelope is now wide — **but the lesson
+  generalizes and M7's sediment is the next case**: any new distributed source added to
+  a field must go through `sources.py`, not a bare `+=`, or it reintroduces exactly this.
+  Two things the fix does *not* cover: **flux-divergence** round-off (untouched, and now
+  the floor — ~21 m³ on that run) and **point sources** (inflow is deliberately
+  uncompensated, so rain-free scenarios stay bitwise). Diagnosis discipline still
+  applies: check storm depth, cell count and step count before suspecting the scheme.
+  See `docs/plans/precision-sources.md`.
 - **Every scenario writes to the same default output, and the frames export never
   purges it.** `[meta] name` does not pick the output path — `reach_basin` and
   `demo_basin_rain` both land in `data/results/demo.zarr` + `frames/`. Run them back to

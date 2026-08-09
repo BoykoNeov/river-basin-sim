@@ -17,9 +17,14 @@ diagnostic and the validation harness gate every step.
 
 Detailed per-milestone plans live alongside this file as `M<n>-*.md`.
 
-**Carried debts before M7.** Two things M6 measured and deliberately did not fix:
-a **precision pass** on distributed-source accumulation (float32 round-off puts a
-reach-scale rain-on-grid run at the mass gate for arithmetic reasons — M7 adds a
-second distributed source onto the same fields, so this should land first), and the
-**viewer terrain path**, which still loads tile 0 only and so renders a mosaic run's
-water over one terrain tile. See `M6-reach.md` → carried limitations.
+**Carried debts before M7.** Two things M6 measured and deliberately did not fix.
+
+1. ~~**Precision pass** on distributed-source accumulation.~~ **Done 2026-08-09** —
+   per-cell Kahan compensation on areal sources (`solver/core/sources.py`) takes the
+   failing `reach_basin` @ `coarsen = 4` case from **3.77e-6 to 1.28e-7**. Runs without
+   an areal source stay bitwise unchanged; point sources are deliberately out of scope.
+   **M7's sediment must go through `sources.py` rather than a bare `+=`.** See
+   `precision-sources.md`.
+2. **Viewer terrain path** — still loads tile 0 only, so a mosaic run's (correct,
+   manifest-driven) water renders over a single, possibly unrelated terrain tile. Open.
+   See `M6-reach.md` → carried limitations.

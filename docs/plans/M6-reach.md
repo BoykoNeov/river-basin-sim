@@ -387,6 +387,15 @@ root.
   the cell count and the step count.** A real fix (a compensated or float64 source
   accumulation) is a precision pass, and it should happen before sediment (M7) adds
   another distributed source on the same fields.
+  **RESOLVED 2026-08-09** — the precision pass landed: per-cell Kahan compensation on
+  areal sources (`solver/core/sources.py`). Re-measured on this hardware, the
+  `coarsen = 4` case reads **3.77e-6 before / 1.28e-7 after** (this session measures the
+  failing case worse than the 1.8e-6 recorded above, on the same scenario), and the
+  shipped demo moves from 2.79e-7 / 3.08e-7 to **7.21e-8 CPU / 1.60e-7 CUDA**. The
+  diagnosis above was correct in every particular — the drift is generated while it
+  rains and is the source add, not the fluxes — which is what made the fix a targeted
+  one. The residual floor is now flux/limiter round-off (~21 m³ on that run), which is
+  untouched. See `precision-sources.md`.
 - **A sub-grid channel is a parameterization, not resolved physics.** It restores
   conveyance and storage; it does not restore planform, meander routing or overbank
   velocity structure. And its geometry is calibration data: `pipeline/channels.py`'s
