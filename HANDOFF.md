@@ -92,7 +92,7 @@ Three independent components connected by files. No shared memory, no shared pro
 ```mermaid
 flowchart LR
     subgraph Offline["Offline pipeline (Python)"]
-        A[Raw DEM + river network<br/>MERIT Hydro, HydroSHEDS, 3DEP] --> B[Condition + reproject<br/>GDAL, RichDEM/pysheds]
+        A[Raw DEM + river network<br/>MERIT Hydro, HydroSHEDS, 3DEP] --> B[Condition + reproject<br/>GDAL, pysheds]
         B --> C[Engine-ready tiles]
     end
 
@@ -123,12 +123,18 @@ rewritten independently as long as the formats in §7 hold.
 
 ## 5. Tech stack
 
-**Solver / pipeline (Python 3.11+):**
+**Solver / pipeline (Python 3.13, pinned in `.python-version`; managed with `uv`):**
 - `warp-lang` (NVIDIA Warp) — GPU kernels
 - `numpy`, `zarr`, `xarray` — arrays + result store + analysis
-- `rasterio`/GDAL, `richdem` or `pysheds` — DEM conditioning, flow routing
+- `rasterio`/GDAL, `pysheds` — DEM conditioning, flow routing
 - `matplotlib` — validation plots
 - NVIDIA driver + matching CUDA toolkit (verify Warp ↔ CUDA ↔ driver compatibility first)
+
+**`richdem` is dead** — no wheels past cp37 and it will not build on a modern Python.
+`pysheds` is what M0 was built on (it installs pure-Python over numba and does run on
+3.13, with a NumPy-2.x shim in `pipeline/_compat.py`); WhiteboxTools is the fallback if
+the Python coupling ever becomes a problem. The geo stack is an optional extra, so the
+pipeline tests skip silently without it — "green" is not the same as "ran".
 
 **Viewer:**
 - Godot 4.x (latest stable), GDScript
@@ -562,8 +568,9 @@ every other assertion measuring an uncompensated add against itself, silently.
 
 1. Install the NVIDIA driver + a CUDA toolkit compatible with the chosen Warp release.
    Verify `warp` initializes and sees the GPU before anything else.
-2. Python venv; install `warp-lang numpy zarr xarray rasterio richdem matplotlib`
-   (swap `richdem`→`pysheds` if preferred; `rasterio` pulls GDAL).
+2. `uv sync` for the solver and viewer-facing work; `uv sync --extra geo` to add the
+   offline DEM-conditioning stack (`rasterio`/GDAL, `pyproj`, `pysheds`, `matplotlib`).
+   Without the extra the pipeline tests `importorskip` and skip without failing.
 3. Install Godot 4.x (latest stable). Add the `Terrain3D` plugin or plan a custom
    clipmap (§12).
 4. Smoke test: a tiny Warp kernel writing a known array to Zarr, read back in xarray.
