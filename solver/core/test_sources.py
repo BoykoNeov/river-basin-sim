@@ -18,6 +18,7 @@ import warp as wp
 from solver.core import sources
 from solver.core.local_inertial import step
 from solver.core.massbalance import MassLedger
+from solver.core.schemes import get_scheme
 from solver.core.state import State
 
 wp.init()
@@ -127,6 +128,75 @@ def test_mass_ledger_residual_improves_under_compensation():
         return ledger.max_rel_error
 
     assert run(False) / max(run(True), 1e-30) > 20.0
+
+
+@pytest.mark.parametrize("scheme_name", ["local_inertial", "hllc_fv"])
+def test_spatial_rain_field_is_compensated_on_both_schemes(scheme_name):
+    """The field-rain branch, on both schemes -- the paths a scenario reaches.
+
+    Nothing else in the suite exercises these. Every other test here drives the
+    *uniform* source, and no shipped scenario sets ``rainfall.type = "field"``
+    (``spatial_fields.toml`` has field Manning and infiltration but uniform rain),
+    so without this the compensated field kernel would first execute in production.
+    Both schemes are covered because each owns its own dispatch: the local-inertial
+    scheme fuses uniform rain into continuity and routes the field separately, while
+    HLLC keeps both as standalone kernels.
+
+    The field carries a **uniform value** on purpose. A spatially varying rain field
+    tilts `eta` on a flat bed and the water starts to flow -- and at `h = 1 m` the
+    flux divergence's own float32 round-off is far larger than a sub-ulp source
+    increment, so the measurement stops being about source accumulation at all
+    (measured: it swamps the signal by ~9%). Keeping the box at rest isolates what
+    this module owns. That the kernel really reads the field per cell is a separate,
+    non-precision claim -- see :func:`test_rain_field_is_read_per_cell`.
+    """
+    scheme = get_scheme(scheme_name)
+    dt, steps = 1.0, 1500
+    # Half an ulp of h = 1 m is 5.96e-8, so this per-step increment rounds down to
+    # nothing uncompensated. It has to stay under that bound: a rate *above* it
+    # rounds a full ulp up every step and the cell over-accumulates instead.
+    rate = 4.0e-8
+    expected = rate * dt * steps
+
+    def run(compensate: bool) -> float:
+        st = _flat_state(depth=1.0)
+        st.set_rain_field(np.full(st.grid.shape, rate, dtype=np.float32))
+        if compensate:
+            st.arm_source_compensation()
+        for _ in range(steps):
+            scheme.step(st, dt=dt, rain_scale=1.0)
+        return float(st.h.numpy().astype(np.float64).mean()) - 1.0
+
+    got_plain, got_comp = run(False), run(True)
+    assert got_plain == pytest.approx(0.0, abs=1e-9)  # sub-ulp: all of it lost
+    assert got_comp == pytest.approx(expected, rel=5e-3)
+
+    err_plain = abs(got_plain - expected)
+    err_comp = abs(got_comp - expected)
+    assert err_plain / max(err_comp, 1e-30) > 100.0
+
+
+@pytest.mark.parametrize("scheme_name", ["local_inertial", "hllc_fv"])
+def test_rain_field_is_read_per_cell(scheme_name):
+    """The compensated field kernel indexes `rain[i,j]`, not a domain-wide scalar.
+
+    One step, rain over the left half only. At a sub-ulp rate `h` itself does not
+    move, so the evidence is in the compensation term -- which is exactly where the
+    debt should be: nonzero under the rain, still zero everywhere else.
+    """
+    scheme = get_scheme(scheme_name)
+    st = _flat_state(depth=1.0)
+    field = np.zeros(st.grid.shape, dtype=np.float32)
+    field[:, : st.grid.shape[1] // 2] = 4.0e-8
+    st.set_rain_field(field)
+    st.arm_source_compensation()
+
+    scheme.step(st, dt=1.0, rain_scale=1.0)
+
+    comp = st.h_comp.numpy()
+    half = st.grid.shape[1] // 2
+    assert np.all(comp[:, :half] != 0.0), "no compensation banked under the rain"
+    assert np.all(comp[:, half:] == 0.0), "compensation banked where no rain fell"
 
 
 def test_unarmed_state_keeps_the_original_kernels():

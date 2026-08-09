@@ -110,12 +110,27 @@ same configuration with and without arming and gates the improvement.
 - **Realistic storm** — 15 mm/hr onto a 0.3 m sheet at the demo's 20 s steps, the
   reach regime shrunk to a 24×24 CPU grid. Error ratio > 20.
 - **Ledger residual** — the gate quantity itself rather than raw depth. Ratio > 20.
+- **Spatial rain field, on both schemes** — the field branch is a separate dispatch
+  in each scheme and no shipped scenario reaches it (`spatial_fields.toml` has field
+  Manning and infiltration but *uniform* rain), so without this test the compensated
+  field kernel would first have executed in production. Ratio > 100, and a companion
+  test proves the kernel indexes `rain[i,j]` rather than a domain-wide scalar.
 - **Unarmed keeps the original kernels** — `h_comp is None` after stepping without
   arming, and the compensated entry points refuse to run unarmed.
 - **Arming is idempotent** and does not wipe a running debt mid-run.
 
 CI runs on Warp's CPU backend, so the reach-scale run is not the gate — these
 proxies are.
+
+**A trap worth recording, since the field test hit it twice.** These are *sub-ulp*
+tests, and that makes them fragile in two specific ways. A rate above half an ulp of
+`h` does not round *down* to nothing — it rounds a full ulp *up*, every step, and the
+uncompensated control then over-accumulates instead of losing everything. And a
+spatially varying rain field on a flat bed tilts `η` and starts the water flowing, at
+which point the flux divergence's own float32 round-off at `h = 1 m` is far larger
+than the source increment being measured (it swamped the signal by ~9%). Both tests
+therefore keep the box at rest and the rate under `5.96e-8`; per-cell indexing is
+checked separately, where flow cannot contaminate it.
 
 ## 4. Measured result
 
@@ -142,6 +157,17 @@ non-conservative `max(h, 0)` clamp: the old behaviour was a defect, not a contra
 | `reach_basin` (M6), CUDA | 3.08e-7 | **1.60e-07** |
 | `reach_basin` at `coarsen = 4` | **3.77e-06 — over gate** | **1.28e-07** |
 | `reservoir_release` (M5) | 1.36e-7 / 3.15e-7 | unchanged (no areal source) |
+
+**Negative depths are unchanged.** Kahan repays its debt by *subtracting* (`y = -comp`
+once the storm stops), so it could in principle push a sharply draining cell below
+zero. Measured against the pre-fix commit on `river_reach`, which has open boundaries
+and drying cells: **before** `h.min() = -2.33e-09` over 658,496 cells totalling
+−0.105 m³; **after** `-2.56e-09` over 652,611 cells totalling −0.105 m³ — the same
+population, the same volume, slightly fewer cells. These are the M1 limiter's and
+continuity's float32 round-off and pre-date this change; the reach-scale runs
+(`reach_basin` at both coarsenings, and the HLLC scenario) report `h.min() == 0.0`
+exactly. Nothing here is clamped: `max(h, 0)` invents mass and the repo does not use
+it (M4 measured ~6.5e-2 on a drain when it did).
 
 Two honest notes on that table. The M1/M2 demos got **marginally worse**
 (2.12e-8 → 2.59e-08): at that magnitude source drift was never what set the
