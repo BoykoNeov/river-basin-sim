@@ -313,6 +313,37 @@ sediment.
    because sizing it is a derivation (`c_b`, run length, cells per wave) and
    discovering it late means redoing the geometry. It is **not** the demo, and it
    is not `reach_basin`: see the note in §4 on why the demo cannot carry this gate.
+   **Done** — `validation/bedwave.py` (the durable fixture: geometry, the derived
+   design point, three migration estimators) + `validation/test_bed_wave.py` (a
+   *provisional* harness, superseded by step 5's process, and four checks). No
+   `.toml`: every gate in this harness builds its state in Python, and `run.py`
+   refuses `[sediment]` until step 5. What sizing turned up, all measured:
+   - **The design point** — 240×1 cells @ 2.5 m (600 m), `S = 0.002`, `n = 0.035`,
+     `d50 = 8 mm`, `q = 2.5 m²/s` → `h_n = 1.4959 m`, `Fr = 0.44`,
+     `θ = 0.2266` (4.8 θ_c), `c_b = 8.63e-3 m/s`. A 15 mm × σ 15 m bump migrates
+     **16 cells (40 m) in 4635 s**, 103 activations at 45 s (Courant 0.155),
+     ~13 000 fast steps, ~2 s on CPU. The solver hits that design point to four
+     decimals (1.4959 m, `q = 2.5000`, θ = 0.2266), so the gate's denominator is
+     the celerity of the flow that actually ran, not a nominal one.
+   - **Measured migration: 0.993 c_b** by cross-correlation lag (gated), 1.004 by
+     crest fit, 0.942 by centroid; crest keeps 0.72 of its height; signal/background
+     ≈ 30. Interval stability (xcorr/`c_b`): 0.93 @ 11.25 s, 0.95 @ 22.5 s,
+     **0.99 @ 45 s**, 0.99 @ 90 s, 0.97 @ 180 s, 0.94 @ 360 s (Courant 1.24) — a 7%
+     spread, so **step 8 can gate ±20% on the shape estimator** and treat the crest
+     and centroid as printed diagnostics.
+   - **The reference is only meaningful for a slender bump.** `bed_celerity`
+     linearises at a *rigid* water surface; how close reality gets is set by
+     `σ/(h/S)`. At 0.02 the wave lands within 1% of `c_b`; at 0.07 it reads ~0.9
+     with a visible grid dependence; at 0.30 it collapses to 0.37 and refining `dx`
+     does not recover it. Two design points were rejected on exactly this
+     (`Fr = 0.77` at `σ/(h/S) = 0.065`; a shallow steep flume at 0.30).
+   - **The ends must be pinned, and that is a sediment BC.** Boundary faces carry no
+     bedload, so with free ends the inlet scoured **1.12 m** and the outlet grew a
+     **0.91 m** sill in 26 activations, whose backwater lifted the reach 1.495 →
+     1.944 m (30%) — the flow is wrong everywhere before the bump has moved. Pinning
+     one cell at each end via `exner_update`'s `dz_lo == dz_hi == 0` makes them an
+     equilibrium feed and an equilibrium sink (banked, not clamped), and the reach
+     holds 1.4952 m. See the step-5 requirement below and §4.
 4. **`state.py` + `sources.py`** — arm `dz_cum` (**f64**, cell-centred), `qs_int`
    + its compensation (**f32**, faces, §1.3), `z0` (the pristine initial bed);
    generalise the exact-accumulation helpers to take a target array; extend
@@ -322,7 +353,18 @@ sediment.
    `reservoir.py`: constructed after `State`, exposes `as_slow_process()`,
    `advance(t, dt_slow)` returns a record, `series` lands in `.zattrs`. Plus the
    per-fast-step accumulation hook in `run.py` (beside the inflow injector, which
-   is already wired that way).
+   is already wired that way). Two requirements step 3 hands it:
+   - **It must accept explicit `dz_lo`/`dz_hi` arrays (or a frozen-cell mask) at
+     construction**, not only bounds derived from `[sediment]`. `alluvium_thickness
+     = 0` pins the floor and leaves the ceiling open, so nothing in the config can
+     hold an outlet cell *down* — and step 3's fixture needs exactly that, as will
+     any scenario that wants an equilibrium sediment BC.
+   - **Assert once that the in-`step` hook is equivalent to accumulating after
+     `step` returns**, which is what the step-3 harness does and what makes its
+     recorded numbers transferable: for LI, `eta` is computed at the top of the step
+     and never rewritten, the faces are final after the limiter, and the
+     post-continuity sinks touch only `h`. A future reordering would silently move
+     the gate.
 6. **`SedimentLedger`** in `massbalance.py` or beside it — same shape as
    `MassLedger`, same Kahan f64 accumulators, same causal peak floor, its own
    relative gate. Masked-cell and clamped transport bank here.
@@ -354,10 +396,17 @@ sediment.
 - **Bed-wave celerity against the implemented law.** A low bump in a steady
   uniform channel migrates at `c_b = (1/(1−p)) · dq_s/dz`; gate the numerical
   celerity against the analytical one derived for MPM. This is M6's fine-vs-coarse
-  pattern — self-consistent, in-tree, and genuinely discriminating.
+  pattern — self-consistent, in-tree, and genuinely discriminating. The fixture and
+  its sizing evidence landed at build step 3 (`validation/bedwave.py`): measured
+  **0.993 c_b** by shape correlation, so the step-8 gate is ±20% on that estimator,
+  with the crest fit and the centroid printed rather than gated. Note the reference
+  is a *rigid-surface* linearisation — it is only the right reference while the bump
+  stays slender against `h/S` (step 2 of the build order, and §4).
 - **Interval independence.** Halve `interval_s`; the final bed must agree to a
   stated tolerance. This is what §1.3's time-integrated flux buys and the reason
-  to build it that way.
+  to build it that way. Measured on the step-3 fixture across a 32× range of
+  intervals: 7% spread in the migration, degrading only where the morphological
+  Courant number passes 1.
 - **Morphological CFL print** is asserted, not just printed: a scenario that
   exceeds it fails a test rather than producing a plausible-looking wrong answer.
 
@@ -381,6 +430,16 @@ sediment.
   shear is much larger than a naive `h·S` on the cell mean. Getting this wrong
   in either direction is a factor-of-`dx/w` error — up to ~15× on this demo.
   It is the single most likely physics bug in the milestone.
+- **An open boundary grows a sill, and it is big.** Boundary faces carry no bedload
+  (they are never updated — that *is* the closed BC) and the local-inertial open
+  boundary is a post-interior sink on the edge *cell*, not a face. So water leaves
+  and its load does not. Measured on the step-3 fixture with free ends: the outlet
+  cell aggraded **0.053 m per activation** — 0.91 m in 26 — and its backwater lifted
+  the whole reach's depth by 30%, while the inlet cell (exporting with no supply)
+  scoured 1.12 m. This is not fixture-specific: `reach_alluvial.toml` has an open
+  boundary and will do the same, and the sill is a *hydraulic* error long before it
+  is a visible one. Either pin the end cells (`dz_lo == dz_hi == 0`, banked into the
+  ledger) or keep every quoted measurement clear of the boundaries and say which.
 - **Every scenario still writes to the same default output**, and the frames
   export still never purges it. Pass `--out` / `--frames-dir` for anything worth
   keeping (CLAUDE.md's sharpest gotcha, and a morphology run is expensive enough
@@ -397,6 +456,11 @@ sediment.
    way this is independent of the celerity scenario (build step 3), which is a
    gate fixture and is not up for the same decision.
 2. **`interval_s` default** — 900 s follows the reservoir. Wants checking against
-   the morphological CFL on the demo before it becomes a default.
+   the morphological CFL on the demo before it becomes a default. First datum from
+   build step 3: 900 s puts the *celerity fixture* at Courant 3.1, so that fixture
+   carries its own 45 s — a deliberately erosive reach at 2.5 m cells is the worst
+   case, and it says the default cannot be assumed rather than that it is wrong.
+   `reach_basin`-scale numbers (100 m cells, millimetre-per-activation channel
+   transport) will land far under 1; the demo at step 9 decides it.
 3. **Viewer** — confirmed deferred (§1.7), or is a static final-bed toggle wanted
    inside M7?

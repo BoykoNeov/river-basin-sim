@@ -11,6 +11,7 @@ Designed to run on Warp's **CPU backend** so they execute in CI without a GPU.
 | **Dam-break** | shock speed + wave shape vs the analytical Stoker/Ritter solution | M1 |
 | **Lake-at-rest** | flat surface over arbitrary bed stays flat, zero velocity (well-balancedness) | M4 |
 | **UK EA 2D benchmark suite** | realistic flood behaviour vs the standard battery | M4 |
+| **Bed-wave celerity** | a low bed bump migrates at the analytical `c_b` of the implemented MPM law (`bedwave.py` holds the fixture and its sizing derivation) | M7 |
 
 Run with `uv run pytest`. A run whose mass-balance error exceeds threshold is a
 **bug, not a warning** — treat exceedance as a failing test.
