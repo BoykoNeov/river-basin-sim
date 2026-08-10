@@ -36,11 +36,14 @@ import numpy as np
 import pytest
 import warp as wp
 
+from solver.core.channels import arm_channels
 from solver.core.grid import H_DRY
 from solver.core.local_inertial import compute_dt, step
 from solver.core.massbalance import MASS_GATE, SEDIMENT_GATE, MassLedger, SedimentLedger
 from solver.core.sediment import SHIELDS_CRITICAL, arm_sediment, shields_from_flow
 from solver.core.state import State
+from solver.io.config import Inflow
+from solver.processes.inflow import InflowInjector
 from solver.processes.morphology import MorphologyProcess
 from validation.bedwave import BedWave, drive
 
@@ -198,6 +201,155 @@ def test_the_gate_scenarios_transport_inside_the_laws_range():
     # The contrast is the whole argument: without it, "> 20" could be vacuous.
     assert 1e-3 / 0.002 < 1.0
     assert sheet > 10.0 * SHIELDS_CRITICAL
+
+
+# --- the M7 demo's scenario-design claim (build step 9) ------------------------
+# `test_the_gate_scenarios_transport_inside_the_laws_range` above checks the *step-8
+# fixtures*, analytically, from a steady normal depth. A shipped scenario is a harder
+# case and the demo is the first one: it starts dry, it carries a sub-grid channel, and
+# it advances a wetting front, so "the reach is in regime" is no longer a single number
+# -- some cells always sit at the wet/dry guard. What `scenarios/reach_alluvial.toml`
+# claims instead is a *distribution*: essentially all of the bed change happens where
+# the law applies. This pair gates that claim, on the same geometry, with the forcing
+# as the only variable.
+
+_DEMO_D50 = 0.008  # m, the demo's grain size
+_REGIME_FLOOR = 35.0  # h_col/d50; the lowest relative submergence the step-8 gates run at
+
+
+def _channel_reach(ny: int = 48, nx: int = 9, dx: float = 100.0):
+    """A coarse valley with a sub-grid channel down the middle -- the demo in miniature.
+
+    Deliberately at the demo's own cell size and channel width, because the quantity
+    under test is the ratio between them: the storage curve stands a channel cell's
+    water ``dx/w`` deeper than its cell mean, and reading the regime off the cell mean
+    instead would call a 1.6 m river a 0.11 m sheet (which is what it does).
+    """
+    rows = np.arange(ny, dtype=np.float64)[:, None]
+    cols = np.arange(nx, dtype=np.float64)[None, :]
+    mid = (nx - 1) / 2.0
+    # 0.15% down-valley, banks rising 0.4 m per cell away from the river.
+    bed = 20.0 - 0.15 * rows + 0.4 * np.abs(cols - mid)
+    w = np.where(np.abs(cols - mid) < 0.5, 8.0, 0.0) * np.ones_like(rows)
+    d = np.where(w > 0.0, 1.5, 0.0)
+    return bed.astype(np.float32), w.astype(np.float32), d.astype(np.float32), dx
+
+
+def _regime_share(rain_mm_hr: float, *, activations: int = 12, interval_s: float = 900.0):
+    """Drive the reach; return (in-regime share of the interior, interior volume,
+    peak interior |dz|, outlet-row volume share).
+
+    The share is volume-weighted on purpose. A *minimum* over cells that moved is the
+    wrong statistic for any dry-start run -- the wetting front always puts some cell at
+    the guard, so a min-based gate could only ever fail -- while the share answers the
+    question a quoted bed change actually rests on: did the metres come from cells the
+    law describes?
+
+    **The open-boundary row is excluded, and separately reported.** That is not a
+    convenience: a boundary face carries no bedload (never being updated *is* the closed
+    sediment BC) while the local-inertial open boundary removes water from the edge
+    *cell*, so the water leaves and its load does not, and the cell aggrades. M7 plan §4
+    predicts it for this scenario by name and measures 0.053 m per activation on the
+    free-ended celerity fixture. Nothing in ``[sediment]`` can pin a cell *down*
+    (``alluvium_thickness`` bounds the floor only), so the sanctioned remedy is to keep
+    quoted figures clear of the boundary and say which -- which means measuring it, not
+    dropping it silently. Here it is 81% of the gross volume in the last two rows, and
+    folding that into a regime statistic would conflate a boundary artefact with the
+    question of whether the law was used inside its range.
+    """
+    bed, w, d, dx = _channel_reach()
+    ny, nx = bed.shape
+    st = State.from_bed(bed, dx=dx, manning=np.full_like(bed, 0.06), device=DEV)
+    arm_channels(st, w, d, np.where(w > 0.0, 0.03, 0.06).astype(np.float32))
+    arm_sediment(st, np.full(bed.shape, _DEMO_D50, dtype=np.float32), 0.4)
+    morph = MorphologyProcess(st, interval_s)
+    # Q into the head of the channel, spread over four cells the way the demo spreads
+    # it -- the whole discharge into one cell digs a crater that dominates the volume.
+    # Sized to stay *within bank*: normal depth at this q is ~0.9 m against a 1.5 m
+    # bank, which is the demo's condition. An earlier 20 m^3/s overbanked (h_n ~ 1.5 m)
+    # and turned the in-channel arm into a second sheet-flow case -- the in-regime share
+    # fell 89.5% -> 51.9% as the run lengthened, because it was measuring the floodplain.
+    q_each = 8.0 / 4.0
+    mid = nx // 2
+    inj = InflowInjector(
+        [Inflow(cell=(r, mid), hydrograph=[(0.0, q_each), (1.0e9, q_each)]) for r in range(4)],
+        st.grid,
+        DEV,
+    )
+    st.set_open_boundaries({"south": "open"})
+    rain_m_s = rain_mm_hr / 1000.0 / 3600.0
+    if rain_m_s > 0.0:
+        st.arm_source_compensation()
+
+    t, acts = 0.0, 0
+    while acts < activations:
+        dt = min(compute_dt(st, alpha=0.7, dt_max=20.0), (acts + 1) * interval_s - t)
+        inj.apply(st, t, dt)
+        step(st, dt, rain=rain_m_s)
+        t += dt
+        if t >= (acts + 1) * interval_s - 1e-9:
+            morph.advance(t, interval_s)
+            acts += 1
+
+    dz = np.abs(st.sediment.bed_change_numpy())
+    h = st.h.numpy().astype(np.float64)
+    # The storage curve, host-side: below bank full a channel cell's water all stands
+    # in the channel, dx/w deeper than the cell mean (solver.core.channels).
+    has = (w > 0.0) & (d > 0.0)
+    w_s = np.where(has, w, 1.0).astype(np.float64)
+    h_bf = w_s * d / dx
+    h_col = np.where(has, np.where(h <= h_bf, h * dx / w_s, d + (h - h_bf)), h)
+    vol = dz * dx * dx
+    outlet_share = float(vol[-1].sum()) / float(vol.sum()) if vol.sum() > 0.0 else 0.0
+    interior = slice(0, ny - 1)  # everything but the open south edge
+    vol_i, sub_i = vol[interior], h_col[interior] / _DEMO_D50
+    gross = float(vol_i.sum())
+    in_regime = float(vol_i[sub_i >= _REGIME_FLOOR].sum())
+    return (
+        (in_regime / gross if gross > 0.0 else 0.0),
+        gross,
+        float(dz[interior].max()),
+        outlet_share,
+    )
+
+
+def test_an_inflow_driven_channel_keeps_its_transport_where_the_law_lives():
+    """The demo's design claim, and the rain sheet that breaks it -- same geometry.
+
+    ``scenarios/reach_alluvial.toml`` drops rainfall entirely, which looks like a
+    stylistic choice and is not: MPM is a channel bedload law and its shear diverges as
+    ``h -> H_DRY`` at fixed ``q``, so a millimetric rain-on-grid sheet transports
+    furiously in a regime shallower than a single grain. Measured on the shipped
+    scenario before the rain was removed: **83% of the run's gross bed change** sat in
+    a rain artefact, and an absent ``[rainfall]`` table was silently supplying 50 mm/hr
+    (:mod:`solver.io.test_config`).
+
+    So the pair varies only the forcing. Both arms run the same coarse valley, the same
+    sub-grid channel, the same grain, the same discharge into the same four head cells;
+    one adds ``reach_basin``'s 15 mm/hr storm on top. The claim is not "the in-channel
+    arm is in regime" -- that alone would pass by construction on any well-drawn reach
+    -- it is that the share **collapses** when the sheet is added, which is what makes
+    dropping the rain a design decision rather than a preference.
+    """
+    dry, dry_gross, dry_peak, dry_outlet = _regime_share(0.0)
+    wet, wet_gross, wet_peak, wet_outlet = _regime_share(15.0)
+    print("")
+    print(
+        f"[regime] inflow only   : {100 * dry:5.1f}% of {dry_gross:11.1f} m3 in regime "
+        f"(h_col/d50 >= {_REGIME_FLOOR:g}), peak |dz| {1000 * dry_peak:10.2f} mm, "
+        f"outlet row {100 * dry_outlet:4.1f}% of gross"
+    )
+    print(
+        f"[regime] + 15 mm/hr    : {100 * wet:5.1f}% of {wet_gross:11.1f} m3 in regime, "
+        f"peak |dz| {1000 * wet_peak:10.2f} mm, outlet row {100 * wet_outlet:4.1f}% of gross"
+    )
+    assert dry_gross > 0.0, "the in-channel arm moved no bed at all -- nothing is gated"
+    assert dry > 0.95, f"the demo's own pattern is out of regime ({100 * dry:.1f}%)"
+    # The contrast is the whole argument. Without it, "> 0.95" says nothing about
+    # whether the choice of forcing was load-bearing -- and the interior share is the
+    # honest place to make it, since the boundary artefact is present in both arms.
+    assert wet < 0.5 * dry, f"a rain sheet did not move the transport out of regime ({wet:.2f})"
+    assert wet_gross > 100.0 * dry_gross, "the sheet should transport far more, out of range"
 
 
 def test_deposition_can_dry_a_cell_and_the_ordinary_guard_is_what_dries_it():
