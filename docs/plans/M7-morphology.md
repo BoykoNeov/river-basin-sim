@@ -491,6 +491,63 @@ sediment.
 6. **`SedimentLedger`** in `massbalance.py` or beside it — same shape as
    `MassLedger`, same Kahan f64 accumulators, same causal peak floor, its own
    relative gate. Masked-cell and clamped transport bank here.
+   **Done** — `SEDIMENT_GATE` + `SedimentRecord` + `SedimentLedger` in
+   `massbalance.py` (so one module owns both credibility gauges), recorded at the
+   output cadence from `run.py` and shipped in `.zattrs`. Five decisions worth naming,
+   three of which are places this step's own brief was wrong:
+   - **"Same Kahan f64 accumulators" does not survive contact with the terms.** Every
+     sediment quantity is a *fresh full-field f64 reduction* at each accounting point
+     — `Σ dz_cum`, `Σ dz_unapplied`, `Σ|dz_cum|` — not a running sum of many small
+     increments, so there is nothing for `_Kahan` to compensate and it is deliberately
+     unused. What the water ledger lends is the **idiom**: a record dataclass, a causal
+     peak, a relative gate, `as_attrs`. Shipping the accumulator anyway would repeat
+     exactly what step 4 refused when it dropped the generalised accumulation helper.
+   - **There are no inflow/outflow terms, and that is the physics, not an omission.**
+     Bedload cannot cross a domain edge — `accumulate_qs_*` launch over interior faces
+     only, so the four edge face-rows stay exactly zero and `div(qs_int)` telescopes to
+     nothing. The whole balance is therefore **`Σ dz_cum + Σ dz_unapplied = 0`**: every
+     metre gained somewhere came from somewhere else, plus what the bounds refused. A
+     bound is a *supply* (`supplied = -banked`): the fixture's frozen inlet that wanted
+     to erode 1.12 m and did not has fed the domain that much solid. Accumulators for a
+     boundary term nobody can produce would ship with zero callers;
+     `test_the_boundary_faces_carry_no_bedload` is the standing evidence instead, and
+     it is what fails first if a future supply BC starts writing them.
+   - **The causal peak is on the *gross*, and it is the primary scale rather than a
+     floor.** §3 justified the floor by "erode-then-redeposit nets to zero" — but for
+     sediment the net is *identically* zero, since that is the invariant under test, so
+     a peak-of-net would be vacuous and the denominator would end up being the residual
+     itself. The scale that means anything is `A(1-p)·Σ|dz_cum|`, and it is **reported
+     in every record** for the same reason: without it a near-zero residual cannot be
+     told from "nothing happened" (`test_the_gross_volume_tells_a_balanced_bed_from_a
+     _still_one` pins both readings side by side).
+   - **What is balanced is `dz_cum`, not `z`.** The float32 bed is a *rendering* of the
+     f64 change (`z = float32(z0 + dz_cum)`); differencing two O(100 m) float32
+     elevations to recover a sub-millimetre change is the cancellation §1.1 built
+     `dz_cum` to avoid.
+   - **The gate is measured on both paths, because banking is the one that can silently
+     break.** On the celerity fixture over 103 activations: worst relative residual
+     **5.7e-15 with the bounds firing**, **2.1e-16 with them absent** — and the
+     *absolute* residuals are 1.4e-15 and 2.5e-15 m³, i.e. the same round-off, so the
+     27× ratio is only the pinned run's 27× smaller gross (1.24 vs 33.5 m³) and not a
+     banking defect. `SEDIMENT_GATE = 1e-11` leaves ~3 orders over that, and is 5
+     orders tighter than the water gate because this balance is f64 arithmetic over an
+     f64 field where the water gate absorbs float32 flux divergence.
+
+   `run_simulation` still returns `MassLedger` — the sediment balance travels in
+   `.zattrs`, which also makes the shipped artifact the thing under test. **312 tests
+   green.**
+
+   **One finding for step 8, measured here and out of scope for this step.** The bowl
+   scenario in `test_run.py` scours **5.6 cm in its first 150 s activation** and then
+   almost nothing for the rest of the run — because MPM at the dry threshold is
+   enormous. `τ/ρ = g n² q²/h^(7/3)` diverges as `h → H_DRY = 1e-3 m` at fixed `q`: a
+   1 mm sheet at 0.5 m/s with `n = 0.03`, `d50 = 2 mm` reads `θ = 0.68`, **14× θ_c**,
+   for `q_s = 1.4e-3 m²/s` — which over a 150 s interval and a 20 m cell is exactly the
+   ~1.8 cm/activation observed. MPM is a channel bedload law and an overland sheet at
+   the wet/dry guard is outside it; the ledger is exact through all of this (2.8e-17)
+   because conservation is not the thing at stake. Step 8 has to decide whether the
+   gate scenarios stay clear of that regime or the law carries a depth guard, and §4
+   should carry it as a risk beside the `dx/w` one.
 7. **Store + export** — `bed_change` through `ZarrWriter`, §7.2 and §7.1 edits in
    HANDOFF, the manifest note, `scripts/plot_bed_change.py`.
 8. **Validation** — §3, every gate.
@@ -505,6 +562,11 @@ sediment.
   gate's 1e-6: `(1−p)·Σ Δz·A + banked = net sediment in − out`, relative, with a
   causal peak floor. An erode-then-redeposit run nets to zero and would otherwise
   trip on denominator collapse — the same trap M4 hit and fixed for water.
+  **Landed at build step 6**, and sharper than this bullet: the right-hand side is
+  *structurally* zero (bedload cannot cross a boundary face), the net is zero for the
+  same reason, so the causal peak had to move onto the **gross** displaced volume and
+  became the primary scale rather than a floor. `SEDIMENT_GATE = 1e-11`, measured on
+  both the banking and the bounds-free path.
 - **Water mass gate stays green** — on every existing scenario with sediment
   unarmed (**bitwise identical**, the invariant M4/M5/M6 all held), and on the new
   demo with it armed (within gate). This is the regression that catches a bed
@@ -549,6 +611,16 @@ sediment.
   number of cells**, and at these rates it will not move one. Hence the separate,
   purpose-sized celerity scenario at build step 3 — the gate and the demo are
   answering different questions and cannot share a scenario.
+- **MPM at the wet/dry guard is enormous, and a rain-on-grid scenario lives there.**
+  `τ/ρ = g n² q²/h^(7/3)` diverges as `h → H_DRY = 1e-3 m` at fixed `q`, so a 1 mm
+  overland sheet at 0.5 m/s reads `θ = 0.68` (**14× θ_c**) for `d50 = 2 mm` and
+  `n = 0.03`. Measured at build step 6: the 16×16 bowl in `test_run.py` scours **5.6 cm
+  in its first 150 s activation** — the whole run's bed change — while `h_max` is still
+  2 cm. This is the law being extrapolated outside its range (MPM is a *channel bedload*
+  law; a millimetric sheet is not bedload), not a conservation failure — the ledger
+  reads 2.8e-17 through all of it. Either keep the gate and demo scenarios in channel
+  flow, or give the law a depth guard and say so; **step 8 decides, and quoting a
+  floodplain bed change before it does would be quoting an artefact.**
 - **The channel storage curve amplifies depth by `dx/w`**, so a channel cell's
   shear is much larger than a naive `h·S` on the cell mean. Getting this wrong
   in either direction is a factor-of-`dx/w` error — up to ~15× on this demo.

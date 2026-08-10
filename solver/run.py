@@ -25,7 +25,7 @@ import warp as wp
 from solver.core.channels import arm_channels
 from solver.core.datum import resolve_datum, shift_bed, unshift_bed
 from solver.core.grid import Grid
-from solver.core.massbalance import MASS_GATE, MassLedger
+from solver.core.massbalance import MASS_GATE, SEDIMENT_GATE, MassLedger, SedimentLedger
 from solver.core.schemes import get_scheme
 from solver.core.sediment import arm_sediment
 from solver.core.state import State
@@ -291,6 +291,11 @@ def run_simulation(
     reservoirs = build_operators(elev.structures, st)
 
     ledger = MassLedger.from_state(st)
+    # The second conserved substance gets its own ledger, and only when there is a
+    # bed to conserve: solid volume is closed to the domain (bedload cannot cross a
+    # boundary face), so what it balances is that every metre gained somewhere came
+    # from somewhere else, plus whatever the bounds refused and banked.
+    sed_ledger = SedimentLedger.from_state(st) if morphology is not None else None
 
     n_frames = int(round(scenario.end_time / scenario.output_every)) + 1
     attrs = {
@@ -382,8 +387,15 @@ def run_simulation(
             u, v = st.velocities_numpy()
             writer.append(tick.t1, st.depth_numpy(), u, v)
             h_max = float(st.h.numpy().max())
+            line = f"  t={tick.t1:8.1f}s  h_max={h_max:6.3f}m  mass_rel_err={rec.rel_error:.2e}"
+            if sed_ledger is not None:
+                sed_rec = sed_ledger.record(st, tick.t1)
+                # Gross displaced volume, not the net: the net is identically zero in
+                # a domain closed to bedload, so it would say nothing about whether
+                # any sediment moved (solver.core.massbalance.SedimentLedger).
+                line += f"  bed_moved={sed_rec.gross_volume:9.1f}m3"
             if verbose:
-                print(f"  t={tick.t1:8.1f}s  h_max={h_max:6.3f}m  mass_rel_err={rec.rel_error:.2e}")
+                print(line)
             if status is not None:
                 status.write(
                     "running",
@@ -399,6 +411,7 @@ def run_simulation(
         # stored run says what its slow clock did. The bed_change *field* is M7
         # build step 7; this is the record of the activations that produced it.
         final_attrs["morphology"] = morphology.series
+        final_attrs.update(sed_ledger.as_attrs())
     if reservoirs:
         # The release history is the evidence the slow clock actually ran; it lives
         # with the mass series so a stored run is self-describing (§7.2).
@@ -408,8 +421,20 @@ def run_simulation(
         print(f"done: {out_path}")
         print(f"  frames        : {len(ledger.series)}")
         print(f"  mass max rel  : {ledger.max_rel_error:.2e}  (gate {MASS_GATE:.0e})")
+        if sed_ledger is not None:
+            last = sed_ledger.series[-1]
+            print(
+                f"  sediment rel  : {sed_ledger.max_rel_error:.2e}  (gate {SEDIMENT_GATE:.0e}), "
+                f"{last.gross_volume:.1f} m3 moved, {last.banked_volume:+.1f} m3 banked"
+            )
+            print(
+                f"  bed courant   : {morphology.peak_courant:.2f} peak  "
+                "(> 1 is a splitting artefact)"
+            )
     if ledger.max_rel_error >= MASS_GATE:
         print(f"  WARNING: mass-balance gate exceeded ({ledger.max_rel_error:.2e})")
+    if sed_ledger is not None and sed_ledger.max_rel_error >= SEDIMENT_GATE:
+        print(f"  WARNING: sediment-balance gate exceeded ({sed_ledger.max_rel_error:.2e})")
     return ledger
 
 

@@ -9,7 +9,7 @@ import pytest
 import warp as wp
 import xarray as xr
 
-from solver.core.massbalance import MASS_GATE
+from solver.core.massbalance import MASS_GATE, SEDIMENT_GATE
 from solver.io.config import ConfigError, Inflow
 from solver.run import Scenario, field_memory_mb, main, run_simulation
 
@@ -287,6 +287,16 @@ def test_a_sediment_scenario_runs_and_records_what_its_slow_clock_did(tmp_path):
     assert any(r["applied_m3"] != 0.0 for r in series), "no sediment moved at all"
     # Unbounded bed: nothing was refused, so the ledger is owed nothing (step 6).
     assert all(r["banked_m3"] == 0.0 for r in series)
+
+    # Step 6: the second conserved substance has its own gauge, and it ships with the
+    # run rather than living in the process object -- the same reason the water series
+    # does. It is sampled at the *output* cadence (the morphology series above is the
+    # activation one), so a reader can line it up frame for frame with the mass series.
+    assert ds.attrs["sediment_max_rel_error"] < SEDIMENT_GATE
+    sed_series = ds.attrs["sediment_balance_series"]
+    assert [r["time"] for r in sed_series] == [0.0, 300.0, 600.0]
+    assert sed_series[-1]["gross_volume"] > 0.0, "gross must say the bed actually moved"
+    assert all(r["banked_volume"] == 0.0 for r in sed_series)
 
 
 def test_field_memory_counts_the_two_widths_separately_for_morphology():
