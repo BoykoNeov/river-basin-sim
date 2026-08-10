@@ -27,7 +27,7 @@ from solver.core.datum import resolve_datum, shift_bed, unshift_bed
 from solver.core.grid import Grid
 from solver.core.massbalance import MASS_GATE, SEDIMENT_GATE, MassLedger, SedimentLedger
 from solver.core.schemes import get_scheme
-from solver.core.sediment import arm_sediment
+from solver.core.sediment import MORPH_COURANT_GATE, arm_sediment
 from solver.core.state import State
 from solver.io.coarsen import (
     block_reduce,
@@ -445,6 +445,18 @@ def run_simulation(
         print(f"  WARNING: mass-balance gate exceeded ({ledger.max_rel_error:.2e})")
     if sed_ledger is not None and sed_ledger.max_rel_error >= SEDIMENT_GATE:
         print(f"  WARNING: sediment-balance gate exceeded ({sed_ledger.max_rel_error:.2e})")
+    if morphology is not None and morphology.peak_courant >= MORPH_COURANT_GATE:
+        # Warned, not raised -- the mass gates set the precedent, and a deliberately
+        # coarse exploratory run is a legitimate thing to do. It is *printed
+        # unconditionally* (unlike the `bed courant` line above, which is verbose-only)
+        # because this is the one failure mode with no other symptom: the run finishes,
+        # the mass balance is clean, and the bed is wrong (M7 build step 8).
+        print(
+            f"  WARNING: morphological Courant {morphology.peak_courant:.2f} exceeds "
+            f"{MORPH_COURANT_GATE:.0f} -- the bed wave crosses more than a cell per "
+            f"activation, so the bed change is a splitting artefact. Shorten "
+            f"[sediment] interval_s (it is {scenario.sediment_interval_s:g} s)."
+        )
     return ledger
 
 

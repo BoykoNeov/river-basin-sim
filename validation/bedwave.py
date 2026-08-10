@@ -78,14 +78,27 @@ Every one of these is a constraint, and they pull against each other:
 6. **Small amplitude.** 15 mm on 1.5 m of water. At 30 mm the crest travelled 3%
    fast and the shape 2% fast -- nonlinear steepening, since ``c_b`` rises with bed
    elevation -- which is real physics but not what the gate is written against.
-7. **The activation interval is the fixture's own, not the 900 s default.** At
-   900 s this bed wave crosses 3.1 cells per activation, which is a splitting
-   artefact rather than a result (M7 plan §1.3). Measured stability in the
-   interval, as ``xcorr`` celerity over ``c_b``: 0.93 at 11.25 s, 0.95 at 22.5 s,
-   **0.99 at 45 s**, 0.99 at 90 s, 0.97 at 180 s, and 0.94 at 360 s where the
-   Courant number passes 1.24. Short intervals couple the water to the bed more
-   tightly (the physical answer is slightly *slower* than the rigid-lid celerity)
-   and long ones lose the splitting; 45 s sits between, and the whole spread is 7%.
+7. **The activation interval is the fixture's own, not the 900 s default, and it is
+   fenced on both sides.** Above, at 900 s, this bed wave crosses 3.1 cells per
+   activation, which is a splitting artefact rather than a result (M7 plan §1.3).
+   Below, the limit is not the splitting at all but the **scheme**: a shorter
+   interval means more sync-point activations, every one of which clamps ``dt`` and
+   so hands local-inertial an abrupt shorten-then-restore that excites a
+   short-wavelength mode (M7 plan §4, *"a clamped step is not a free step"*).
+   Measured on this fixture with the **bump removed**, so every departure below is
+   spurious: +-0.16 mm at 90 s, **+-0.11 mm at 45 s**, +-8.85 mm at 22.5 s and
+   +-29.3 mm at 11.25 s -- against a 15 mm bump. 45 s sits inside the band, and
+   ``xcorr`` celerity over ``c_b`` across it reads 0.99 at 45 s, 0.996 at 90 s and
+   0.97 at 180 s.
+
+   **The first draft of this constraint said the opposite and it was wrong.** It
+   read *"short intervals couple the water to the bed more tightly (the physical
+   answer is slightly slower than the rigid-lid celerity)"* -- i.e. it took the
+   short-interval readings for convergence toward a coupled answer and quoted them
+   as physics. They are a numerical artefact, and the discriminator is that they
+   appear with **no bed at all**: the same clamp cadence applied to water alone,
+   with sediment never armed, ripples a steady 1.4959 m reach by 74 mm at 22.5 s
+   and destroys it at 11.25 s, while the mass gate reads 1e-8 throughout.
 
 **The ends are pinned, and that is a sediment boundary condition, not a fudge.**
 Boundary faces carry no bedload (they are never updated, which is the closed BC),
@@ -157,13 +170,16 @@ window's asymmetry cancels instead of biasing the answer.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
 from solver.core.grid import GRAVITY
+from solver.core.local_inertial import compute_dt, step
+from solver.core.massbalance import MassLedger
 from solver.core.sediment import (
     SHIELDS_CRITICAL,
+    arm_sediment,
     bed_celerity,
     capacity_from_flow,
     morphological_courant,
@@ -171,6 +187,8 @@ from solver.core.sediment import (
 )
 from solver.core.state import State
 from solver.io.config import Inflow
+from solver.processes.inflow import InflowInjector
+from solver.processes.morphology import MorphologyProcess
 
 # Water in at the head, out at the toe. The east edge is the M3 post-interior sink
 # (solver.core.boundaries): it passes water and, by construction, no sediment.
@@ -288,6 +306,32 @@ class BedWave:
     def shields_margin(self) -> float:
         """``theta / theta_c`` -- constraint (1); below ~3 the gate measures threshold."""
         return self.shields / SHIELDS_CRITICAL
+
+    def at_shields(self, ratio: float) -> BedWave:
+        """This fixture re-grained to sit at ``ratio * theta_c``, flow untouched.
+
+        ``theta = tau / (rho s' g d50)`` and ``tau`` carries no grain size at all, so
+        ``theta`` is **exactly** inversely proportional to ``d50`` -- and ``d50`` does
+        not enter the hydraulics either (Manning ``n`` is separate). So the threshold
+        pair (M7 plan §3, *"no transport below theta_c"*) is one variable: the same
+        reach, the same flow, the same bump, a different grain size. Building a second
+        fixture at a different slope or discharge would move the hydraulics too and
+        the pair would stop being a clean contrast.
+        """
+        if ratio <= 0.0:
+            raise ValueError(f"shields ratio must be > 0, got {ratio}")
+        return replace(self, d50=self.d50 * self.shields / (ratio * SHIELDS_CRITICAL))
+
+    @property
+    def relative_submergence(self) -> float:
+        """``h/d50`` -- how many grain diameters deep the flow is.
+
+        The regime check M7 build step 8 gates its scenarios on. MPM is a *channel
+        bedload* law and says nothing about a sheet thinner than the grains it is
+        moving: this fixture reads 187, while the millimetric overland sheet at the
+        wet/dry guard that build step 6 measured reads **0.5** (M7 plan §4).
+        """
+        return self.normal_depth / self.d50
 
     @property
     def capacity(self) -> float:
@@ -507,6 +551,133 @@ class BedWave:
             f"          window cells [{lo}, {hi})  pinned ends={self.pinned_cells}  "
             f"warm-up {self.warmup_s:g} s"
         )
+
+
+# --- driving it ----------------------------------------------------------------
+# This lived in `validation.test_bed_wave` as a private `_drive` while it was the
+# provisional step-3 harness. Build step 5 landed the real process and step 8 needs
+# it from a second gate file, so it is part of the durable fixture now. `alpha` and
+# `dt_max` are parameters rather than constants because constraint (7)'s finding is
+# only reproducible by varying them: capping the fast step so it divides the
+# interval exactly stops the clamp firing at all, which is how the artefact was told
+# apart from the step size.
+
+_EPS_T = 1e-9  # activation-time comparison slack, in seconds
+DT_MAX = 5.0
+"""Inert at this scale (the state-derived step is ~0.46 s) and kept only so the
+harness cannot wander off if a future fixture is much deeper."""
+
+
+@dataclass
+class Run:
+    """What one fixture run leaves behind, host-side."""
+
+    bed: np.ndarray  # (nx,) final bed elevation, float64
+    depth: np.ndarray  # (nx,) final water depth
+    face_q: np.ndarray  # (nx+1,) final face discharge per unit width
+    dz_cum: np.ndarray  # (nx,) cumulative bed change, float64
+    banked_m: float  # metres of bed change the bounds refused (for the ledger)
+    mass_rel_error: float
+    steps: int
+    activations: int
+    t: float
+    courant: float = 0.0  # largest morphological Courant number the process measured
+
+    def median_depth(self, where: slice) -> float:
+        return float(np.median(self.depth[where]))
+
+    def median_unit_discharge(self, where: slice) -> float:
+        return float(np.median(self.face_q[1:-1][where]))
+
+
+def drive(
+    fx: BedWave,
+    *,
+    morphology: bool = True,
+    end_s: float | None = None,
+    alpha: float = 0.7,
+    dt_max: float = DT_MAX,
+) -> Run:
+    """Run the fixture: local-inertial water, plus (optionally) the M7 morphology.
+
+    ``end_s`` stops early (the design-point check needs only the warm-up and a few
+    intervals past it); ``morphology=False`` never arms the state, so nothing is
+    launched, the bed is untouched, and there are no activation boundaries to land on.
+
+    The bed update is :class:`~solver.processes.morphology.MorphologyProcess` driven
+    by hand rather than by the scheduler, because the fixture's water-only warm-up is
+    not a scheduler concept -- the sync-point algebra itself is M5's and is tested
+    there. The physics is not hand-wired: the transport integral accumulates inside
+    ``step`` and the activation is one ``advance`` call.
+
+    **The clamp below is the scheduler's, deliberately.** Landing exactly on each
+    activation is what :class:`~solver.scheduler.MultiRateScheduler` does for every
+    real run (``dt = min(dt, next_sync - t)``), so the fixture inherits the artefact
+    constraint (7) describes rather than dodging it. A harness that skipped the clamp
+    would measure a cleaner reach than any scenario can actually run.
+    """
+    st = fx.state("cpu")
+    inj = InflowInjector(fx.inflows(), st.grid, "cpu")
+    ledger = MassLedger.from_state(st)
+    morph: MorphologyProcess | None = None
+
+    end = fx.end_time_s if end_s is None else float(end_s)
+    t, steps, acts = 0.0, 0, 0
+    while t < end - _EPS_T:
+        dt = compute_dt(st, alpha=alpha, dt_max=dt_max)
+        # Land exactly on the warm-up boundary and on every activation, so an
+        # interval is an interval. With morphology off there is nothing to land on --
+        # and the activation counter never advances either, so keeping the clamp
+        # would freeze `dt` at zero and spin here forever the first time `t` passed
+        # one interval.
+        if morphology:
+            edge = (
+                fx.warmup_s
+                if t < fx.warmup_s - _EPS_T
+                else fx.warmup_s + (acts + 1) * fx.interval_s
+            )
+        else:
+            edge = end
+        edge = min(edge, end)
+        if t + dt > edge:
+            dt = edge - t
+        assert dt > 0.0, f"harness made no progress at t={t} (edge={edge}, acts={acts})"
+
+        # Arm *at* the warm-up boundary: `z0` is captured here and is still the
+        # pristine bed, so morphology begins with the very next step and every
+        # earlier step ran the untouched M6 kernels. The **bounds** are handed in
+        # whole -- they are the fixture's equilibrium sediment BC, which is exactly
+        # the case `[sediment]` cannot express (M7 plan §2).
+        if morphology and morph is None and t >= fx.warmup_s - _EPS_T:
+            arm_sediment(st, fx.d50, fx.porosity)
+            lo_h, hi_h = fx.bed_bounds()
+            morph = MorphologyProcess(st, fx.interval_s, dz_lo=lo_h, dz_hi=hi_h)
+
+        ledger.add_inflow(inj.apply(st, t, dt))
+        step(st, dt=dt)  # accumulates the transport integral in-step once armed
+        steps += 1
+        t += dt
+
+        if morph is not None and t >= fx.warmup_s + (acts + 1) * fx.interval_s - _EPS_T:
+            morph.advance(t, fx.interval_s)
+            acts += 1
+    ledger.record(st, t)
+
+    sed = st.sediment
+    return Run(
+        bed=st.z.numpy()[0].astype(np.float64),
+        depth=st.h.numpy()[0].astype(np.float64),
+        face_q=st.qx.numpy()[0].astype(np.float64),
+        dz_cum=(
+            sed.bed_change_numpy()[0] if sed is not None else np.zeros(fx.nx, dtype=np.float64)
+        ),
+        banked_m=0.0 if sed is None else float(sed.dz_unapplied.numpy().sum()),
+        mass_rel_error=ledger.max_rel_error,
+        steps=steps,
+        activations=acts,
+        t=t,
+        courant=0.0 if morph is None else morph.peak_courant,
+    )
 
 
 # --- estimators ---------------------------------------------------------------

@@ -316,6 +316,22 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   gate failure as a bug, check the depth-to-elevation ratio and step count; the fix is
   usually `[grid] datum` or a better-scaled test, not a change to the scheme. (M4's EA
   Test 2 note is the same effect measured on horizon length.)
+- **A clamped step is not a free step, and no gate can see the damage.** The
+  scheduler clamps every step to land on a sync point (`dt = min(dt, next_sync - t)`
+  — output cadence, forcing breakpoints, slow-process activations; M1–M4 did the same
+  inline). That hands local-inertial an abrupt shorten-then-restore, which excites a
+  short-wavelength mode. Measured on a uniform steady reach with **no sediment armed
+  at all**: interior depth ripple 0.010 mm unclamped, 14 mm at a 45 s cadence, 74 mm
+  at 22.5 s, **2342 mm at 11.25 s** — while the mass balance reads 1e-8 throughout,
+  because mass *is* conserved and the water is merely in the wrong places. Isolated
+  to the scheme by two controls (a closed box with no inflow and no open edge does it
+  too; smooth drift of the state-derived `dt` does not). Existing scenarios sit at a
+  900 s cadence (0.165 mm), which is why nothing caught it. **So: a frequent sync
+  cadence is not the safe direction** — before shortening `output_every` or a slow
+  process's interval, check a quantity that a ripple would break, not the mass gate.
+  A measured candidate fix (fill each span with `ceil(span/dt)` *equal* steps) is
+  recorded but unshipped, because it moves every run's `dt` sequence and with it the
+  pre-M5 bitwise-identity invariant. Full tables + controls: `docs/plans/M7-morphology.md` §4.
 - **A slow process hands over a whole interval at once — that is the splitting, not a
   bug, but it has a scale.** 60 m³/s over a 900 s reservoir interval is 54,000 m³; into
   a single 40 m cell that is a 34 m instantaneous column. Deliver over a *reach* (the

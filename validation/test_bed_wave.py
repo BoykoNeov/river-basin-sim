@@ -1,14 +1,21 @@
-"""Bed-wave celerity fixture (M7 build step 3) on Warp's CPU backend.
+"""Bed-wave celerity: the M7 gate, on Warp's CPU backend.
 
-What this file proves is that the fixture in :mod:`validation.bedwave` is
-**measurable**: the reach delivers the flow its design point was derived from, a low
-bump migrates a countable number of cells at the celerity the implemented law
-predicts, and nothing else the run does to the bed is big enough to be mistaken for
-that. The *gates* -- sediment mass conservation, interval independence, the
-morphological-CFL assertion, the tolerances tightened against the real slow process
--- are M7 build step 8 and are deliberately not here; the tolerances below are wide
-on purpose, because a step-3 failure should mean "the geometry is wrong", not "the
-physics moved by 3%".
+**This is the gate now** (M7 build step 8). It was authored at build step 3 to prove
+the fixture in :mod:`validation.bedwave` is *measurable* -- the reach delivers the
+flow its design point was derived from, a low bump migrates a countable number of
+cells at the celerity the implemented law predicts, and nothing else the run does to
+the bed is big enough to be mistaken for that. Step 8 promotes it rather than
+tightening it: the +-20% on the shape estimator is what the sizing evidence supports
+(a 7% spread across a 32x range of activation intervals), and shrinking it to +-5%
+because the design point happens to read 0.993 would be fitting the gate to one run.
+The crest fit and the centroid stay **printed, not gated**, for the reason
+:mod:`validation.bedwave` gives: they fail differently and their disagreement is
+information.
+
+What step 8 adds here is the other half of §3 -- **interval independence**, and the
+**morphological-CFL assertion** that fences it from above. The threshold pair, the
+deposition-dries-a-cell rule and the MPM regime check live next door in
+:mod:`validation.test_morphology_gates`.
 
 Three findings from sizing it, each now asserted rather than remembered:
 
@@ -19,16 +26,22 @@ Three findings from sizing it, each now asserted rather than remembered:
   reach 30% -- so the fixture pins its end cells with the bound
   :func:`~solver.core.sediment.exner_update` already carries;
 * the 900 s activation interval that follows the reservoir would move this bed wave
-  3.1 cells per activation, which is why the fixture carries its own.
+  3.1 cells per activation, which is why the fixture carries its own -- and step 8
+  gates that from *both* sides, because the interval is fenced below as well
+  (:mod:`validation.bedwave` constraint (7), M7 plan §4).
 
-**The harness is no longer provisional.** ``_drive`` was written at build step 3
-hand-wiring what :mod:`solver.processes.morphology` would own at step 5 -- accumulate
-every fast step, apply Exner and rebuild the bed at each activation -- and
-accumulating *after* :func:`solver.core.local_inertial.step` returned. Step 5 landed
-the real thing and this file now drives it: the accumulation happens **inside**
-``step`` (off ``state.sediment``, after the limiter and before continuity) and the
-activation is ``MorphologyProcess.advance``. Every number recorded below reproduced
-bit for bit across that change, which is what the equivalence held out for:
+**The harness is no longer provisional, and no longer lives here.** A private
+``_drive`` was written at build step 3 hand-wiring what
+:mod:`solver.processes.morphology` would own at step 5 -- accumulate every fast step,
+apply Exner and rebuild the bed at each activation -- and accumulating *after*
+:func:`solver.core.local_inertial.step` returned. Step 5 landed the real thing and
+this file drove it: the accumulation happens **inside** ``step`` (off
+``state.sediment``, after the limiter and before continuity) and the activation is
+``MorphologyProcess.advance``. Step 8 needed it from a second gate file, so it is
+:func:`validation.bedwave.drive` now, with ``alpha`` and ``dt_max`` exposed because
+constraint (7)'s finding is only reproducible by varying them. Every number recorded
+below reproduced bit for bit across both moves, which is what the equivalence held
+out for:
 ``test_the_in_step_hook_is_the_same_inputs_as_accumulating_after_the_step``
 (:mod:`solver.processes.test_morphology`) asserts the property directly, and this
 fixture is the evidence that it transfers to a measured result.
@@ -40,123 +53,17 @@ pristine bed because nothing has moved it, and morphology begins with the next s
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
 import numpy as np
 import pytest
 import warp as wp
 
-from solver.core.local_inertial import compute_dt, step
-from solver.core.massbalance import MASS_GATE, MassLedger
-from solver.core.sediment import arm_sediment, morphological_courant, shields_from_flow
-from solver.processes.inflow import InflowInjector
-from solver.processes.morphology import MorphologyProcess
-from validation.bedwave import BedWave
+from solver.core.massbalance import MASS_GATE
+from solver.core.sediment import morphological_courant, shields_from_flow
+from validation.bedwave import BedWave, drive
 
 wp.init()
-DEV = "cpu"
-
-# Inert at this scale (the state-derived step is ~0.46 s here) and kept only so the
-# harness cannot wander off if a future fixture is much deeper.
-_DT_MAX = 5.0
-_EPS = 1e-9  # activation-time comparison slack, in seconds
-
-
-@dataclass
-class Run:
-    """What one fixture run leaves behind, host-side."""
-
-    bed: np.ndarray  # (nx,) final bed elevation, float64
-    depth: np.ndarray  # (nx,) final water depth
-    face_q: np.ndarray  # (nx+1,) final face discharge per unit width
-    dz_cum: np.ndarray  # (nx,) cumulative bed change, float64
-    banked_m: float  # metres of bed change the bounds refused (for the ledger)
-    mass_rel_error: float
-    steps: int
-    activations: int
-    t: float
-    courant: float = 0.0  # largest morphological Courant number the process measured
-
-    def median_depth(self, where: slice) -> float:
-        return float(np.median(self.depth[where]))
-
-    def median_unit_discharge(self, where: slice) -> float:
-        return float(np.median(self.face_q[1:-1][where]))
-
-
-def _drive(fx: BedWave, *, morphology: bool = True, end_s: float | None = None) -> Run:
-    """Run the fixture: local-inertial water, plus (optionally) the M7 morphology.
-
-    ``end_s`` stops early (the design-point check needs only the warm-up and a few
-    intervals past it); ``morphology=False`` never arms the state, so nothing is
-    launched, the bed is untouched, and there are no activation boundaries to land on.
-
-    The bed update is :class:`~solver.processes.morphology.MorphologyProcess` driven
-    by hand rather than by the scheduler, because the fixture's water-only warm-up is
-    not a scheduler concept -- the sync-point algebra itself is M5's and is tested
-    there. What is *not* hand-wired any more is the physics: the transport integral
-    accumulates inside ``step`` and the activation is one ``advance`` call.
-    """
-    st = fx.state(DEV)
-    inj = InflowInjector(fx.inflows(), st.grid, DEV)
-    ledger = MassLedger.from_state(st)
-    morph: MorphologyProcess | None = None
-
-    end = fx.end_time_s if end_s is None else float(end_s)
-    t, steps, acts = 0.0, 0, 0
-    while t < end - _EPS:
-        dt = compute_dt(st, alpha=0.7, dt_max=_DT_MAX)
-        # Land exactly on the warm-up boundary and on every activation, so an
-        # interval is an interval (the scheduler does this for real runs, M5). With
-        # morphology off there is nothing to land on -- and the activation counter
-        # never advances either, so keeping the clamp would freeze `dt` at zero and
-        # spin here forever the first time `t` passed one interval.
-        if morphology:
-            edge = (
-                fx.warmup_s if t < fx.warmup_s - _EPS else fx.warmup_s + (acts + 1) * fx.interval_s
-            )
-        else:
-            edge = end
-        edge = min(edge, end)
-        if t + dt > edge:
-            dt = edge - t
-        assert dt > 0.0, f"harness made no progress at t={t} (edge={edge}, acts={acts})"
-
-        # Arm *at* the warm-up boundary: `z0` is captured here and is still the
-        # pristine bed, so morphology begins with the very next step and every
-        # earlier step ran the untouched M6 kernels. The **bounds** are handed in
-        # whole -- they are the fixture's equilibrium sediment BC, which is exactly
-        # the case `[sediment]` cannot express (validation.bedwave, M7 plan §2).
-        if morphology and morph is None and t >= fx.warmup_s - _EPS:
-            arm_sediment(st, fx.d50, fx.porosity)
-            lo_h, hi_h = fx.bed_bounds()
-            morph = MorphologyProcess(st, fx.interval_s, dz_lo=lo_h, dz_hi=hi_h)
-
-        ledger.add_inflow(inj.apply(st, t, dt))
-        step(st, dt=dt)  # accumulates the transport integral in-step once armed
-        steps += 1
-        t += dt
-
-        if morph is not None and t >= fx.warmup_s + (acts + 1) * fx.interval_s - _EPS:
-            morph.advance(t, fx.interval_s)
-            acts += 1
-    ledger.record(st, t)
-
-    sed = st.sediment
-    return Run(
-        bed=st.z.numpy()[0].astype(np.float64),
-        depth=st.h.numpy()[0].astype(np.float64),
-        face_q=st.qx.numpy()[0].astype(np.float64),
-        dz_cum=(
-            sed.bed_change_numpy()[0] if sed is not None else np.zeros(fx.nx, dtype=np.float64)
-        ),
-        banked_m=0.0 if sed is None else float(sed.dz_unapplied.numpy().sum()),
-        mass_rel_error=ledger.max_rel_error,
-        steps=steps,
-        activations=acts,
-        t=t,
-        courant=0.0 if morph is None else morph.peak_courant,
-    )
 
 
 def test_the_fixture_is_sized_for_the_law_not_for_convenience():
@@ -212,7 +119,7 @@ def test_the_design_point_is_what_the_solver_actually_delivers():
     spun forever, which no test that stopped exactly at the warm-up could see.
     """
     fx = BedWave()
-    res = _drive(fx, morphology=False, end_s=fx.warmup_s + 3.0 * fx.interval_s)
+    res = drive(fx, morphology=False, end_s=fx.warmup_s + 3.0 * fx.interval_s)
 
     h = res.median_depth(fx.interior)
     q = res.median_unit_discharge(fx.interior)
@@ -243,17 +150,20 @@ def test_the_design_point_is_what_the_solver_actually_delivers():
 
 
 def test_the_bump_migrates_at_the_analytical_bed_wave_celerity():
-    """The sizing claim: the bump crosses ~16 cells at ~``c_b``, and it is the *bump*.
+    """**The M7 celerity gate**: the bump crosses ~16 cells at ~``c_b``, and it is the
+    *bump*.
 
-    Wide tolerances by design (step 8 owns the gate). What this must catch is a
-    fixture that cannot be measured: a wave that diffuses away, a wave buried under
-    boundary artefacts, a wave that never leaves its cell. The celerity is compared
-    against ``c_b`` **at the achieved flow**, and all three estimators are printed --
-    their disagreement is the diffusion and the upstream deposition plateau, not
-    noise (:mod:`validation.bedwave`).
+    Gated at +-20% on the shape estimator, which is the number the sizing evidence
+    supports rather than the number this run happens to hit -- see the module
+    docstring on why step 8 promotes this tolerance instead of shrinking it. What it
+    must catch is a fixture that has stopped measuring the law: a wave that diffuses
+    away, a wave buried under boundary artefacts, a wave that never leaves its cell.
+    The celerity is compared against ``c_b`` **at the achieved flow**, and all three
+    estimators are printed -- their disagreement is the diffusion and the upstream
+    deposition plateau, not noise (:mod:`validation.bedwave`).
     """
     fx = BedWave()
-    res = _drive(fx)
+    res = drive(fx)
     mig = fx.measure(res.bed)
     c_flow = fx.celerity_at(res.median_unit_discharge(fx.interior), res.median_depth(fx.interior))
 
@@ -282,8 +192,7 @@ def test_the_bump_migrates_at_the_analytical_bed_wave_celerity():
     # really has (solver.core.sediment.celerity_field), so this is a cross-check of
     # that diagnostic against the fixture's independently derived `c_b`: the peak is
     # over every cell, including the bump crest where the bed is locally faster, so
-    # it may sit above the design value -- but not by a factor. Gating a *scenario*
-    # on it is build step 8.
+    # it may sit above the design value -- but not by a factor.
     assert 0.5 * fx.courant < res.courant < 2.0 * fx.courant
     assert res.courant < 0.25, "(7) the bed wave crosses too much of a cell per activation"
     # The wave is still a wave, and it is the thing being measured.
@@ -293,6 +202,147 @@ def test_the_bump_migrates_at_the_analytical_bed_wave_celerity():
     assert mig.xcorr_celerity == pytest.approx(c_flow, rel=0.20)
     assert 0.6 < mig.peak_celerity / c_flow < 1.4
     assert 0.5 < mig.centroid_celerity / c_flow < 1.4
+
+
+# The interval is fenced on both sides, and step 8 gates both. Above, the bed wave
+# must not cross a cell per activation. Below, the limit is not the splitting at all
+# -- it is the scheme (validation.bedwave constraint (7), M7 plan §4) -- so the
+# independence gate is asserted **over the band the Courant gate admits**, which is
+# what is true, rather than over "halve it and compare", which is not.
+_INDEPENDENCE_S = 4680.0  # 104 activations at 45 s == 52 at 90 s, exactly
+
+
+def test_the_final_bed_does_not_depend_on_the_activation_interval():
+    """Interval independence (M7 plan §3), over the band the Courant gate admits.
+
+    45 s and 90 s applied to the **same** 4680 s of morphology -- 104 activations
+    against 52, chosen so the two runs cover an identical span rather than the 4635 s
+    and 4680 s the fixture's own rounding would give them. Matching removes a
+    confound but, measured, it is a *small* one: 0.300 mm matched against 0.324 mm
+    mismatched, so the 0.16 cells of extra travel account for 0.02 mm and the rest is
+    real interval sensitivity. Worth recording, because the first draft of this
+    docstring asserted the opposite from arithmetic and the run disagreed.
+
+    This is what §1.3's time-integrated flux buys: the transport carries its own
+    elapsed time, so halving the number of applications does not halve the bed
+    change. What it does **not** buy is freedom to shrink the interval without limit
+    -- see ``test_a_shorter_interval_is_fenced_by_the_scheme_not_by_the_splitting``.
+    """
+    coarse = replace(BedWave(), interval_s=90.0)
+    fine = replace(BedWave(), interval_s=45.0)
+    end = fine.warmup_s + _INDEPENDENCE_S
+
+    res_c = drive(coarse, end_s=end)
+    res_f = drive(fine, end_s=end)
+    dep_c = coarse.departure(res_c.bed)
+    dep_f = fine.departure(res_f.bed)
+    diff = np.abs(dep_f - dep_c)
+    lo, hi = fine.window
+    signal = float(np.abs(dep_f).max())
+
+    print(
+        f"\n[interval independence] {_INDEPENDENCE_S:g} s of morphology both ways\n"
+        f"  90 s: {res_c.activations:3d} activations, Cr {res_c.courant:.3f}, "
+        f"xcorr {coarse.measure(res_c.bed).xcorr_cells:.3f} cells\n"
+        f"  45 s: {res_f.activations:3d} activations, Cr {res_f.courant:.3f}, "
+        f"xcorr {fine.measure(res_f.bed).xcorr_cells:.3f} cells\n"
+        f"  max |bed difference| {1000 * diff.max():.4f} mm whole reach, "
+        f"{1000 * diff[lo:hi].max():.4f} mm in the window, "
+        f"rms {1000 * np.sqrt((diff[lo:hi] ** 2).mean()):.4f} mm\n"
+        f"  ... against a {1000 * signal:.4f} mm signal "
+        f"({100 * diff.max() / signal:.2f}%)"
+    )
+
+    assert res_c.activations * 90.0 == pytest.approx(res_f.activations * 45.0)
+    assert res_c.mass_rel_error < MASS_GATE
+    assert res_f.mass_rel_error < MASS_GATE
+    # Both intervals sit inside the admitted band, or this compares two artefacts.
+    assert res_c.courant < 1.0 and res_f.courant < 1.0
+    # The gate: the bed the run ends with is the same bed, to a stated fraction of
+    # the bed change itself -- not of the bump amplitude, which the run erodes.
+    assert diff.max() < 0.05 * signal
+
+
+def test_a_flat_reach_stays_flat_at_the_fixtures_own_interval():
+    """Nothing should happen to a uniform bed, and at 45 s nothing does.
+
+    The bump removed, the flow is uniform, so the transport is uniform, so the
+    divergence is zero and **every** millimetre of bed change this run produces is
+    spurious. That makes it the sharpest available statement that the celerity gate
+    measures the transport law rather than the scheme's own noise: the floor has to be
+    small against the 15 mm wave the gate tracks.
+
+    It is also the **lower fence** on the activation interval, and the reason the
+    fixture does not simply use a shorter one. Shortening it means more sync-point
+    activations, every one of which clamps ``dt`` and hands local-inertial an abrupt
+    shorten-then-restore. Measured on exactly this flat reach: +-0.16 mm at 90 s,
+    +-0.11 mm at 45 s, **+-8.85 mm at 22.5 s**, **+-29.3 mm at 11.25 s**. Those are
+    not gated here, because they are a property of the scheme rather than of this
+    fixture and a fix would legitimately change them -- they are recorded, with the
+    controls that isolate the mechanism, in M7 plan §4 (*"a clamped step is not a free
+    step"*). What is gated is the one the gate depends on.
+    """
+    fx = replace(BedWave(), bump_amplitude_m=0.0)
+    res = drive(fx)
+    spurious = float(np.abs(res.dz_cum).max())
+
+    print(
+        f"\n[flat reach] {res.activations} activations at {fx.interval_s:g} s: "
+        f"spurious bed change {1000 * res.dz_cum.min():+.4f} .. "
+        f"{1000 * res.dz_cum.max():+.4f} mm "
+        f"({100 * spurious / BedWave().bump_amplitude_m:.2f}% of the 15 mm bump)  "
+        f"depth {res.median_depth(fx.interior):.4f} m  mass {res.mass_rel_error:.2e}"
+    )
+
+    assert res.mass_rel_error < MASS_GATE
+    assert res.median_depth(fx.interior) == pytest.approx(fx.normal_depth, rel=0.01)
+    assert spurious < 0.05 * BedWave().bump_amplitude_m
+
+
+def test_an_interval_that_moves_the_bed_a_cell_per_activation_is_caught():
+    """The morphological-CFL assertion (M7 plan §3): the diagnostic fires, loudly.
+
+    The upper fence. At the reservoir's 900 s cadence this bed wave crosses ~3 cells
+    per activation, which is a splitting artefact rather than a result -- M5's
+    *"54,000 m^3 into one 40 m cell is a 34 m column"*, in morphology. The point of
+    gating it is that the run would otherwise finish and hand back a bed that looks
+    entirely plausible: mass is conserved to the same 1e-8, the wave is still roughly
+    where a wave should be, and nothing else says the splitting has stopped meaning
+    anything.
+
+    What is asserted is the **process's own measurement**
+    (:func:`solver.core.sediment.celerity_field` over the flow the run really had),
+    not the fixture's analytical ``c_b`` -- that one is already checked as arithmetic
+    in ``test_the_fixture_is_sized_for_the_law_not_for_convenience``. A diagnostic
+    that only agrees with a hand-derived number is not a diagnostic.
+    """
+    fx = replace(BedWave(), interval_s=900.0)
+    res = drive(fx)
+    mig = fx.measure(res.bed)
+    c_flow = fx.celerity_at(res.median_unit_discharge(fx.interior), res.median_depth(fx.interior))
+
+    print(
+        f"\n[over-Courant] {res.activations} activations at {fx.interval_s:g} s "
+        f"(design Cr {fx.courant:.2f})\n"
+        f"  measured peak Courant {res.courant:.3f}\n"
+        f"  xcorr {mig.xcorr_celerity / c_flow:.3f} c_b, crest retained "
+        f"{mig.amplitude_retained:.3f}, signal/background {mig.signal_to_background:.1f}\n"
+        f"  mass {res.mass_rel_error:.2e} -- still inside the gate, which is the point"
+    )
+
+    # The run completes and conserves mass; nothing in the water tells you anything
+    # is wrong. Only the morphological Courant number does.
+    assert res.mass_rel_error < MASS_GATE
+    assert res.courant > 1.0, "the over-Courant configuration was not detected"
+    # ... and the fixture's own interval is on the right side of the same fence, so
+    # this is a discriminator rather than a number that is always large.
+    assert BedWave().courant < 1.0
+    # The bump **grew** -- 1.63 of its initial height, where the same wave properly
+    # resolved keeps 0.72 and diffusion is the only thing that can happen to it. That
+    # is the artefact's signature, and it is worth pinning because the celerity
+    # estimator does *not* catch this run: it reads 0.95 c_b here and would sail
+    # through the +-20% gate. The two gates are not substitutes for each other.
+    assert mig.amplitude_retained > 1.0, "a resolved bed wave can only diffuse"
 
 
 def test_a_free_end_grows_a_sill_which_is_why_the_fixture_pins_them():
@@ -310,8 +360,8 @@ def test_a_free_end_grows_a_sill_which_is_why_the_fixture_pins_them():
     floor and leaves the ceiling open -- it cannot hold an outlet down.
     """
     short = replace(BedWave(), migration_cells=4.0)  # ~26 activations; enough to be loud
-    free = _drive(replace(short, pinned_cells=0))
-    pinned = _drive(short)
+    free = drive(replace(short, pinned_cells=0))
+    pinned = drive(short)
 
     for name, res in (("free", free), ("pinned", pinned)):
         print(

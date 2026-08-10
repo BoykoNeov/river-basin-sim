@@ -598,6 +598,77 @@ sediment.
    morphological export it prints *"terrain is the bed at t=0 -- this run moved it by
    −0.206..+0.090 m by t = 900 s"*. **321 tests green.**
 8. **Validation** — §3, every gate.
+   **Done** — `validation/test_morphology_gates.py` (the threshold pair, the
+   deposition rule, the regime check), the celerity gate promoted in
+   `validation/test_bed_wave.py` with interval independence and the morphological-CFL
+   assertion beside it, `drive`/`Run` promoted into `validation/bedwave.py`, and
+   `MORPH_COURANT_GATE` + an unconditional `run.py` warning. Six decisions worth
+   naming, two of which are places this step's own brief was wrong:
+   - **"Halve `interval_s`; the final bed must agree" does not hold, and the reason is
+     not morphology.** Measured, shortening the interval makes the bed *worse* — on a
+     flat reach with the bump removed, where every millimetre is spurious: ±0.16 mm at
+     90 s, ±0.11 mm at 45 s, **±8.85 mm at 22.5 s**, **±29.3 mm at 11.25 s**, against
+     a 15 mm bump. The cause is the **sync-point `dt` clamp**, and it is a
+     *water-solver* artefact: see §4, *"a clamped step is not a free step"*. So the
+     gate is asserted over the band the Courant number admits — 45 s against 90 s
+     applied to the **same** 4680 s of morphology (104 activations against 52), which
+     agree to **0.300 mm on a 10.76 mm signal, 2.8%**, gated at 5%. Matching the span
+     was worth doing and worth measuring: it accounts for 0.02 mm of the 0.32 mm the
+     mismatched comparison reads, not the ~0.24 mm the arithmetic predicted.
+   - **The celerity tolerance was promoted, not tightened.** ±20% on the shape
+     estimator is what the sizing evidence supports (a 7% spread across a 32× range of
+     intervals); shrinking it to ±5% because the design point reads 0.993 would fit
+     the gate to one run and flake on a reduction-order change. The crest fit and the
+     centroid stay printed.
+   - **The Courant gate and the celerity gate are not substitutes, and that is
+     measured.** At a 900 s interval the fixture runs at Courant **3.30** and the
+     result is meaningless — the bump *grows* to 1.63 of its initial height, where a
+     resolved bed wave can only diffuse (0.72) — yet mass reads 1.2e-8, the sediment
+     balance holds, and the **celerity estimator reads 0.95 c_b and sails through
+     ±20%**. Nothing but the Courant number catches it, which is why `run.py` prints
+     that warning unconditionally rather than under `verbose`.
+   - **The regime decision: keep the scenarios clear, do not guard the law** (the debt
+     step 6 handed over). The discriminator is relative submergence `h/d50` rather
+     than an absolute depth, because it is the group the law is about: the celerity
+     fixture is at **187** and the threshold pair at 35–47, while the bowl's
+     millimetric sheet is at **0.5** — shallower than one grain. A guard was refused
+     because it would have changed what three existing tests test *without failing
+     any of them*: `sed_boulders` asserts a 1 m grain size moves no bed and passes
+     because `θ < θ_c`, and an `h ≥ k·d50` cut-off would have taken that assertion
+     over silently. The range is enforced where scenarios are chosen instead, and
+     asserted there.
+   - **The threshold pair is one variable, and that had to be checked.** `θ ∝ 1/d50`
+     exactly (the shear carries no grain size) and `d50` enters no hydraulic kernel,
+     so `BedWave.at_shields` re-grains the *same* reach: 42.86 mm for 0.9 θ_c, 32.15 mm
+     for 1.2 θ_c. Verified rather than argued — all three arms produce **bit-identical**
+     depth and face-discharge fields. Under threshold: **0 cells moved**, `dz_cum`
+     bit-exact zero, with the achieved θ peaking at 0.921 θ_c at the bump crest, which
+     is locally shallower (the bump is deliberately kept in both arms; flattening one
+     would stop the pair being the same geometry). Over threshold: 238 of 240 cells,
+     the two pinned ends excepted, with the whole reach above 1.095 θ_c.
+   - **Deposition cannot dry a cell directly, and the test that says it does is
+     testing the wrong thing.** `h` is volume per unit plan area and no Exner kernel
+     reads it, so `η = z + h` rises *with* the bed and a cell can never be buried —
+     asserted immediately after the activation, where the water is bit-for-bit
+     unchanged. Drying is **hydraulic and later**: the raised cell is a mound, and the
+     ordinary momentum update runs the water off it (58 fast steps here) until the
+     existing `H_DRY` guard applies. The content of the gate is that the water went
+     *somewhere* — mass 8.7e-8, the two scoured neighbours deeper than they started —
+     and a partner test pins that the drying is local, without which a solver that
+     dried the whole domain would pass on mass conservation alone. The deposition is
+     hand-loaded into the transport integral rather than grown from a flow, because
+     depositing 5 cm onto a 2 cm sheet means running MPM in exactly the regime the
+     bullet above fences off.
+
+   Also carried, and pinned by a test rather than remembered: **the Courant
+   diagnostic samples, while the transport integrates.** `celerity_field` reads the
+   flow at the activation *instant*, so an interval in which a flood arrived, moved
+   577 m³ of bed and drained away reports Courant **0.000** — while the same scenario
+   with its forcing held on reports 5.05. The warning is a floor on what can be
+   trusted, not a certificate. Making it a true interval maximum needs a full-field
+   host reduction every fast step, which is not what a diagnostic should cost.
+
+   **333 tests green.**
 9. **Demo** — `scenarios/reach_alluvial.toml`, GPU sign-off, HANDOFF + CLAUDE.md
    + roadmap updates.
 
@@ -682,6 +753,69 @@ sediment.
   boundary and will do the same, and the sill is a *hydraulic* error long before it
   is a visible one. Either pin the end cells (`dz_lo == dz_hi == 0`, banked into the
   ledger) or keep every quoted measurement clear of the boundaries and say which.
+- **A clamped step is not a free step: sync-point `dt` clamping degrades
+  local-inertial, and no existing gate can see it.** Found at build step 8 while
+  measuring §3's interval-independence gate, which is why that gate is worded the way
+  it is. **This is not a morphology bug** — it reproduces with sediment never armed —
+  and it predates M7: `solver/scheduler.py` clamps every step with
+  `dt = min(dt, next_sync - t)`, the same algebra M1–M4 ran inline, and sync points
+  include the output cadence, forcing breakpoints and slow-process activations.
+
+  Water only, uniform steady reach (`validation.bedwave` with the bump removed),
+  5835 s, **no sediment anywhere**:
+
+  | sync cadence | clamped steps | interior depth | ripple | mass |
+  |---|---|---|---|---|
+  | none | 0 | 1.495871..1.495881 | 0.010 mm | 7.7e-09 |
+  | 900 s | 7 | 1.495786..1.495951 | 0.165 mm | 7.8e-09 |
+  | 300 s | 20 | 1.492152..1.501927 | 9.775 mm | 1.7e-08 |
+  | 45 s | 130 | 1.489426..1.503675 | 14.248 mm | 2.5e-08 |
+  | 22.5 s | 260 | 1.443363..1.517787 | 74.424 mm | 4.9e-09 |
+  | 11.25 s | 519 | **0.230063..2.571629** | **2341.566 mm** | 9.5e-09 |
+
+  **The mass gate reads 1e-8 throughout.** Mass is conserved perfectly; the water is
+  simply in the wrong places, as a short-wavelength standing oscillation (unit
+  discharge swinging 2.34..2.66 about a design 2.5).
+
+  The mechanism is **local-inertial plus an abrupt Δt change**, isolated by two
+  controls. Both per-step operations are exactly linear in `dt` by inspection (inflow
+  adds `Q(t+dt/2)·dt`; the open sink removes `dt/dx·q_out`, capped at a depth the cap
+  never reaches here), and the controls confirm they are not involved: (1) the same
+  reach with **no sync cadence at all**, merely shortening one step in N to 0.25 Δt,
+  reproduces it — 13.7 mm at 1 in 200, 2289 mm at 1 in 25; (2) a **closed box** with
+  no inflow, no open edge and nothing per-step but the scheme reaches a 2015 mm ripple
+  and a cell of exactly zero depth. Smooth drift of the state-derived Δt, which every
+  run already has, does not do this; shorten-then-restore does. Capping the fast step
+  so it divides the interval exactly — so the clamp never fires — removes it
+  (±0.04 mm at 22.5 s), which is how it was told apart from the step size.
+
+  **Why nothing caught it:** existing scenarios run a 900 s output cadence, which is
+  0.165 mm here, and the validated benchmarks (dam-break, Manning normal depth to
+  0.59–1%, the EA tests) all bound the reach against a reference that a large ripple
+  would break. M7 is the first milestone wanting a *frequent* slow clock, because the
+  morphological Courant number forces a short interval on an erosive reach — and
+  morphology **rectifies** the oscillation into a permanent bed signature instead of
+  letting it average out.
+
+  **Candidate fix, measured, deliberately not shipped in step 8:** fill the span to
+  the next sync point with `n = ceil(span/dt)` *equal* steps rather than full steps
+  plus a remainder — still never exceeding the state-derived `dt`, still landing
+  exactly on the sync point. Ripple 14.248 → **0.009 mm** at 45 s, 2341.566 → 1.908 mm
+  at 11.25 s. It is not step 8's to ship: it rewrites the Δt sequence of *every* run,
+  so the pre-M5 bitwise-identity invariant M4/M5/M6 all held — and the in-tree test
+  that replays the pre-M5 inline loop as an executable reference — would move. That is
+  a milestone-scale change deserving its own commit and its own before/after, the way
+  the precision pass got one. Two numbers in it are also still unexplained: 22.5 s and
+  11.25 s both settle at 1.908 mm, and a 32.9 mm end-cell offset is identical across
+  all three cadences. Carried the way M6 carried `coarsen = 4`.
+
+- **The morphological Courant number samples the flow; the transport integrates it.**
+  `celerity_field` runs at the activation *instant*, so an interval in which a flood
+  arrived, moved the bed and drained away reports Courant 0.000 — measured, 577 m³ of
+  sediment moved at a reported zero, against 5.05 for the same scenario with its
+  forcing held on. Treat a silent run with spiky forcing as unchecked rather than as
+  cleared. A true interval maximum needs a full-field host reduction every fast step.
+
 - **Every scenario still writes to the same default output**, and the frames
   export still never purges it. Pass `--out` / `--frames-dir` for anything worth
   keeping (CLAUDE.md's sharpest gotcha, and a morphology run is expensive enough

@@ -106,6 +106,23 @@ mass exactly the way a bare ``max(h, 0)`` invents water (M4).
   local-inertial open boundary is a post-interior sink on the edge *cell*, not a
   face. So water leaves and its load does not, and an outlet cell aggrades. Keep a
   measurement clear of the outlet, or read the ledger.
+* *The law has no depth guard, and a millimetric sheet is outside it.* ``tau/rho``
+  goes as ``q^2 / h^(7/3)`` at fixed ``q``, so it **diverges** as ``h -> H_DRY``: a
+  1 mm overland sheet at 0.5 m/s with ``n = 0.03`` and ``d50 = 2 mm`` reads
+  ``theta = 0.68``, 14x ``theta_c``, and moves centimetres of bed per activation.
+  That is MPM extrapolated far outside its range -- it is a *channel bedload* law,
+  and at ``h/d50 = 0.5`` the flow is shallower than one grain -- not a conservation
+  failure; the ledger is exact through all of it.
+
+  **M7 build step 8 chose not to guard it**, and the choice is worth stating because
+  the alternative looks free. A relative-submergence cut-off would have changed what
+  three existing tests test without failing any of them: a 1 m grain size moves no
+  bed today *because* ``theta < theta_c``, and a guard would have taken over that
+  assertion silently. So the range of validity is enforced where scenarios are
+  *chosen* rather than inside the law: the gates assert their own ``h/d50``
+  (``validation.test_morphology_gates``), the celerity fixture runs at 187 and the
+  threshold pair at 35-47. A rain-on-grid floodplain result from this module is an
+  artefact, and quoting one as a transport result would be wrong (M7 plan §4).
 """
 
 from __future__ import annotations
@@ -784,14 +801,30 @@ def bed_celerity(
     return frac * dqs_dz / (1.0 - float(porosity))
 
 
+# A bed wave crossing more than one cell per activation is a splitting artefact
+# rather than a result. Gated the way `MASS_GATE` is -- the run *warns* and the
+# validation suite *asserts* -- and deliberately not raised on, because a coarse
+# exploratory run is a legitimate thing to do on purpose (M7 build step 8).
+MORPH_COURANT_GATE = 1.0
+
+
 def morphological_courant(celerity: float, interval_s: float, dx: float) -> float:
     """``c_b * interval_s / dx`` -- cells a bed wave crosses in one slow interval.
 
     A bed wave that travels more than a cell per activation is a splitting artefact,
     not a result: the exact analogue of M5's *"54,000 m^3 into one 40 m cell is a
-    34 m column"*. The run loop prints this before stepping, from the scenario's own
-    numbers, in the codebase's habit of saying the dangerous ratio out loud before
-    it bites.
+    34 m column"*. It is measured **per activation, from the flow the run really
+    had** (:func:`celerity_field`) rather than printed before stepping from nominal
+    numbers -- at ``t = 0`` a scenario usually has no flow, and a Courant number from
+    a flow that has not happened is a reassurance rather than a warning.
+
+    Why it needs its own gate: the artefact is invisible to every other one. Measured
+    on the celerity fixture at a 900 s interval -- Courant 3.3 -- the run finishes,
+    the mass balance reads 1.2e-8, and the bed-wave *celerity* still comes out at
+    0.95 ``c_b``, inside the +-20% gate. The only thing that says the answer is
+    meaningless is this number (and the bump growing to 1.63 of its initial height,
+    which nothing was watching). See
+    ``validation.test_bed_wave.test_an_interval_that_moves_the_bed_a_cell_per_activation_is_caught``.
     """
     return float(celerity) * float(interval_s) / float(dx)
 

@@ -312,12 +312,25 @@ def _sediment_bowl(**over) -> Scenario:
     """The step-5 bowl scenario, parameterised.
 
     **What transports here is the thin sheet at the wet/dry guard, and that regime is
-    on notice** -- MPM's shear diverges as ``h -> H_DRY`` (M7 plan §4, and the step-5
-    test above says it at length). Every test built on this helper asserts that the
-    bed *moved*, so if step 8 gives the law a depth guard they all fail here rather
-    than where the law changed: re-home them to channel flow then, do not weaken the
-    assertions. The one exception is the below-threshold test, which asserts the bed
-    did **not** move and survives a depth guard unchanged.
+    outside MPM** -- the shear diverges as ``h -> H_DRY`` (M7 plan §4, and the step-5
+    test above says it at length). Relative submergence here is ``h/d50 = 0.5``: the
+    sheet is shallower than one grain.
+
+    **Build step 8 decided not to guard the law**, and this helper is one of the
+    reasons. A relative-submergence cut-off would keep every test below green while
+    silently changing what they test -- ``test_a_grain_size_the_flow_cannot_move_...``
+    passes today *because* ``theta < theta_c``, and a ``h >= k*d50`` guard would make
+    it pass for a second, unrelated reason and stop exercising the threshold at all.
+    The gates keep clear of the regime instead, and assert that they do
+    (``validation.test_morphology_gates.test_the_gate_scenarios_transport_inside_the_laws_range``).
+    So the numbers this helper produces are **plumbing evidence, not physics**: they
+    show the bed moves, the store records it and the ledger balances, and nothing
+    here should be quoted as a transport result.
+
+    The contingency stands if that decision is ever revisited: every test built on
+    this helper asserts the bed *moved*, so a depth guard would fail them here rather
+    than where the law changed -- re-home them to channel flow then, do not weaken the
+    assertions.
     """
     kw = dict(
         dx=20.0,
@@ -463,3 +476,85 @@ def test_field_memory_counts_the_two_widths_separately_for_morphology():
     assert field_memory_mb(shape, sediment=True) == pytest.approx(
         field_memory_mb(shape) + mb(6 * 4) + 9.0
     )
+
+
+# --- M7 build step 8: the morphological-CFL gate at the scenario level ------------
+# The unit-level pieces live in `solver.core.test_sediment` (the ratio) and
+# `solver.processes.test_morphology` (the per-activation measurement); the physics
+# gate lives in `validation.test_bed_wave`. What is left, and what M7 plan §3 means
+# by *"asserted, not just printed"*, is that a whole scenario carrying an
+# over-Courant interval says so out loud instead of finishing quietly.
+
+
+def test_a_scenario_inside_the_morphological_courant_gate_says_nothing(tmp_path, capsys):
+    """The step-5 bowl is under the gate, so the warning must stay silent.
+
+    Half of a warning's value is that it is not always on. This also pins the bowl at
+    Courant 0.07 -- comfortably inside -- so a future change that pushed the demo
+    scenarios over would surface here rather than in a reviewer's eyeball.
+    """
+    scn = _sediment_bowl()
+    run_simulation(scn, _bowl(16, 16), tmp_path / "ok.zarr", device="cpu", verbose=True)
+    out = capsys.readouterr().out
+    print(out)
+    assert "morphological Courant" not in out
+    assert "bed courant" in out  # ... but the number is still reported
+
+
+def test_a_scenario_over_the_morphological_courant_gate_warns(tmp_path, capsys):
+    """An over-Courant run finishes clean on every other gauge, and warns on this one.
+
+    The same bowl with the rain held on for the whole run and a 2400 s bed interval:
+    the bed wave then crosses ~3 cells per activation. Nothing else notices -- the
+    mass balance and the sediment balance both stay far inside their gates, the store
+    is written, `status.json` reaches `done` -- which is exactly why this warning is
+    printed unconditionally rather than under `verbose`.
+    """
+    scn = _sediment_bowl(end_time=6000.0, output_every=3000.0, rain_duration=6000.0,
+                         sediment_interval_s=2400.0)  # fmt: skip
+    ledger = run_simulation(scn, _bowl(16, 16), tmp_path / "bad.zarr", device="cpu",
+                            verbose=False)  # fmt: skip
+    out = capsys.readouterr().out
+    print(out)
+
+    assert "WARNING: morphological Courant" in out
+    assert "2400" in out, "the warning should name the interval it is complaining about"
+    # Every other gauge is happy, which is the finding this test carries.
+    assert ledger.max_rel_error < MASS_GATE
+
+    ds = xr.open_zarr(tmp_path / "bad.zarr", consolidated=False)
+    series = ds.attrs["morphology"]
+    assert max(r["courant"] for r in series) > 1.0
+    assert ds.attrs["sediment_max_rel_error"] < SEDIMENT_GATE
+
+
+def test_the_courant_diagnostic_samples_the_flow_and_a_drained_run_reads_zero(tmp_path, capsys):
+    """A carried limitation of the diagnostic, pinned rather than remembered.
+
+    The transport integral is accumulated over the interval (M7 plan §1.3); the
+    Courant number is **not**. :func:`solver.core.sediment.celerity_field` evaluates
+    the flow the state is carrying *at the activation instant*, so an interval during
+    which a flood arrived, moved the bed and drained away reports a celerity of zero
+    -- and therefore a Courant number of zero -- having moved the bed by more than the
+    over-Courant run above.
+
+    Measured here: rain for 600 s of a 6000 s run with a 3000 s bed interval moves
+    577 m^3 of sediment and reports Courant 0.000, while the same scenario with the
+    rain held on reports 5.05. The warning is a **floor on what you can trust, not a
+    certificate**: a silent run whose forcing is spiky has not been checked. Making it
+    a true interval maximum means tracking the celerity every fast step, which is a
+    full-field host reduction per step -- out of scope for a diagnostic, and named in
+    M7 plan §4 instead.
+    """
+    scn = _sediment_bowl(end_time=6000.0, output_every=3000.0, sediment_interval_s=3000.0)
+    run_simulation(scn, _bowl(16, 16), tmp_path / "spiky.zarr", device="cpu", verbose=False)
+    out = capsys.readouterr().out
+    print(out)
+
+    ds = xr.open_zarr(tmp_path / "spiky.zarr", consolidated=False)
+    series = ds.attrs["morphology"]
+    # The bed moved a lot ...
+    assert ds.attrs["sediment_balance_series"][-1]["gross_volume"] > 100.0
+    # ... and the diagnostic still read zero, so nothing warned.
+    assert max(r["courant"] for r in series) == 0.0
+    assert "WARNING: morphological Courant" not in out
