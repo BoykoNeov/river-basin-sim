@@ -42,6 +42,14 @@ cell size **by construction** rather than by two implementations agreeing.
 ``assemble_mosaic`` fills uncovered cells at the minimum covered elevation and
 rendering that is a flat plateau no one can tell from a bug.
 
+**A morphological run's bed is the one it started on.** ``bed`` in the canonical
+store is always the initial bed and M7's ``bed_change`` is not exported as frames
+(plan §1.7 -- terrain animation is a viewer milestone, and the shader's
+``bed + depth`` lift debt would move with it). So when the store carries
+``bed_change``, ``manifest["morphology"]`` declares that the terrain is the
+``t = 0`` bed and by how much the run moved it -- same species as the ``domain``
+note, and for the same reason: a picture has to be able to say what it is not.
+
 Byte layout matches the M0 ``.r32`` convention (raw LE f32, row-major) so the
 viewer loads a frame into a Godot ``FORMAT_RF`` image with the *same* orientation
 and origin the M0 terrain loader established -- no transpose, water registers with
@@ -153,6 +161,41 @@ def _export_bed(ds, out_dir: Path, layout: list[dict], tiled: bool) -> dict | No
     return entry
 
 
+def _morphology_note(ds, last_frame: int) -> dict | None:
+    """Declare that the exported bed is the *initial* one, when the run moved it.
+
+    M7 ships ``bed_change (T, Y, X)`` in the canonical store but deliberately does
+    **not** animate the viewer's terrain (M7 plan §1.7): re-fitting the height map
+    per frame is a viewer milestone, and the carried debt makes it worse rather than
+    better -- the shader still lifts water as ``bed + depth`` instead of through the
+    sub-grid storage curve (§7.3 *Known gap*), so a moving bed would move that
+    mis-lift with it. Fix the lift first, then animate.
+
+    What is *not* acceptable is a picture that quietly implies the terrain is
+    current, which is the same failure the mosaic terrain fix was about. So a store
+    that morphed says so in the manifest, **quantitatively** -- the extremes of the
+    final bed change are how wrong the rendered terrain is -- and the viewer prints
+    it. Returns ``None`` for a run without morphology, so an unarmed run's manifest
+    is byte-identical to M6's.
+    """
+    if "bed_change" not in ds or last_frame < 0:
+        return None
+    dz = np.asarray(ds["bed_change"].isel(time=last_frame).values, dtype=np.float64)
+    return {
+        "bed_change": {
+            "min": float(dz.min()),
+            "max": float(dz.max()),
+            "frame": last_frame,
+            "time": float(ds["time"].values[last_frame]),
+        },
+        "static_bed": "initial",
+        "note": (
+            "terrain is the bed at t=0; this run moved it (see bed_change in the "
+            "canonical store). The viewer does not animate terrain in M7."
+        ),
+    }
+
+
 def export_frames(
     zarr_path: str | Path,
     out_dir: str | Path,
@@ -236,6 +279,11 @@ def export_frames(
     static = _export_bed(ds, out_dir, layout, tiled)
     if static is not None:
         manifest["static"] = static
+    morphology = _morphology_note(ds, n_frames - 1)
+    if morphology is not None:
+        # The bed the viewer renders is the run's *first* bed when the run morphed;
+        # the note is what keeps that from reading as the current one.
+        manifest["morphology"] = morphology
     domain = ds.attrs.get("domain")
     if isinstance(domain, dict):
         # How the mosaic was assembled (M6): uncovered cells are filled at the

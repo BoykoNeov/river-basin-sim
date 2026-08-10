@@ -326,7 +326,7 @@ def run_simulation(
         # How the domain was assembled from the tile set (M6): origin, tile count and
         # any uncovered cells, so a stored result says which patch of the world it is.
         attrs["domain"] = domain.as_attrs()
-    writer = ZarrWriter(out_path, grid, n_frames, attrs)
+    writer = ZarrWriter(out_path, grid, n_frames, attrs, bed_change=morphology is not None)
     writer.write_bed(unshift_bed(bed_sim, z_ref))  # §7.2 stores true elevations
     if channels is not None:
         # The bed alone no longer describes what the run stepped on: store the
@@ -334,9 +334,19 @@ def run_simulation(
         writer.write_static("channel_width", channels.w.numpy())
         writer.write_static("channel_depth", channels.d.numpy())
 
+    def bed_change_frame() -> np.ndarray | None:
+        """This frame's cumulative bed change, or ``None`` when nothing morphs.
+
+        Deliberately **not** put through :func:`unshift_bed`: a datum shift moves the
+        origin of an elevation and a *difference* of elevations has no origin to move
+        (M7 plan §1.7). That is what makes `bed` + `bed_change` addable without the
+        reader knowing which datum the run stepped in.
+        """
+        return None if morphology is None else st.sediment.bed_change_numpy()
+
     # Frame at t = 0 (baseline).
     u0, v0 = st.velocities_numpy()
-    writer.append(0.0, st.depth_numpy(), u0, v0)
+    writer.append(0.0, st.depth_numpy(), u0, v0, bed_change_frame())
 
     # Forcing breakpoints a step must not cross (the scheduler adds the output
     # cadence, end_time and any slow-process activations): rain on/off and each
@@ -385,7 +395,7 @@ def run_simulation(
         if tick.is_output:
             rec = ledger.record(st, tick.t1)
             u, v = st.velocities_numpy()
-            writer.append(tick.t1, st.depth_numpy(), u, v)
+            writer.append(tick.t1, st.depth_numpy(), u, v, bed_change_frame())
             h_max = float(st.h.numpy().max())
             line = f"  t={tick.t1:8.1f}s  h_max={h_max:6.3f}m  mass_rel_err={rec.rel_error:.2e}"
             if sed_ledger is not None:
@@ -408,8 +418,8 @@ def run_simulation(
     final_attrs = dict(ledger.as_attrs())
     if morphology is not None:
         # The bed-change history beside the mass series, for the same reason: a
-        # stored run says what its slow clock did. The bed_change *field* is M7
-        # build step 7; this is the record of the activations that produced it.
+        # stored run says what its slow clock did -- the activation-by-activation
+        # record of what produced the `bed_change` field written at each frame.
         final_attrs["morphology"] = morphology.series
         final_attrs.update(sed_ledger.as_attrs())
     if reservoirs:

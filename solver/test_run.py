@@ -308,6 +308,128 @@ def test_a_sediment_scenario_runs_and_records_what_its_slow_clock_did(tmp_path):
     assert all(r["banked_volume"] == 0.0 for r in sed_series)
 
 
+def _sediment_bowl(**over) -> Scenario:
+    """The step-5 bowl scenario, parameterised (see the sediment test above on regime)."""
+    kw = dict(
+        dx=20.0,
+        end_time=600.0,
+        output_every=300.0,
+        dt_max=5.0,
+        rain_mm_hr=120.0,
+        rain_duration=600.0,
+        sediment_law="mpm",
+        sediment_d50_m=0.002,
+        sediment_interval_s=150.0,
+    )
+    kw.update(over)
+    return Scenario(**kw)
+
+
+def test_bed_and_bed_change_reconstruct_the_bed_the_run_finished_on(tmp_path):
+    """M7 step 7, the keystone: ``bed`` is the initial bed and ``bed_change`` moves it.
+
+    §7.2 stores the moving part *beside* ``bed`` rather than promoting ``bed`` to
+    ``(T, Y, X)``, so the two only mean anything together -- and they are consistent
+    by construction (M7 plan §1.1): ``z0`` is captured after barriers from the same
+    array ``bed`` is written from, and ``z = float32(z0 + dz_cum)`` is rebuilt from
+    it at every activation. This asserts that chain end to end through the store,
+    which is what catches a barrier or datum mistake in one shot.
+
+    The volume cross-check is against the **gross** displaced volume the sediment
+    ledger reports, not the net: the net is identically zero in a domain closed to
+    bedload (build step 6), so a net-against-net comparison would be two near-zeros
+    agreeing about nothing. What the store must reproduce is the scale that says the
+    bed moved -- and it reproduces it only to what a float32 *rendering* of the f64
+    ``dz_cum`` costs, which is exactly what the tolerance measures.
+    """
+    scn = _sediment_bowl()
+    run_simulation(scn, _bowl(16, 16), tmp_path / "s.zarr", device="cpu", verbose=False)
+    ds = xr.open_zarr(tmp_path / "s.zarr", consolidated=False)
+
+    dz = ds["bed_change"].values
+    assert dz.shape == ds["depth"].shape
+    assert np.isfinite(dz).all()
+    # t = 0 is the pristine bed: nothing has moved, exactly.
+    assert np.array_equal(dz[0], np.zeros_like(dz[0]))
+    assert np.abs(dz[-1]).max() > 0.0, "the bed moved but the field says it did not"
+
+    # The final output frame lands on the final activation, so the field and that
+    # activation's record describe the same bed.
+    last = ds.attrs["morphology"][-1]
+    assert last["time"] == scn.end_time
+    solid = scn.dx**2 * (1.0 - 0.4)  # the default [sediment] porosity
+    gross = ds.attrs["sediment_balance_series"][-1]["gross_volume"]
+    assert float(np.abs(dz[-1]).sum()) * solid == pytest.approx(gross, rel=1e-5)
+    assert float(dz[-1].min()) == pytest.approx(last["dz_min_m"], rel=1e-6)
+    assert float(dz[-1].max()) == pytest.approx(last["dz_max_m"], rel=1e-6)
+
+    # And the pair adds up to a bed: `bed` never moves, so the terrain a reader
+    # reconstructs for the last frame is bed + bed_change[-1].
+    final_bed = ds["bed"].values + dz[-1]
+    assert np.isfinite(final_bed).all()
+    assert not np.array_equal(final_bed, ds["bed"].values)
+    assert np.array_equal(ds["bed"].values, _bowl(16, 16))  # still the *initial* bed
+
+
+def test_bed_change_is_datum_free(tmp_path):
+    """A difference of elevations has no origin, so ``[grid] datum`` must not touch it.
+
+    ``bed`` goes through :func:`~solver.core.datum.unshift_bed` on the way out and
+    ``bed_change`` deliberately does not (M7 plan §1.7) -- which is what lets a reader
+    add them without knowing the datum. **The discriminator is scale, not tolerance**:
+    un-shifting the change by mistake would offset it by ``z_ref`` -- 9 m here --
+    against a bed that moves by centimetres, three orders away from anything the two
+    runs can differ by legitimately. And they do differ: a datum shift changes float32
+    ``eta = h + z`` arithmetic, which this scenario is unusually sensitive to (MPM at
+    the wet/dry guard, M7 plan §4), so the runs agree to ~5% of the largest change
+    rather than bitwise. M5 measured the same shape of thing on EA Test 1 -- agreement
+    to three decimals, not bit for bit.
+    """
+    bed = _bowl(16, 16) + 9.5
+    plain = _sediment_bowl(name="sed_plain")
+    shifted = _sediment_bowl(name="sed_datum", datum="auto")
+    run_simulation(plain, bed, tmp_path / "p.zarr", device="cpu", verbose=False)
+    run_simulation(shifted, bed, tmp_path / "d.zarr", device="cpu", verbose=False)
+
+    dp = xr.open_zarr(tmp_path / "p.zarr", consolidated=False)
+    dd = xr.open_zarr(tmp_path / "d.zarr", consolidated=False)
+    assert dp.attrs["datum_shift_m"] == 0.0
+    assert dd.attrs["datum_shift_m"] == 9.0  # the shift really was applied
+    assert np.allclose(dp["bed"].values, dd["bed"].values)  # both store true elevations
+
+    a, b = dp["bed_change"].values[-1], dd["bed_change"].values[-1]
+    assert np.abs(a).max() < 0.1  # centimetres, three orders below z_ref = 9 m
+    assert np.abs(a - b).max() < 0.01  # ... and the two runs are within one of those
+
+
+def test_below_threshold_the_stored_bed_change_is_exactly_zero(tmp_path):
+    """Boulders do not move: no transport must render as *bit-exact* zero, not small.
+
+    MPM's threshold is the cheap sharp test the law was chosen for (M7 plan §1.2) --
+    here it also says the store path invents nothing on its way through the f64 ->
+    f32 cast. The array is still created, because the run *has* morphology: "armed
+    and nothing moved" and "no morphology" are different statements about a run and
+    the store makes both readable.
+    """
+    scn = _sediment_bowl(name="sed_boulders", sediment_d50_m=1.0)
+    run_simulation(scn, _bowl(16, 16), tmp_path / "z.zarr", device="cpu", verbose=False)
+    ds = xr.open_zarr(tmp_path / "z.zarr", consolidated=False)
+
+    assert "bed_change" in ds
+    assert np.array_equal(ds["bed_change"].values, np.zeros_like(ds["bed_change"].values))
+    assert all(r["applied_m3"] == 0.0 for r in ds.attrs["morphology"])
+    assert np.array_equal(ds["bed"].values, _bowl(16, 16))
+
+
+def test_a_run_without_sediment_stores_no_bed_change(tmp_path):
+    """The invariant every milestone holds: unarmed is the previous store, untouched."""
+    scn = Scenario(dx=20.0, end_time=300.0, output_every=150.0, dt_max=5.0, rain_mm_hr=60.0)
+    run_simulation(scn, _bowl(12, 12), tmp_path / "n.zarr", device="cpu", verbose=False)
+    ds = xr.open_zarr(tmp_path / "n.zarr", consolidated=False)
+    assert "bed_change" not in ds
+    assert "morphology" not in ds.attrs
+
+
 def test_field_memory_counts_the_two_widths_separately_for_morphology():
     """The f64 pair is the *largest* contributor, and a `count x 4` would hide it.
 

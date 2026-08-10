@@ -307,6 +307,7 @@ func _load_results(manifest_path: String) -> void:
 				+ "%dx%d @ %.2fm -- re-export frames to ship the run's bed"
 				% [_grid_w, _grid_h, _dx])
 	_report_domain()
+	_report_morphology()
 
 	var gdepth: Dictionary = _manifest.get("global", {}).get("depth", {})
 	var p99 := float(gdepth.get("p99", 1.0))
@@ -439,6 +440,25 @@ func _report_domain() -> void:
 		print("River Basin viewer: %d mosaic cells (%.2f%%) are fill @ %.1f m -- flat by "
 			% [gaps, pct, float(domain.get("fill_value", 0.0))]
 			+ "construction, not by the terrain")
+
+
+func _report_morphology() -> void:
+	## Say when the terrain shown is the bed the run *started* on (M7).
+	##
+	## A morphological run moves `z`, but the exported bed is the initial one and M7
+	## deliberately does not animate terrain: the shader still lifts water as
+	## `bed + depth` rather than through the sub-grid storage curve, so a moving bed
+	## would move that mis-lift with it. Fix the lift first, then animate. Until then
+	## the picture has to declare what it is not -- with the number, because "the
+	## terrain is a little out of date" and "it scoured a metre" are different
+	## pictures. Same idiom as `_report_domain`.
+	var morph: Dictionary = _manifest.get("morphology", {})
+	if morph.is_empty():
+		return
+	var dz: Dictionary = morph.get("bed_change", {})
+	print("River Basin viewer: terrain is the bed at t=0 -- this run moved it by "
+		+ "%+.3f..%+.3f m by t = %.0f s (not animated in M7)"
+		% [float(dz.get("min", 0.0)), float(dz.get("max", 0.0)), float(dz.get("time", 0.0))])
 
 
 func _apply_frame(i: int) -> void:

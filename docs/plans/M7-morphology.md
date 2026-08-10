@@ -550,6 +550,53 @@ sediment.
    should carry it as a risk beside the `dx/w` one.
 7. **Store + export** — `bed_change` through `ZarrWriter`, §7.2 and §7.1 edits in
    HANDOFF, the manifest note, `scripts/plot_bed_change.py`.
+   **Done** — `bed_change (T, Y, X)` in `zarr_writer.py` (created only when a run has
+   morphology, appended at every output frame from `run.py`), `manifest["morphology"]`
+   + a viewer `_report_morphology()` print, the §7.1/§7.2/§7.3 edits, and the figure
+   script. Five decisions worth naming:
+   - **The keystone is `bed + bed_change[i]`, and it is consistent by construction.**
+     `z0` is captured from the same array `bed` is written from (after barriers, before
+     any water moves) and `z = float32(z0 + dz_cum)` is rebuilt from it at every
+     activation — so the two stored arrays add up because of §1.1's design, not because
+     the writer arranges it. `bed_change` deliberately does **not** go through
+     `unshift_bed`: a *difference* of elevations has no origin to move, which is what
+     lets a reader add the pair without knowing the datum. The discriminator is scale,
+     not tolerance — un-shifting by mistake would offset a centimetre-scale field by
+     `z_ref` (9 m in the test), three orders away from anything two datums can
+     legitimately differ by.
+   - **`ZarrWriter.append` refuses a mismatch in both directions**, because zero is a
+     legal bed change. A preallocated frame reads as *"the bed did not move here"* —
+     a statement about the physics, not a visible hole — so an omitted frame is the
+     same class of quiet lie as `max(h, 0)`. Symmetrically, a store without morphology
+     refuses one, so the unarmed store stays exactly M6's: no array, no attribute, and
+     a byte-identical manifest (the `morphology` key is added only when the store
+     actually carries `bed_change`, never as `false`).
+   - **The volume cross-check had to be against the *gross*, for the reason step 6
+     found.** `Σ dz_cum` is identically zero in a domain closed to bedload, so the
+     first draft of the keystone test compared two near-zeros (−6.7e-7 against
+     4.2e-16) and would have passed on nothing. It now compares `Σ|dz|·A(1−p)` against
+     the ledger's `gross_volume`, which is the number that says the bed moved at all.
+   - **`bed_change` is not exported as frame tiles, and the manifest says why.**
+     `_write_field` would make it nearly free, which is exactly the temptation §1.7
+     fences: the shader still lifts water as `bed + depth` rather than through the
+     storage curve, so animating the bed would animate that mis-lift with it. Instead
+     `manifest["morphology"]` carries the final change's extremes and the viewer prints
+     them — quantitative on purpose, since *"the terrain is slightly stale"* and *"it
+     scoured 20 cm"* are different pictures and only the number separates them. Same
+     idiom and same reason as `_report_domain`'s gap-fill declaration.
+   - **The figure reads its numbers from `.zattrs`, never from the field it draws.**
+     What the ledger balances is the f64 `dz_cum`; the stored array is its float32
+     rendering, so re-deriving a volume from the picture would report the rendering's
+     error as the run's. `plot_bed_change.py` also reads `attrs["n_frames"]` rather
+     than the time-axis length — `finalize` records the count but never resizes, and a
+     trailing preallocated frame of zeros is indistinguishable from a still bed.
+     Verified by running it (`scripts/` has no in-tree tests by convention); the
+     logic that is not drawing is covered by the store and export tests.
+
+   Checked on the read path as well as in `pytest`: `--rbverify` is green on the
+   existing (morphology-free) demo export — the note stays silent — and on a
+   morphological export it prints *"terrain is the bed at t=0 -- this run moved it by
+   −0.206..+0.090 m by t = 900 s"*. **321 tests green.**
 8. **Validation** — §3, every gate.
 9. **Demo** — `scenarios/reach_alluvial.toml`, GPU sign-off, HANDOFF + CLAUDE.md
    + roadmap updates.

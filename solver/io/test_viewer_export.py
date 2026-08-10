@@ -198,6 +198,67 @@ def test_manifest_carries_the_mosaic_assembly_record(tmp_path):
     assert manifest["domain"]["fill_value"] == 12.5
 
 
+def _make_sediment_run(tmp_path):
+    """A morphological run over the same bowl (the step-5 scenario, see solver/test_run)."""
+    ny, nx = 16, 20
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    bed = (((yy - ny / 2) ** 2 + (xx - nx / 2) ** 2) * 0.02).astype(np.float32)
+    scn = Scenario(
+        name="export_sediment",
+        dx=20.0,
+        end_time=600.0,
+        output_every=300.0,
+        dt_max=5.0,
+        rain_mm_hr=120.0,
+        rain_duration=600.0,
+        sediment_law="mpm",
+        sediment_d50_m=0.002,
+        sediment_interval_s=150.0,
+    )
+    zarr_path = tmp_path / "sed.zarr"
+    run_simulation(scn, bed, zarr_path, device="cpu", verbose=False)
+    return zarr_path
+
+
+def test_a_morphological_run_declares_that_its_terrain_is_the_starting_bed(tmp_path):
+    """M7 §1.7: the viewer does not animate terrain, so the picture must say so.
+
+    The exported bed is the run's bed at ``t = 0`` and stays that way while the run
+    scours and fills underneath it. The note is **quantitative** on purpose -- "the
+    terrain is a little out of date" and "it scoured a metre" are different pictures,
+    and only the number tells them apart.
+
+    ``bed_change`` itself is deliberately *not* exported as frame tiles: the shader
+    still lifts water as ``bed + depth`` rather than through the sub-grid storage
+    curve (§7.3 *Known gap*), so animating the bed would animate that mis-lift too.
+    """
+    zarr_path = _make_sediment_run(tmp_path)
+    out = tmp_path / "frames"
+    export_frames(zarr_path, out)
+
+    ds = xr.open_zarr(zarr_path, consolidated=False)
+    manifest = json.loads((out / "manifest.json").read_text())
+    morph = manifest["morphology"]
+    assert morph["static_bed"] == "initial"
+
+    final = ds["bed_change"].isel(time=manifest["n_frames"] - 1).values
+    assert morph["bed_change"]["min"] == float(final.min()) < 0.0
+    assert morph["bed_change"]["max"] == float(final.max())
+    assert morph["bed_change"]["time"] == float(ds["time"].values[-1])
+
+    # The terrain that shipped is the *initial* bed, byte for byte -- which is the
+    # claim the note exists to qualify.
+    bed_raw = np.fromfile(out / manifest["static"]["files"]["bed"], dtype="<f4")
+    assert np.array_equal(bed_raw.reshape(ds["bed"].shape), ds["bed"].values)
+    assert not any("bed_change" in name for name in [p.name for p in out.iterdir()])
+
+
+def test_a_still_bed_leaves_the_manifest_exactly_as_it_was(tmp_path):
+    """No morphology, no note: an unarmed run's manifest is M6's, key for key."""
+    manifest = json.loads((export_frames(_make_run(tmp_path), tmp_path / "f")).read_text())
+    assert "morphology" not in manifest
+
+
 def test_untiled_export_bytes_are_unchanged_by_the_m6_export(tmp_path):
     """The demo-scale path must be byte-for-byte what M2 wrote."""
     zarr_path = _make_run(tmp_path)

@@ -254,6 +254,13 @@ width = "data/fields/channel_width.r32"   # w (m), 0 < w ≤ dx; 0 = no channel
 depth = "data/fields/channel_depth.r32"   # d (m) bank-full, below the floodplain bed
 manning = 0.03                            # the channel's own roughness
 
+[sediment]                       # morphology (M7) — the table's presence arms it
+d50 = 0.008                      # m, scalar OR field path
+porosity = 0.4                   # bed porosity p in Exner's 1/(1−p)
+law = "mpm"                      # Meyer-Peter–Müller
+interval_s = 900.0               # slow-clock cadence — a scheduler sync point
+alluvium_thickness = 2.0         # optional erodible depth, scalar OR field
+
 [[inflow]]                       # point-source hydrograph, piecewise-linear Q(t)
 cell = [4, 768]
 hydrograph = [[0.0, 5.0], [3600.0, 60.0], [18000.0, 10.0]]
@@ -299,10 +306,10 @@ results.zarr/
 ├── time                    # (T,) simulated seconds
 ├── depth                   # (T, Y, X) float32  water depth h
 ├── u, v                    # (T, Y, X) float32  depth-averaged velocity
-├── bed                     # (Y, X)    float32  bed elevation z (static unless morpho)
+├── bed                     # (Y, X)    float32  bed elevation z at t = 0, always
+├── bed_change              # (T, Y, X) float32  cumulative bed change, when morpho ran
 ├── channel_width           # (Y, X)    float32  sub-grid channel w, when present
-├── channel_depth           # (Y, X)    float32  sub-grid channel d, when present
-└── [sediment, ...]         # added in later milestones
+└── channel_depth           # (Y, X)    float32  sub-grid channel d, when present
 ```
 
 Chunking: align chunks to viewer tiles (e.g. 512×512) and one timestep per chunk on the
@@ -316,6 +323,17 @@ datum` moved the run; `datum_shift_m` is provenance, not a decoding key. From M6
 bed alone no longer describes the bed: where sub-grid channels exist, `channel_width` /
 `channel_depth` ride alongside as statics, because `z` is the floodplain surface and the
 channel bed is `z − d`. A reader that ignores them will draw the wrong water surface.
+
+**`bed` is always the bed the run *started* on, and morphology ships beside it.** M7
+adds `bed_change (T, Y, X)` rather than promoting `bed` to a time axis: every existing
+reader keeps working untouched, and a bed *change* is a small quantity, so float32
+stores it at full relative precision where float32 elevations would not — the same
+conditioning that makes the solver accumulate it in float64 internally. The terrain at
+frame `i` is `bed + bed_change[i]`. `bed_change` is **not** put through the datum
+un-shift, because a difference of elevations has no origin to move; that is what lets
+the two be added without knowing which datum the run stepped in. The array exists only
+when the run had a `[sediment]` table, and what the sediment ledger balances is the
+solver's float64 accumulator — this array is its float32 rendering, for pictures.
 
 ### 7.3 Per-frame viewer format (solver → Godot)
 
@@ -355,6 +373,14 @@ canonical store carries (§7.2). A viewer therefore cannot reconstruct the stora
 and must lift water as `bed + depth`, which draws the surface over a channel cell up to
 `d` too high. Closing it means shipping `w`/`d` through the same static mechanism —
 anything else the composite depends on travels the same way, or it does not register.
+
+**Known gap (morphology).** The static bed is the run's bed at `t = 0`, and a run with
+`[sediment]` moves it. `bed_change` is deliberately *not* exported as frame tiles: the
+lift debt above would move with an animated bed, so fix the lift first, then animate.
+Until then a store that morphed carries `manifest["morphology"]` — the final change's
+extremes and the frame they belong to — and the viewer prints it, for the same reason
+`domain` declares gap fill: a picture must be able to say what it is not. The figure,
+not the scrub, is how a bed-change run is looked at (`scripts/plot_bed_change.py`).
 
 ### 7.4 Solver ↔ Godot subprocess protocol
 
