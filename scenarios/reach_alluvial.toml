@@ -1,0 +1,131 @@
+# M7 scenario (HANDOFF §7.1, §9 M7) -- morphology: a flood wave moves the bed.
+#
+# The same synthetic basin as `reach_basin.toml` (6x6 tiles, 1536x1536 @ 50 m,
+# run at coarsen = 2 -> 768x768 @ 100 m with the river carried sub-grid), with
+# two deliberate differences and one addition:
+#
+#   * [sediment]        -> Exner + Meyer-Peter-Mueller on the slow clock;
+#   * no [rainfall]     -> this is NOT a stylistic choice. MPM is a *channel
+#     bedload* law, and it diverges at the wet/dry guard: `tau/rho = g n^2 q^2 /
+#     h^(7/3)` at a millimetric rain sheet reads 14x the critical Shields number
+#     for gravel. `reach_basin`'s 15 mm/hr storm puts every floodplain cell at
+#     relative submergence h/d50 ~ 0.5 -- shallower than one grain -- and the bed
+#     change it would print there is an extrapolation artefact, not transport
+#     (M7 plan §4, measured: 5.6 cm of spurious scour in one activation on the
+#     16x16 bowl). Driving the reach with inflow alone keeps the moving water in
+#     the channel, where the law is defined and where step 8's gates ran.
+#   * a longer, fuller hydrograph -- the flood has to *arrive* before it can move
+#     anything, and there is no rain to wet the reach ahead of it.
+#
+# Grain size is derived, not picked: at the design discharge the channel carries
+# q ~ 3 m^2/s at normal depth ~1.66 m (n = 0.03, S = 0.0015), so
+# theta ~ 0.001585 / d50. d50 = 8 mm puts the reach at theta ~ 0.198 = 4.2
+# theta_c with h/d50 ~ 208 -- transporting well clear of threshold, in the same
+# regime band as the validated celerity fixture (validation/bedwave.py), which
+# uses the same grain. Coarser than ~34 mm and nothing moves at all.
+#
+# `interval_s = 900` with `output_every = 1800` is chosen against BOTH bounds
+# that squeeze it (M7 plan §4, §5.2): the morphological Courant number wants a
+# short interval on an erosive reach, while the scheduler's sync-point dt clamp
+# degrades local-inertial as the sync cadence shortens (0.165 mm of spurious
+# depth ripple at 900 s, 9.8 mm at 300 s, 74 mm at 22.5 s -- and morphology
+# *rectifies* that oscillation into a permanent bed signature instead of letting
+# it average out). Sync points are the union of the output cadence and the
+# activations, so this pair runs at the 900 s row. The run prints its peak bed
+# Courant and warns if it approaches 1; at 100 m cells and millimetre-per-
+# activation transport it lands far below.
+#
+# Generate the basin + channel fields first (shared with the M6 demo):
+#   uv run python scripts/make_reach_demo.py
+# Then run, with explicit output paths -- every scenario otherwise writes the
+# same data/results/demo.zarr and the frames export never purges it:
+#   uv run python -m solver.run --config scenarios/reach_alluvial.toml \
+#       --out data/results/reach_alluvial.zarr \
+#       --frames-dir data/results/reach_alluvial_frames
+
+[meta]
+name = "reach_alluvial"
+seed = 12345
+scheme = "local_inertial"        # morphology is LI-only (M7 plan §1.4)
+
+[grid]
+tiles_dir = "data/tiles/reach_demo"   # dx / crs inherit from tiles.json
+tiles = "all"                         # the domain is the mosaic
+coarsen = 2                           # 50 m tiles -> a 100 m run grid
+datum = "auto"                        # a basin at 85-565 m; see reach_basin.toml
+
+[run]
+end_time = 86400.0               # 24 h -- the flood has to travel a dry reach
+output_every = 1800.0            # 48 frames
+cfl = 0.7
+dt_max = 20.0
+
+# Declared, not omitted. An absent [rainfall] table now means no rain (an earlier
+# fallback inherited the in-code demo's 50 mm/hr, which silently put 1.47e8 m^3 on
+# this domain), but the whole scenario turns on there being no rain-on-grid sheet,
+# so it says so out loud.
+[rainfall]
+rate_mm_hr = 0.0
+duration_s = 0.0
+
+[parameters]
+manning_n = 0.06                 # vegetated floodplain
+
+# Sub-grid channel geometry, shared with the M6 demo. The channel is 7-45 m wide
+# inside 100 m cells, so its section -- not the cell mean -- is what sets the
+# shear the transport law sees (solver/core/sediment.py: a channel face's flux is
+# per unit *channel* width, at the channel's own flow depth and hydraulic radius
+# R = A/P, recombined by w/dx). Getting that mix wrong is a factor-of-dx/w error,
+# up to ~15x here.
+[channels]
+width = "../data/fields/reach_demo/channel_width.r32"
+depth = "../data/fields/reach_demo/channel_depth.r32"
+manning = 0.03                   # a channel is smoother than its floodplain
+
+# Bedload on the slow clock. The table's presence arms morphology.
+[sediment]
+law = "mpm"
+d50 = 0.008                      # m -- medium gravel, derived above
+porosity = 0.4
+interval_s = 900.0
+
+# The upstream reach: a flood that rises over three hours, holds its peak for
+# six, then recedes. Longer than reach_basin's, because with no rain the wave
+# has to wet its own way down the valley, and a peak that is gone before the
+# reach is wet moves no bed. Holding the peak also matters to the diagnostic:
+# `celerity_field` samples the flow at the activation *instant*, so a spiky
+# hydrograph can report Courant 0.00 while the interval moved hundreds of m^3
+# of bed (M7 plan §4).
+#
+# TWO things about the placement, both measured rather than assumed:
+#
+#   * it is **in the channel**. Cell indices are assembled-domain (pre-coarsen),
+#     so [r, c] steps the run's (r//2, c//2); the meander centreline at the head
+#     is near column 772, not 768. `reach_basin` injects at [4, 768], which is
+#     the *floodplain* two cells off the river -- harmless there, because rain
+#     wets the channel anyway, and invisible because nothing measured the bed.
+#   * it is **spread over four cells**, a quarter of Q each. The whole discharge
+#     into one 100 m cell is a point source in the M5 `outlet`-box sense, and it
+#     digs its own crater: measured over 3 h at [4, 768], one cell scoured 0.28 m
+#     while the reach signal was 9.3 mm, and that patch carried **83%** of the
+#     run's gross bed change. Spreading it down four consecutive channel cells
+#     hands the same water to the same river over a reach instead of a point.
+[[inflow]]
+cell = [0, 768]                  # -> run (0, 384), w = 6.8 m
+hydrograph = [[0.0, 2.5], [10800.0, 22.5], [32400.0, 22.5], [57600.0, 5.0], [86400.0, 5.0]]
+
+[[inflow]]
+cell = [2, 770]                  # -> run (1, 385), w = 7.0 m
+hydrograph = [[0.0, 2.5], [10800.0, 22.5], [32400.0, 22.5], [57600.0, 5.0], [86400.0, 5.0]]
+
+[[inflow]]
+cell = [4, 772]                  # -> run (2, 386), w = 7.2 m
+hydrograph = [[0.0, 2.5], [10800.0, 22.5], [32400.0, 22.5], [57600.0, 5.0], [86400.0, 5.0]]
+
+[[inflow]]
+cell = [6, 776]                  # -> run (3, 388), w = 7.4 m
+hydrograph = [[0.0, 2.5], [10800.0, 22.5], [32400.0, 22.5], [57600.0, 5.0], [86400.0, 5.0]]
+
+[boundaries]
+default = "closed"
+south = "open"                   # the basin outlet -- water leaves the domain

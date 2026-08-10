@@ -803,7 +803,17 @@ def load_config(path: str | Path) -> Scenario:
     meta = doc.get("meta", {})
     grid = doc.get("grid", {})
     run = doc.get("run", {})
-    rainfall = doc.get("rainfall", {})
+    # An absent [rainfall] table means *no rain*, not the dataclass default. The
+    # in-code demo's `Scenario()` still rains 50 mm/hr -- that is M1's own forcing,
+    # and the no-config path keeps it -- but a scenario file that never mentions
+    # rain must not inherit it: 50 mm/hr for half an hour is 25 mm over the whole
+    # domain, which on the M6/M7 mosaic is 1.47e8 m^3 of water nobody asked for,
+    # and a millimetric rain-on-grid sheet reads 14x the critical Shields number
+    # for gravel (M7 plan §4). Declaring the table opts into its defaults; every
+    # shipped scenario declares it, and `reservoir_release` declares
+    # `rate_mm_hr = 0.0` to say exactly what this fallback now says by omission.
+    rain_table = doc.get("rainfall")
+    rainfall = rain_table if rain_table is not None else {}
     parameters = doc.get("parameters", {})
     boundaries = doc.get("boundaries", {})
     for name, table in (
@@ -931,6 +941,12 @@ def load_config(path: str | Path) -> Scenario:
 
     # --- build the Scenario ----------------------------------------------------
     defaults = Scenario()
+    # Declaring [rainfall] opts into its defaults; omitting it asks for no rain.
+    if rain_table is None:
+        rain_mm_hr, rain_duration = 0.0, 0.0
+    else:
+        rain_mm_hr = float(rainfall.get("rate_mm_hr", defaults.rain_mm_hr))
+        rain_duration = float(rainfall.get("duration_s", defaults.rain_duration))
     try:
         return Scenario(
             name=str(meta.get("name", defaults.name)),
@@ -952,7 +968,7 @@ def load_config(path: str | Path) -> Scenario:
             infiltration_mm_hr=infil_mm_hr,
             infiltration_field=infil_field,
             rain_type=rain_type,
-            rain_mm_hr=float(rainfall.get("rate_mm_hr", defaults.rain_mm_hr)),
+            rain_mm_hr=rain_mm_hr,
             rain_field=rain_field,
             channel_width_m=chan_width,
             channel_width_field=chan_width_field,
@@ -967,7 +983,7 @@ def load_config(path: str | Path) -> Scenario:
             sediment_interval_s=sed_interval,
             alluvium_thickness_m=allu_m,
             alluvium_thickness_field=allu_field,
-            rain_duration=float(rainfall.get("duration_s", defaults.rain_duration)),
+            rain_duration=rain_duration,
             inflows=inflows,
             structures=structures,
             boundaries=bc,

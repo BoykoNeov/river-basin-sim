@@ -70,6 +70,40 @@ def test_full_config_maps_every_field(tmp_path):
     assert scn.has_open_boundary is False
 
 
+def test_an_absent_rainfall_table_means_no_rain_not_the_demo_default(tmp_path):
+    """Omitting [rainfall] must not inherit `Scenario()`'s 50 mm/hr.
+
+    The dataclass default is the M1 in-code demo's own forcing and the no-config
+    path keeps it, but a scenario file that never mentions rain is asking for none.
+    Silently raining 50 mm/hr for half an hour is 25 mm over the whole domain --
+    1.47e8 m^3 on the M6/M7 mosaic -- and it lands as a millimetric sheet, which is
+    where M7's transport law reads 14x the critical Shields number (M7 plan §4).
+    """
+    stanza = '[rainfall]\ntype = "uniform"\nrate_mm_hr = 40.0\nduration_s = 600.0\n'
+    text = _FULL.replace(stanza, "")
+    assert "[rainfall]" not in text
+    scn = load_config(_write(tmp_path, text))
+    assert (scn.rain_mm_hr, scn.rain_duration) == (0.0, 0.0)
+    assert scn.rain_m_s == 0.0
+    # ... while the table's mere presence still opts into those defaults, the way
+    # [sediment] and [channels] are armed by presence.
+    declared = load_config(_write(tmp_path, text + "\n[rainfall]\n", "declared.toml"))
+    demo = Scenario()
+    assert (declared.rain_mm_hr, declared.rain_duration) == (demo.rain_mm_hr, demo.rain_duration)
+
+
+def test_the_alluvial_demo_really_has_no_rain():
+    """The M7 demo's whole design rests on there being no rain-on-grid sheet -- that
+    is what keeps its transport in the regime MPM is defined for. Asserted as
+    behaviour on the shipped file, because the claim is about the run, not the text:
+    with the 50 mm/hr fallback this scenario silently carried 1.47e8 m^3 of water and
+    83% of its bed change was a rain artefact."""
+    scn = load_config(REPO_ROOT / "scenarios" / "reach_alluvial.toml")
+    assert scn.rain_m_s == 0.0
+    assert scn.rain_duration == 0.0
+    assert scn.has_sediment and scn.has_channels
+
+
 def test_dx_crs_default_to_manifest_when_omitted(tmp_path):
     text = _FULL.replace("dx = 25.0\n", "").replace('crs = "EPSG:32617"\n', "")
     scn = load_config(_write(tmp_path, text))
