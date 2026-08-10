@@ -335,6 +335,12 @@ the two be added without knowing which datum the run stepped in. The array exist
 when the run had a `[sediment]` table, and what the sediment ledger balances is the
 solver's float64 accumulator — this array is its float32 rendering, for pictures.
 
+**Read `attrs["n_frames"]`, never `sizes["time"]`.** The time axis is preallocated and
+an early stop does not resize it, so the tail can hold frames that were never written.
+For `depth` a trailing zero frame reads as an obviously dry domain; for `bed_change`
+**zero is a legal value**, so it reads as a bed that did not move — a plausible frame,
+not a visible hole. That asymmetry is why this belongs in the contract.
+
 ### 7.3 Per-frame viewer format (solver → Godot)
 
 Godot cannot read Zarr natively — do not make it try. Export a parallel lean stream:

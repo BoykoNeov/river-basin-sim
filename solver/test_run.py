@@ -257,8 +257,8 @@ def test_a_sediment_scenario_runs_and_records_what_its_slow_clock_did(tmp_path):
     the morphology process is built and scheduled on its own cadence, and the store
     is self-describing about it -- the static configuration in ``sediment`` and the
     activation history in ``morphology``, beside the reservoir's release series for
-    the same reason. The ``bed_change`` *field* is build step 7; this is the record
-    of the activations that will produce it.
+    the same reason. This is the record of the activations that produce the
+    ``bed_change`` field; that field is asserted two tests below.
 
     Rain over a bowl, so there is real flow to transport with, and the water mass
     gate must stay green **with the bed moving** -- "the bed update quietly ate
@@ -309,7 +309,16 @@ def test_a_sediment_scenario_runs_and_records_what_its_slow_clock_did(tmp_path):
 
 
 def _sediment_bowl(**over) -> Scenario:
-    """The step-5 bowl scenario, parameterised (see the sediment test above on regime)."""
+    """The step-5 bowl scenario, parameterised.
+
+    **What transports here is the thin sheet at the wet/dry guard, and that regime is
+    on notice** -- MPM's shear diverges as ``h -> H_DRY`` (M7 plan §4, and the step-5
+    test above says it at length). Every test built on this helper asserts that the
+    bed *moved*, so if step 8 gives the law a depth guard they all fail here rather
+    than where the law changed: re-home them to channel flow then, do not weaken the
+    assertions. The one exception is the below-threshold test, which asserts the bed
+    did **not** move and survives a depth guard unchanged.
+    """
     kw = dict(
         dx=20.0,
         end_time=600.0,
