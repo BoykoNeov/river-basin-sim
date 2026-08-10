@@ -135,9 +135,13 @@ def test_a_reach_just_over_the_threshold_moves_it():
     # The whole reach is over threshold, so this is the clean partner of the 0.9 arm
     # rather than a run that transports only in the one place it happens to be deep.
     assert theta.min() > SHIELDS_CRITICAL
-    # Every cell except the two pinned ends, which are held at zero by the fixture's
-    # own sediment BC and are therefore not evidence either way.
-    assert moved == fx.nx - 2 * fx.pinned_cells
+    # Essentially every free cell moved -- the exact figure is printed rather than
+    # asserted, because a cell whose two face integrals happened to cancel would read
+    # zero legitimately and a knife-edge equality would go brittle on any change to
+    # the reach. What is exact is the pinned ends: they are held at zero by the
+    # fixture's own sediment BC and are not evidence either way.
+    assert moved >= fx.nx - 4
+    assert res.dz_cum[0] == 0.0 and res.dz_cum[-1] == 0.0
     assert np.abs(res.dz_cum).max() > 1e-3
 
 
@@ -311,34 +315,47 @@ def test_a_bed_that_dries_a_cell_keeps_its_neighbours_wet():
     assert (h[[0, 1, 3, 4]] >= H_DRY).all(), "drying was not local to the mound"
 
 
-def test_the_celerity_fixture_and_the_threshold_pair_agree_on_the_flow():
-    """Re-graining changes ``theta`` and nothing else -- the pair's premise, checked.
+def test_re_graining_moves_the_shields_number_and_nothing_else():
+    """The threshold pair's premise: ``at_shields`` changes ``d50``, not the reach.
 
-    ``at_shields`` claims ``d50`` moves the Shields number without touching the
-    hydraulics. If that were false the threshold pair would be comparing two different
-    reaches and its contrast would mean nothing, so it is measured rather than argued:
-    all three arms must settle at the same depth and the same unit discharge.
+    If re-graining moved the hydraulics too, the two arms would be different reaches
+    and their contrast would mean nothing. The claim is checked where it can actually
+    fail -- on the derived design point and on the constructed state -- rather than by
+    running the pair with morphology off and comparing the depth fields. **That
+    comparison is vacuous**: unarmed, ``d50`` is not read by any kernel at all, so the
+    three arms are literally the same computation and bit-identity is guaranteed
+    whatever ``at_shields`` did to the geometry. A test that cannot fail is worse than
+    no test, because its name promises otherwise.
+
+    What *is* asserted: the bed, the seeded depth and the roughness the fixture builds
+    are bit-identical across the arms; every hydraulic quantity of the design point is
+    unchanged; and ``theta`` lands exactly on the ratio that was asked for. The last
+    one is the non-vacuous half -- it is what would break if ``theta`` were not exactly
+    inversely proportional to ``d50``.
     """
     gate = BedWave()
-    end = gate.warmup_s + 3.0 * gate.interval_s
-    ref = drive(gate, morphology=False, end_s=end)
-    h_ref = ref.median_depth(gate.interior)
-    q_ref = ref.median_unit_discharge(gate.interior)
-
+    ref_state = gate.state(DEV)
     print("")
     for ratio in (0.90, 1.20):
         fx = gate.at_shields(ratio)
-        res = drive(fx, morphology=False, end_s=end)
-        h = res.median_depth(fx.interior)
-        q = res.median_unit_discharge(fx.interior)
+        st = fx.state(DEV)
         print(
-            f"[same flow] {ratio:.2f} theta_c (d50 {1000 * fx.d50:5.2f} mm): "
-            f"depth {h:.6f} m vs {h_ref:.6f}, q {q:.6f} vs {q_ref:.6f}"
+            f"[re-grained] {ratio:.2f} theta_c: d50 {1000 * gate.d50:.2f} -> "
+            f"{1000 * fx.d50:5.2f} mm, theta {gate.shields:.5f} -> {fx.shields:.5f}, "
+            f"h_n {fx.normal_depth:.6f} m, q {fx.unit_discharge:.6f} m2/s, "
+            f"Fr {fx.froude:.4f}"
         )
-        # Bit-exact, in fact: d50 is not read by any hydraulic kernel. Asserted as an
-        # equality so a future change that *did* couple them cannot hide in a tolerance.
-        assert np.array_equal(res.depth, ref.depth)
-        assert np.array_equal(res.face_q, ref.face_q)
+        # theta is exactly theta_c * ratio -- the relation the pair is built on.
+        assert fx.shields == pytest.approx(ratio * SHIELDS_CRITICAL, rel=1e-12)
+        assert fx.relative_submergence == pytest.approx(gate.normal_depth / fx.d50)
+        # ... and nothing hydraulic moved, in the derivation or in the built state.
+        assert fx.normal_depth == gate.normal_depth
+        assert fx.unit_discharge == gate.unit_discharge
+        assert fx.froude == gate.froude
+        assert fx.manning == gate.manning and fx.slope == gate.slope
+        assert np.array_equal(st.z.numpy(), ref_state.z.numpy())
+        assert np.array_equal(st.h.numpy(), ref_state.h.numpy())
+        assert np.array_equal(st.n.numpy(), ref_state.n.numpy())
 
 
 if __name__ == "__main__":

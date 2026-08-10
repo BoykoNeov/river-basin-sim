@@ -328,7 +328,9 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   too; smooth drift of the state-derived `dt` does not). Existing scenarios sit at a
   900 s cadence (0.165 mm), which is why nothing caught it. **So: a frequent sync
   cadence is not the safe direction** — before shortening `output_every` or a slow
-  process's interval, check a quantity that a ripple would break, not the mass gate.
+  process's interval, re-check a quantity a ripple would break and the mass gate
+  would not: the spread of interior depth along a reach that should be uniform, or
+  normal depth against the Manning value `validation/test_channel_flow.py` gates.
   A measured candidate fix (fill each span with `ceil(span/dt)` *equal* steps) is
   recorded but unshipped, because it moves every run's `dt` sequence and with it the
   pre-M5 bitwise-identity invariant. Full tables + controls: `docs/plans/M7-morphology.md` §4.

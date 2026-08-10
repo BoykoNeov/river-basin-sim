@@ -640,8 +640,13 @@ sediment.
    - **The threshold pair is one variable, and that had to be checked.** `θ ∝ 1/d50`
      exactly (the shear carries no grain size) and `d50` enters no hydraulic kernel,
      so `BedWave.at_shields` re-grains the *same* reach: 42.86 mm for 0.9 θ_c, 32.15 mm
-     for 1.2 θ_c. Verified rather than argued — all three arms produce **bit-identical**
-     depth and face-discharge fields. Under threshold: **0 cells moved**, `dz_cum`
+     for 1.2 θ_c. Verified where it can fail — the bed, seeded depth and roughness the
+     arms build are bit-identical, every hydraulic quantity of the design point is
+     unchanged, and θ lands exactly on the ratio asked for. The first draft checked it
+     by running the arms with morphology *off* and comparing depth fields, which is
+     **vacuous**: unarmed, `d50` is read by no kernel at all, so the arms are the same
+     computation and bit-identity holds whatever `at_shields` did to the geometry.
+     Under threshold: **0 cells moved**, `dz_cum`
      bit-exact zero, with the achieved θ peaking at 0.921 θ_c at the bump crest, which
      is locally shallower (the bump is deliberately kept in both arms; flattening one
      would stop the pair being the same geometry). Over threshold: 238 of 240 cells,
