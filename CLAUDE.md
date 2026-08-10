@@ -352,6 +352,33 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   uncompensated, so rain-free scenarios stay bitwise). Diagnosis discipline still
   applies: check storm depth, cell count and step count before suspecting the scheme.
   See `docs/plans/precision-sources.md`.
+- **A scenario table that is absent is not a feature that is off — check what the
+  loader falls back to.** `[rainfall]` used to resolve missing keys against
+  `Scenario()`'s *demo* defaults, so a scenario file that never mentioned rain silently
+  got **50 mm/hr for 1800 s** — 25 mm over the whole domain, 1.47e8 m³ on the M6/M7
+  mosaic. It cost a 4-minute run and a wrong diagnosis on M7's demo: with the phantom
+  storm, `bed_moved` read **1.46e11 m³** and the bed Courant 1.7e9, because a millimetric
+  rain sheet is exactly where MPM diverges. **Fixed** — an absent `[rainfall]` now means
+  no rain, while declaring the table (even empty) still opts into its defaults, the
+  "presence arms it" idiom `[sediment]` and `[channels]` already use; the no-config demo
+  path is untouched. Every shipped scenario declared the table already, so nothing moved
+  — `reservoir_release` had `rate_mm_hr = 0.0` written out, which is a previous author
+  hitting this and working around it. When adding a table, decide explicitly what its
+  absence means and test it.
+- **A point source is a splitting artefact with a scale, the same way a slow process
+  is.** `[[inflow]]` hands its whole discharge to *one* cell: 90 m³/s into a 100 m cell
+  digs its own crater, and on M7's demo that one patch carried **83% of the run's gross
+  bed change** (0.28 m of scour against a 9.3 mm reach signal). Split a hydrograph across
+  several consecutive channel cells — `reach_alluvial` uses four, and the head patch then
+  contributes 0.0%. Related and worth checking once per scenario: **an inflow `cell` is in
+  assembled-domain (pre-coarsen) coordinates and nothing checks it is in the river.**
+  `reach_basin` injects at `[4, 768]`, which is floodplain two cells off the meander —
+  invisible there because rain wets the channel anyway and nothing measured the bed.
+- **Two solver runs sharing an output directory race on `status.json`.** The writer
+  retries `PermissionError` (the Windows viewer case) but a *concurrent solver* deletes
+  the tmp file, and the second run dies mid-simulation with `FileNotFoundError` on
+  `os.replace` — measured, a 24 h run lost at t=18000 s. Give every concurrent run its
+  own `--out`/`--status`/`--frames-dir`.
 - **Every scenario writes to the same default output, and the frames export never
   purges it.** `[meta] name` does not pick the output path — `reach_basin` and
   `demo_basin_rain` both land in `data/results/demo.zarr` + `frames/`. Run them back to

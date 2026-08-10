@@ -451,11 +451,23 @@ def run_simulation(
         # unconditionally* (unlike the `bed courant` line above, which is verbose-only)
         # because this is the one failure mode with no other symptom: the run finishes,
         # the mass balance is clean, and the bed is wrong (M7 build step 8).
+        # The remedy deliberately does NOT read "shorten interval_s", which is what it
+        # said until build step 9. Shortening it is a trade, not a fix: every activation
+        # is a scheduler sync point, and clamping the fast step onto more of them
+        # degrades local-inertial into a short-wavelength depth ripple (0.165 mm at a
+        # 900 s cadence, 74 mm at 22.5 s -- M7 plan §4) that no gate can see, because
+        # mass is conserved and only the water's *position* is wrong. Morphology then
+        # rectifies that ripple into a permanent bed signature instead of averaging it
+        # out. So the warning names both bounds and lets the reader pick.
         print(
             f"  WARNING: morphological Courant {morphology.peak_courant:.2f} exceeds "
             f"{MORPH_COURANT_GATE:.0f} -- the bed wave crosses more than a cell per "
-            f"activation, so the bed change is a splitting artefact. Shorten "
-            f"[sediment] interval_s (it is {scenario.sediment_interval_s:g} s)."
+            f"activation, so the bed change is a splitting artefact. [sediment] "
+            f"interval_s is {scenario.sediment_interval_s:g} s; note that shortening it "
+            f"trades this artefact for the sync-clamp one (M7 plan §4), so check the "
+            f"bed against a longer interval rather than assuming shorter is safer. "
+            f"The peak is a field maximum, so a single cell at the wet/dry guard can "
+            f"set it -- check where the bed change actually is before acting."
         )
     return ledger
 
