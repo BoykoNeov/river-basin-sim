@@ -464,7 +464,7 @@ def run_simulation(
             f"{MORPH_COURANT_GATE:.0f} -- the bed wave crosses more than a cell per "
             f"activation, so the bed change is a splitting artefact. [sediment] "
             f"interval_s is {scenario.sediment_interval_s:g} s; note that shortening it "
-            f"trades this artefact for the sync-clamp one (M7 plan §4), so check the "
+            f"trades this artefact for the sync-clamp one (M7 plan sec. 4), so check the "
             f"bed against a longer interval rather than assuming shorter is safer. "
             f"The peak is a field maximum, so a single cell at the wet/dry guard can "
             f"set it -- check where the bed change actually is before acting."

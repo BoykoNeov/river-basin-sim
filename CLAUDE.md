@@ -15,6 +15,37 @@ A faithful research/education sandbox validated against benchmarks — **not a
 regulatory-certification tool**. State that honestly anywhere it matters.
 
 ## Status
+- **M7 — Morphology: done (signed off on GPU + CPU, 2026-08-10).** The bed moves.
+  Meyer-Peter-Mueller transport **at capacity** plus Exner on the **slow clock**
+  (`solver/core/sediment.py` kernels + `solver/processes/morphology.py`, armed by a
+  `[sediment]` table), **local-inertial only and loudly so** — the config refuses
+  `hllc_fv` + sediment. Four things set its shape. **`dz_cum` is float64** because a
+  millimetre of bed on a float32 `z` at 500 m is below the ULP, so the change
+  accumulates separately and `z` is *rebuilt* `z = z0 + dz` at each activation rather
+  than incremented. **Transport integrates over the interval, the bed moves once at the
+  activation** — and the face integral is Kahan-compensated through `sources.py`, which
+  is exactly why the precision pass landed first. **A channel face transports as a
+  channel**: its own flow depth and hydraulic radius `A/P`, recombined by `w/dx`, since
+  reading a sub-grid river off the cell mean is a factor-of-`dx/w` error (~15× here).
+  **The section is frozen** — Exner moves `z`, the invert `z − d` translates with it,
+  so an aggrading channel rises bodily instead of filling in. Sediment gets **its own
+  ledger** (`SEDIMENT_GATE = 1e-11`), and it is sharper than the water's: solid volume
+  is closed to the domain (bedload cannot cross a boundary face), so the net is
+  *structurally* zero and the scale is the **gross** displaced volume. **Validated:**
+  a bed wave migrates at **0.993 c_b** by cross-correlation (±20% gate, 7% spread across
+  a 32× range of intervals); a threshold pair re-grained on one reach moves **0 cells**
+  bit-exactly at 0.9 θ_c and 238 of 240 at 1.2 θ_c; deposition cannot dry a cell directly
+  (the ordinary momentum update does it, 58 steps later). Demo
+  `scenarios/reach_alluvial.toml` — the M6 basin flood-driven instead of storm-driven —
+  moves **167 043 m³** of bed with peak scour/fill **−228/+257 mm**, mass **9.22e-8 CPU /
+  5.53e-8 CUDA**, sediment **5.5e-17 / 4.1e-17**, the two backends agreeing to 1.05e-4 in
+  volume and 0.990 mm in the field. **333 → 336 tests green.** **Two carried findings,
+  both loud:** the scheduler's sync-point `Δt` clamp degrades LI with *no gate able to
+  see it* (see the gotcha below — this is the next piece of work), and the morphological
+  Courant diagnostic overstates the splitting error by more than an order of magnitude
+  on a reach with a wetting front (peak 46 425 set by one cell of 1414; 19.4 even
+  in-range; yet halving `interval_s` moves the bed 0.9%). See
+  `docs/plans/M7-morphology.md`.
 - **M6 — Reach: done (signed off on GPU + Godot, 2026-08-09).** Reach is bought by **choosing the
   resolution** and putting the lost river back, not by nesting grids. Three pieces:
   **`solver/io/mosaic.py`** makes the domain the whole **tile mosaic** (`[grid] tiles`
@@ -245,6 +276,13 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   open boundary, self-contained) and `scenarios/spatial_fields.toml` (Manning +
   infiltration `.r32` fields — generate them first with
   `uv run python scripts/make_demo_fields.py`).
+- M7 scenario: `scenarios/reach_alluvial.toml` — the same 6x6 mosaic as the M6 demo and
+  the same channel fields (so run `scripts/make_reach_demo.py` first), but **flood-driven
+  with no rain** and `[sediment]` armed. The no-rain part is the design, not a
+  preference: MPM is a channel bedload law and a millimetric rain-on-grid sheet
+  transports furiously in a regime shallower than one grain. 24 h at 100 m cells takes
+  ~10 min on CPU and ~3 min on the 5090. Pass `--out` / `--frames-dir` / `--status` —
+  and give **concurrent** runs separate directories, or they race on `status.json`.
 - M6 scenario: `scenarios/reach_basin.toml` — a 6x6 tile mosaic (1536^2 @ 50 m = 76.8 km
   square) run at `coarsen = 2` (768^2 @ 100 m) with the river carried by sub-grid
   channels. Generate its synthetic basin + channel fields first with

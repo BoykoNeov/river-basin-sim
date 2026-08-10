@@ -676,6 +676,116 @@ sediment.
    **333 tests green.**
 9. **Demo** — `scenarios/reach_alluvial.toml`, GPU sign-off, HANDOFF + CLAUDE.md
    + roadmap updates.
+   **Done** — the demo is the M6 basin (6×6 mosaic, 768² @ 100 m, sub-grid channels)
+   driven by a flood instead of a storm, with `[sediment]` armed. Five things this
+   step found, three of which are about *scenario authoring* rather than morphology,
+   and the first of which invalidated the first run outright:
+
+   - **An absent `[rainfall]` table was raining 50 mm/hr.** The loader resolved missing
+     keys against `Scenario()`'s in-code demo defaults, so "no rain" by omission meant
+     25 mm over the whole domain — **1.47e8 m³** on this mosaic — landing as exactly the
+     millimetric sheet §4 says MPM diverges in. The first demo run therefore reported
+     `bed_moved = 1.46e11 m³`, a bed Courant of 1.7e9 and `h_max` 42.9 m from a ≤90 m³/s
+     inflow, with the water-only control at 0.816 m. **Fixed** in `solver/io/config.py`
+     (an absent table means no rain; declaring it, even empty, still opts into its
+     defaults — the "presence arms it" idiom `[sediment]` and `[channels]` already use;
+     the no-config path keeps M1's forcing). Every shipped scenario declared the table
+     already, so nothing else moved. With rain off, the same run: **4078 m³**.
+   - **A point source digs its own crater, and it dominated the volume.** The whole
+     hydrograph into one 100 m cell scoured 0.28 m in 3 h while the reach signal was
+     9.3 mm — **83% of the run's gross bed change in one patch**. This is M5's
+     `outlet`-box lesson on `[[inflow]]`. The demo splits Q across four consecutive
+     channel cells and the head patch then contributes **0.0%**. While fixing it:
+     `reach_basin`'s inflow `[4, 768]` is *floodplain*, two cells off the meander —
+     harmless there (rain wets the channel) and invisible because nothing measured
+     the bed, but nothing checks it either.
+   - **The regime claim is a distribution, not a number, and the boundary is not part
+     of it.** A shipped scenario starts dry and advances a wetting front, so some cell
+     is always at the guard; a *minimum* relative submergence over moved cells could
+     only ever fail. What the demo claims is volume-weighted, and it must be read on
+     the **channel column depth** `h·dx/w`, not the cell mean — the cell mean calls a
+     1.6 m river a 0.11 m sheet. Gated by
+     `test_an_inflow_driven_channel_keeps_its_transport_where_the_law_lives`, a *pair*
+     on one geometry: inflow-only reads **100.0%** of the interior volume in regime,
+     and adding `reach_basin`'s 15 mm/hr storm collapses it to 35.1% while transporting
+     1.49e9 m³ with a 27 km peak. The pair is the argument — the first arm alone passes
+     by construction on any well-drawn reach.
+   - **The out-of-regime volume in that fixture was the open outlet, not the front.**
+     81% of its gross change sat in the last two rows, and the boundary cell itself was
+     dry at the end while carrying 20 mm — §4's predicted sill, measured. Nothing in
+     `[sediment]` can pin a cell *down*, so the sanctioned remedy is option (b): quote
+     nothing from the boundary row and say so. The gate excludes it and reports it
+     separately rather than dropping it silently.
+   - **The Courant warning stopped recommending the thing that hurts.** Its remedy read
+     "Shorten `[sediment] interval_s`" — which §4 measures as the direct route to the
+     sync-clamp artefact, that being an artefact morphology *rectifies* into permanent
+     bed. Reworded to name both bounds and to say the peak is a field maximum a single
+     wet/dry cell can set. **Text only**: the computation is untouched, so the
+     Courant-3.30 fixture still asserts exactly what it asserted at step 8. Making the
+     diagnostic itself regime-aware was considered and refused here for the same reason
+     step 8 refused a depth guard — it would silently move what that fixture asserts
+     without failing it — and belongs in its own commit if it is wanted.
+
+   **The sign-off run.** `scenarios/reach_alluvial.toml`: the 6×6 mosaic at
+   `coarsen = 2` (768² @ 100 m, 2232 channel cells), 24 h, a flood rising to 90 m³/s
+   over three hours and holding six, `d50 = 8 mm`, `interval_s = 900 s`. The grain size
+   is derived rather than picked — at the design discharge the channel carries
+   `q ≈ 3 m²/s` at normal depth ≈ 1.66 m, so `θ ≈ 0.001585/d50`, and 8 mm lands at
+   `θ ≈ 0.198` = **4.2 θ_c**, the same grain the celerity fixture uses. Coarser than
+   ~34 mm and nothing moves at all.
+
+   | | CPU | CUDA (5090) |
+   |---|---|---|
+   | water mass, max rel | **9.22e-8** | **5.53e-8** |
+   | sediment balance, max rel | **5.53e-17** | **4.09e-17** |
+   | gross bed moved | 167 043.5 m³ | 167 026.0 m³ |
+   | peak scour / fill | −227.7 / +256.7 mm | −227.7 / +256.7 mm |
+
+   Cross-backend: gross volume within **1.05e-4**, bed-change field max difference
+   **0.990 mm** (rms 0.0031 mm), correlation 0.9999987, depth within 0.043 mm. The
+   flood travels **~50 km** of the 76.8 km basin (front at row ~497 of 767) and
+   **does not reach the south edge** — 0 of 768 edge cells wet — so this run carries
+   **no outlet sill**, and that is because the water never arrived, not because the
+   sill will not appear. A longer run will grow one. Net bed change is exactly zero,
+   which is structural: bedload cannot cross a boundary face. 721 cells scoured, 530
+   filled, 0.21% of the reach moving more than 1 mm. Against a sediment-unarmed
+   control of the same scenario, channel depths differ by **1.96% of mean depth** at
+   most (mean −0.02 mm) — the morphology feeds back on the water, mildly.
+   Regime: **87.9%** of the gross volume sits at `h_col/d50 ≥ 35`, volume-weighted
+   median **142**, and 87.9% of it is on channel cells. The extremes are mid-reach
+   channel cells at `h_col/d50` = 118–270, not the inflow (whose patch is 0.0%).
+
+   **`interval_s = 900` is decided, and the Courant number is not what decided it.**
+   §5.2 asked the demo to check the default against the morphological CFL. It fails
+   that check and is right anyway, which is the most useful thing this step measured:
+
+   - The **raw** peak Courant is 46 425, set by a *single* wetting-front cell — of
+     1414 cells with nonzero celerity, exactly **one** sits below `h_col/d50 = 10`.
+   - The peak over cells the law applies to is still **19.4** (≥ 35) and steadily 8–16
+     across the run, so the splitting is coarse even where the transport is real.
+     Reaching Courant < 1 needs ~45 s, which §4 measures at a 14 mm depth ripple —
+     the interval cannot be fixed without breaking the water.
+   - **So the bed was asked directly.** The same 24 h at `interval_s = 450`: gross
+     volume 165 611.8 m³ (**0.9%** different), scour −228.0 mm and fill +257.6 mm
+     (~1 mm different), correlation over moved cells 0.9945 and **0.9992 on channel
+     cells** at 4.1% relative rms; depths within 6.1 mm. Halving the interval does not
+     change the answer.
+
+   The morphological Courant number therefore **overstates the splitting error by more
+   than an order of magnitude here** — 19.4 in-regime, against a bed that moves 0.9% in
+   volume when the interval is halved. It is a floor on what can be trusted in *both*
+   directions: §4 already recorded that it reads 0.00 through a flood that moved 577 m³,
+   and this adds that a large reading is not by itself evidence the bed is wrong. Keep
+   the warning (nothing else catches a genuinely unresolved bed wave, and the Courant-3.30
+   fixture shows the celerity gate sails through one), and check the bed against a longer
+   interval rather than trusting the number.
+
+   The comparison's own confound is named rather than hidden: halving `interval_s`
+   halves the sync cadence too, so part of the 0.9% is the clamp artefact and not the
+   splitting. §4 bounds that at ~0.165 mm (900 s) to ~9.8 mm (300 s) of *depth* ripple
+   against a bed signal of hundreds of millimetres, so it cannot account for the
+   agreement, but it does mean the residual is an upper bound on the splitting error,
+   not a measurement of it.
 
 ---
 
@@ -845,3 +955,23 @@ sediment.
    transport) will land far under 1; the demo at step 9 decides it.
 3. **Viewer** — confirmed deferred (§1.7), or is a static final-bed toggle wanted
    inside M7?
+
+**All three resolved at build step 9 (2026-08-10).**
+
+1. **A new `scenarios/reach_alluvial.toml`**, as recommended — the M6 basin and its
+   channel fields, but flood-driven instead of storm-driven, so `reach_basin` stays a
+   clean mosaic/channel regression. Dropping the rain turned out to be forced rather
+   than tidy: see step 9.
+2. **`interval_s = 900` stays**, and the prediction in this bullet was wrong. Reach-scale
+   numbers did *not* land far under 1 — the demo runs at a raw peak of 46 425 and still
+   **19.4** over cells inside the law's range. The default survives because the bed was
+   asked directly instead: halving the interval changes gross bed volume by 0.9% and the
+   channel-cell field by 4.1% rms (correlation 0.9992). The lesson is about the
+   diagnostic, not the default — the morphological Courant number overstates the
+   splitting error by more than an order of magnitude on this scenario, and a reach with
+   a wetting front will always have a cell that sets an alarming peak.
+3. **Viewer deferral confirmed**, as §1.7 has it: `bed_change` travels in the store and
+   the frames export is unchanged (49 frames × 4 tiles + the `static` bed = 200 files,
+   manifest coherent, `morphology` series recorded). No viewer leg was run, the same
+   deliberate scope call M5's sign-off made. The static final-bed toggle stays unbuilt,
+   as does the sub-grid channel storage curve in the shader (carried from M6).
