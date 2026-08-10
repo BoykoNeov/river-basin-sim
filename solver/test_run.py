@@ -263,6 +263,15 @@ def test_a_sediment_scenario_runs_and_records_what_its_slow_clock_did(tmp_path):
     Rain over a bowl, so there is real flow to transport with, and the water mass
     gate must stay green **with the bed moving** -- "the bed update quietly ate
     water" is precisely the failure this milestone can produce.
+
+    **What transports here is the thin sheet at the wet/dry guard, and that regime is
+    on notice.** MPM's shear diverges as ``h -> H_DRY``, so this bowl scours 5.6 cm in
+    its first 150 s activation and almost nothing afterwards (M7 plan §4, measured at
+    build step 6). Nothing below depends on the *size* of that -- only that the bed
+    moved at all, so the plumbing is exercised -- but if step 8 gives the law a depth
+    guard, this scenario stops transporting and the two "something moved" assertions
+    fail here rather than where the law changed. Re-home it to channel flow then; do
+    not weaken the assertions.
     """
     scn = Scenario(
         dx=20.0,

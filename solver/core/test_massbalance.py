@@ -276,15 +276,16 @@ def test_the_boundary_faces_carry_no_bedload():
     would otherwise silently start blaming the arithmetic.
     """
     st, morph = _sloping_reach()
-    _drive_bed(st, morph)
+    sed = _drive_bed(st, morph)
 
     qs_x = st.sediment.qs_int_x.numpy()
     qs_y = st.sediment.qs_int_y.numpy()
     assert (qs_x[:, 0] == 0.0).all() and (qs_x[:, -1] == 0.0).all()
     assert (qs_y[0, :] == 0.0).all() and (qs_y[-1, :] == 0.0).all()
-    # ...and the interior really was carrying something, or the assertion is vacuous.
-    # `advance` zeroes the integral, so read the compensation debt it deliberately keeps.
-    assert np.abs(st.sediment.qs_comp_x.numpy()[:, 1:-1]).max() > 0.0
+    # ...and the interior really was carrying something, or the assertion above is
+    # vacuous. `advance` zeroes the integral, so the durable evidence is the bed it
+    # moved -- not the leftover Kahan debt, which is an arithmetic accident.
+    assert sed.series[-1].gross_volume > 0.0
 
 
 def test_a_bound_supplies_the_domain_and_the_ledger_says_how_much():
