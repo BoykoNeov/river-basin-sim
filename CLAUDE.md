@@ -15,6 +15,40 @@ A faithful research/education sandbox validated against benchmarks — **not a
 regulatory-certification tool**. State that honestly anywhere it matters.
 
 ## Status
+- **Viewer channel surface: done (2026-08-17).** The last carried item in the repo, and
+  **the fix it specified was not renderable** — which is most of what the pass produced.
+  The shader lifted every cell as `bed + depth` (M1's relation), so on the M6 demo the
+  drawn surface stood up to **2.74 m** above a wet channel cell and *arched up over the
+  valley*: the river was rendered as a **ridge** about a metre proud of its own
+  floodplain, wrong in the sign of curvature where a viewer looks for the river.
+  `viewer-terrain-mosaic.md` §4 said to ship `w`/`d` and evaluate the storage curve —
+  **and evaluating it hides the river inside the ground.** Below bank full the true
+  surface `z − d + h·dx/w` is *under* the floodplain bed, up to **2.46 m** under it on
+  **1030 of 2232** channel cells, and the rendered terrain has no trench because a
+  channel is **sub-grid** (7–45 m inside a 100 m cell; a per-cell height map cannot hold
+  a feature narrower than a cell). **Carving one was measured and rejected**: the groove
+  is a whole cell wide, up to **14.7×** wider than the river; it is below what the water
+  mesh can resolve (512 segments over 768 cells) so it renders as spikes and cracks; and
+  the terrain would stop being the exported bed, which is the invariant the mosaic pass
+  bought and `--rbverify` asserts. What shipped is `viewer_export.render_eta`, the
+  **renderable projection**: `z + h` with no channel (bit for bit), the **exact** curve
+  `z + (h − h_bf)` overbank — where the old lift was wrong by `h_bf`, up to **1.39 m** —
+  and the **bank** `z` below bank full, never above the terrain and never buried under
+  it. Continuous at bank full, monotone, and **one-sided**, so one number bounds the
+  residual: the export measures it over **every** frame (the worst in-bank cell is a
+  barely-wet one — **3.06 m at frame 1** against 2.46 m at frame 24) and
+  `manifest["static"]["channel"]` declares it, the way `domain` declares gap fill.
+  `channel_width`/`channel_depth` now ride in `manifest["static"]` through the same tile
+  layout as the bed, sampled **nearest** (interpolating a 20 m width against a 0 m
+  neighbour invents a river), with `bank_bias = 0.05 m` as a z-buffer offset, not
+  physics. **368 → 374 tests green**; `--rbverify` gained the only check that can fail
+  here (decoded channel cells must equal the export's count — a failed tile read returns
+  a blank of the *right size*), reading **2232/2232**; the full loop `--rblaunch` is green
+  at **2.30e-08**. **The picture is the gate and `--rbverify` cannot be it** — it never
+  looks at the water surface — so before/after screenshots at a river-level camera:
+  **0.29 %** of pixels changed in the river view, **0.05 %** at basin altitude, tracing
+  the river margins and nothing else. Colour is still cell-mean depth on purpose (the
+  colormap range is defined over it). See `docs/plans/viewer-channel-surface.md`.
 - **Morphological Courant diagnostic: done (2026-08-17).** The last finding carried out
   of M7, and **the finding was wrong twice over** — which is most of what the pass
   produced. The warning fires on `reach_alluvial` at **39 271** (not M7's 46 425; the
@@ -241,9 +275,10 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   padding texel, so it cannot be used for this (its "relief" is the max elevation);
   `reach_basin` re-run on the 5090 at mass **1.60e-07** (unchanged) renders the whole
   76.8 km basin; the M2 demo is unchanged and `--rblaunch` reaches `done` at 2.59e-08.
-  **241 tests green.** Carried: the shader still lifts a sub-grid channel by
-  `bed + depth`, not its storage curve, so the sheet sits up to `d` high on the river.
-  See `docs/plans/viewer-terrain-mosaic.md`.
+  **241 tests green.** ~~Carried: the shader still lifts a sub-grid channel by
+  `bed + depth`, not its storage curve, so the sheet sits up to `d` high on the river.~~
+  **Closed 2026-08-17** — see the channel-surface pass above; the fix this bullet
+  prescribed was not renderable. See `docs/plans/viewer-terrain-mosaic.md`.
 - **M5 — Multi-physics: done.** The locked time-integration
   decision (HANDOFF §2/§8) is now real code. **`solver/scheduler.py`** owns the single
   simulated clock and *only* that: the fast scheme still computes its own state-derived
@@ -637,6 +672,28 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   must travel through the manifest the same way. Verified-water and aligned-with-terrain
   are still separate claims — `--rbverify` now asserts the second one, and it took a
   *screenshot* to catch an empty render that the headless check called OK.
+- **A sub-grid quantity can be shipped through the manifest, but it cannot be *rendered*
+  on a height field coarser than the feature. (2026-08-17.)** The water shader lifted
+  every cell as `bed + depth`, which over a sub-grid channel drew the river as a **ridge**
+  up to **2.74 m** proud of its own valley — wrong in the sign of curvature, and invisible
+  from the default camera, which is why M6 and M7 both shipped over it. The carried fix
+  was "ship `w`/`d` and evaluate the storage curve", **and that makes it worse**: below
+  bank full the true surface is *under* the floodplain bed (up to **2.46 m**, on 1030 of
+  2232 cells here), and the terrain has no trench to hold it because the channel is
+  narrower than a cell. Carving the trench costs a groove up to **14.7×** too wide, below
+  the water mesh's resolution, and the "terrain *is* the exported bed" invariant. So
+  `viewer_export.render_eta` takes the **exact** curve overbank and draws the **bank**
+  below it, and the residual is measured per run and declared in the manifest
+  (`static.channel.in_bank_offset_m`). **Three things to carry:** measure the *proposed*
+  rendering against the terrain it will be drawn on before calling a formula the fix —
+  the curve was right and unrenderable; take such a measurement over **all** frames, not
+  the last, because the worst in-bank cell is a barely-wet one (3.06 m at frame 1 vs
+  2.46 m at frame 24); and **`--rbverify` cannot gate a picture** (it never looks at the
+  water surface), so gate what it *can* — decoded channel cells against the export's own
+  count, since a failed tile read returns a blank of the right size — and look at a
+  screenshot for the rest. Related: the colormap range is defined over cell-mean depth,
+  so recolouring a river by its column depth without re-deriving that range saturates
+  every river cell. See `docs/plans/viewer-channel-surface.md`.
 - **A sub-grid channel conveys only where it is continuous.** `w_face = min(w_L, w_R)`, so
   a channel band that steps sideways faster than it is wide has a wall across it and
   nothing in the depth field says so. Check connectivity when authoring channel geometry

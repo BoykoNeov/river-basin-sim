@@ -111,14 +111,29 @@ the headless check passed on the frame that rendered nothing.
   byte for byte, tiles with the frame layout, and the manifest carries the assembly
   record.
 
-## 4. Carried limitation
+## 4. Carried limitation — **closed 2026-08-17, and this section was wrong**
 
 **The channel surface is still the floodplain approximation.** The shader lifts water
 to `η = bed + depth`, which is M1's storage relation. With M6 sub-grid channels a
 channel cell's true surface below bank full is `η = z − d + h·dx/w`
 (`solver/core/channels.py`), so the rendered sheet sits up to the channel depth `d`
 high along the river. Terrain and water now register; the *channel* does not yet
-render its own storage curve. Fixing it means exporting `channel_width`/`channel_depth`
-(already in the store, §7.2) alongside the bed and evaluating the same curve in the
-shader — a small job, but a rendering claim, not a hydraulics one, and out of scope
-here.
+render its own storage curve.
+
+That much held — measured on this very demo, the drawn surface was up to **2.74 m** high
+over a wet channel cell, and it arched *up* over the valley, drawing the river as a ridge.
+What did not hold is the fix this section then prescribed: *"exporting
+`channel_width`/`channel_depth` alongside the bed and evaluating the same curve in the
+shader — a small job"*. **Evaluating the whole curve hides the river inside the ground.**
+Below bank full the true surface is *under* the floodplain bed — up to **2.46 m** under
+it, on **1030 of 2232** channel cells here — and the rendered terrain has no trench to
+put it in, because the channel is sub-grid and a per-cell height map cannot hold a
+feature narrower than a cell. Carving one is a whole-cell groove up to **14.7×** too
+wide, below the water mesh's resolution, and it costs the "terrain *is* the exported bed"
+invariant this pass bought.
+
+What shipped instead: the fields do travel through `manifest["static"]`, and the shader
+takes the exact curve **overbank** (where the old lift was wrong by `h_bf`, up to 1.39 m)
+and draws the **bank** below it — never above the terrain, never buried under it, with
+the one-sided residual measured per run and declared in the manifest. See
+`viewer-channel-surface.md`.

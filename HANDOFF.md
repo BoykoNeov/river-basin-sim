@@ -364,7 +364,9 @@ no tile on disk is the surface the run stepped on — only the store's `bed` is,
 shipping it makes the water register with the terrain by construction rather than by
 the viewer re-deriving the mosaic. `manifest["domain"]` carries the assembly record
 (origin, tiles used, gap cells, fill value) beside it: uncovered cells are filled flat,
-and a picture must be able to say so.
+and a picture must be able to say so. **`channel_width`/`channel_depth` travel the same
+way** when the run had sub-grid channels (§7.2): without them a viewer cannot tell a
+river cell from a floodplain cell, and has to draw both the same way.
 
 **`manifest.json` is the only authoritative record of which files belong to a run.**
 Frame tiles are named by field and index, every scenario writes to the same default
@@ -374,15 +376,27 @@ size. Never reconstruct a frame filename by index and never read a directory lis
 as "the last run's output"; read the manifest. The reader's tile-size check is a
 backstop that yields a hole, not an error.
 
-**Known gap.** The static section ships `bed` but not the sub-grid channel geometry the
-canonical store carries (§7.2). A viewer therefore cannot reconstruct the storage curve
-and must lift water as `bed + depth`, which draws the surface over a channel cell up to
-`d` too high. Closing it means shipping `w`/`d` through the same static mechanism —
-anything else the composite depends on travels the same way, or it does not register.
+**How a channel's surface is drawn** (was a *Known gap*; closed 2026-08-17). The lift is
+`viewer_export.render_eta`, the renderable projection of the M6 storage curve: `z + h`
+with no channel, the exact `z + (h − h_bf)` **overbank**, and the **bank** `z` below bank
+full. Only that last branch departs from the physics, and it must: the true in-bank
+surface `z − d + h·dx/w` is *under* the floodplain bed (up to 2.46 m under it on the M6
+demo, on 1030 of 2232 channel cells), and the rendered terrain has no trench to hold it
+because a channel is narrower than a cell. Drawing it there hides the river inside the
+ground; the old `bed + depth` drew it as a ridge up to 2.74 m proud of its own valley.
+The residual is therefore **one-sided and measured per run** —
+`manifest["static"]["channel"]["in_bank_offset_m"]`, over every frame, because the worst
+in-bank cell is a barely-wet one. **The general rule this is an instance of:** a
+sub-grid quantity can be shipped through the manifest, but it cannot be *rendered* on a
+grid whose height field is coarser than the feature — so state which of the two the
+picture is doing. See `docs/plans/viewer-channel-surface.md`.
 
 **Known gap (morphology).** The static bed is the run's bed at `t = 0`, and a run with
-`[sediment]` moves it. `bed_change` is deliberately *not* exported as frame tiles: the
-lift debt above would move with an animated bed, so fix the lift first, then animate.
+`[sediment]` moves it. `bed_change` is deliberately *not* exported as frame tiles:
+animating terrain means re-fitting the height map, the water plane, `bed_tex` and the
+registration check every frame, which is a viewer milestone of its own. (The lift debt
+that used to be the second reason is closed above; the curve's other input survives
+morphology, because M7 freezes the section so `z − d` translates with `z`.)
 Until then a store that morphed carries `manifest["morphology"]` — the final change's
 extremes and the frame they belong to — and the viewer prints it, for the same reason
 `domain` declares gap fill: a picture must be able to say what it is not. The figure,

@@ -29,8 +29,22 @@ Detailed per-milestone plans live alongside this file as `M<n>-*.md`.
    bed now ships with the frames (`manifest["static"]`) and *is* the terrain, so extent,
    origin and cell size agree by construction; `--rbverify` gates that registration by
    sampling the imported surface against the exported bed.
-   Remaining: the shader still lifts water as `bed + depth`, so a sub-grid channel's
-   surface is drawn up to `d` high. See `viewer-terrain-mosaic.md`.
+   ~~Remaining: the shader still lifts water as `bed + depth`, so a sub-grid channel's
+   surface is drawn up to `d` high.~~ **Done 2026-08-17** — and the fix that item
+   specified was not renderable, which is the durable half. `manifest["static"]` now
+   ships `channel_width`/`channel_depth`, and `viewer_export.render_eta` takes the
+   **exact** curve overbank (the old lift was wrong by `h_bf` there, up to 1.39 m) and
+   draws the **bank** below bank full. Evaluating the whole curve, as that item asked,
+   would have put the surface *under* the rendered terrain — up to **2.46 m** under it on
+   **1030 of 2232** channel cells — because the trench is sub-grid and a per-cell height
+   map cannot hold it; carving one is a whole-cell groove up to **14.7×** too wide and
+   costs the "terrain is the exported bed" invariant. The old render drew the river as a
+   **ridge** up to **2.74 m** proud of its own valley; the residual now is one-sided,
+   measured per run over every frame, and declared
+   (`static.channel.in_bank_offset_m` — **3.06 m** worst on the demo, ~0.3 m near bank
+   full). **368 → 374 tests green**, `--rbverify` counts the decoded channel cells
+   (2232/2232), and the full loop is green at 2.30e-08. See `viewer-channel-surface.md`
+   and `viewer-terrain-mosaic.md` §4.
 
 **Carried out of M7.** Two, both measured and both deliberately unshipped.
 
