@@ -45,7 +45,21 @@ Detailed per-milestone plans live alongside this file as `M<n>-*.md`.
    `solver/test_scheduler.py`); determinism is untouched. One consequence worth
    knowing: the shipped 900 s cadence was never clean either, only 20× less dirty.
    See `scheduler-equal-steps.md`.
-2. **The morphological Courant diagnostic overstates the error, and cannot be filtered
+2. **Point sources are uncompensated, and on a flood-driven scenario that is the whole
+   residual.** Found by the scheduler pass (2026-08-17), which moved `reach_alluvial`'s
+   mass error from 5.53e-08 to 4.79e-07 — 2.1× under the gate. A/B'd with only
+   `scheduler.py` swapped, and **systematic, not a draw**: across two further Δt
+   partitions the old code holds 5.5–6.9e-08 and the new one 4.8–6.2e-07. In absolute
+   terms it is **−2.1 m³ in 4.45 million** (3.6e-10 m per cell), and `outflow_cum` is
+   exactly 0.0 all run, so the residual is entirely float32 stored volume against the
+   float64 inflow ledger. The likely seat is the four `[[inflow]]` cells, whose
+   `Q·dt/A` add is float32 and deliberately uncompensated: `precision-sources.md` §2
+   scoped point sources out because inflow was **~1.3 % of the residual** — but that
+   was measured on a *rain-driven* scenario, and does not transfer to a flood-driven
+   one where inflow is the only source. Fix is `sources.py`'s Kahan idiom at a second
+   call site; it needs its own before/after across every inflow-bearing scenario, so
+   it is its own commit. See `scheduler-equal-steps.md` §8.5.
+3. **The morphological Courant diagnostic overstates the error, and cannot be filtered
    without moving a load-bearing gate.** On the M7 demo it peaks at 46 425 (one wetting-
    front cell of 1414) and still reads 19.4 over in-range cells, while halving the
    interval changes the bed by 0.9%. Making it regime-aware would silently change what

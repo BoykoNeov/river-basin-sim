@@ -78,7 +78,7 @@ import numpy as np
 import pytest
 
 from solver.core.local_inertial import compute_dt, step
-from solver.core.massbalance import MassLedger
+from solver.core.massbalance import MASS_GATE, MassLedger
 from solver.processes.inflow import InflowInjector
 from solver.scheduler import MultiRateScheduler
 from validation.bedwave import DT_MAX, BedWave
@@ -97,9 +97,10 @@ at 29-44 %; equal steps produce at most one small re-quantization per span and t
 mean is ~1e-6. See :meth:`Ripple.mean_dt_jump` for why the mean and not the max.
 """
 
-MASS_GATE = 1e-6
-"""HANDOFF §8's gate. Asserted, and **explicitly not the point** -- it reads 1e-8 on
-both sides of this defect, which is exactly why the defect survived four milestones."""
+# `MASS_GATE` is imported from solver.core.massbalance rather than restated here, so
+# it cannot drift from the project's. It is asserted below and is **explicitly not the
+# point**: it reads 1e-8 on both sides of this defect, which is exactly why the defect
+# survived four milestones.
 
 END_S = 2400.0
 """1200 s of water-only warm-up (the fixture reaches normal depth by ~1000 s) plus

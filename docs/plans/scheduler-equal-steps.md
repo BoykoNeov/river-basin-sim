@@ -475,11 +475,15 @@ without a device, it is repeated.
 | `river_reach_hllc` (M4) | 1.31e-07 (CUDA) | *not measured* | 1.51e-07 |
 | `reservoir_release` (M5) | 1.36e-07 / 3.15e-07 | **1.30e-07** | **2.38e-07** |
 | `reach_basin` (M6) | 7.21e-08 / 1.60e-07 | **6.07e-08** | **5.95e-08** |
-| `reach_alluvial` (M7) | 9.22e-08 / 5.53e-08 | see §8.5 | **4.79e-07** |
+| `reach_alluvial` (M7) | 9.22e-08 / 5.53e-08 | **5.45e-07** | **4.79e-07** — see §8.5 |
 
-No systematic direction: the three small demos drift up by ~20 %, the two largest
-scenarios improve (`reach_basin` on CUDA by 2.7×), HLLC is flat. All are one to two
-orders inside the 1e-6 gate. **`river_reach_hllc` on CPU was not measured** — no CPU
+No systematic direction, and **§5's prediction was wrong**. It said "the mass gate
+proves nothing here — it reads 1e-8 on both sides." That held for six of the seven
+scenarios (the three small demos drift up by ~20 %, the two largest improve —
+`reach_basin` on CUDA by 2.7× — HLLC is flat, all one to two orders inside the gate)
+and **failed on `reach_alluvial`**, which moved almost an order of magnitude. Writing
+the prediction down in advance is what made that legible instead of invisible; §8.5 is
+what it cost to chase, and it was worth chasing. **`river_reach_hllc` on CPU was not measured** — no CPU
 figure was ever recorded for it, and the run costs over an hour on this machine while
 adding nothing to a comparison that has no "before".
 
@@ -534,22 +538,46 @@ cell**, three orders of magnitude below one float32 ulp at this depth. Physicall
 is nothing, and the *bed* — the thing this demo exists to show — moved by 0.9 %,
 inside the interval-halving sensitivity M7 already documented.
 
-**Leading explanation, stated as a hypothesis because it is not proven.** The four
-`[[inflow]]` cells add `Q·dt/A ≈ 0.03 m` onto a depth of order 1 m, once per cell per
-step, in float32 and **deliberately uncompensated** — `precision-sources.md` §2 put
-point sources out of scope on the grounds that inflow measured ~1.3 % of the residual
-it was fixing. Each such add discards up to half an ulp, ~1.2e-3 m³ at this cell size;
-over four cells and a few thousand steps the *available* drift is several cubic
-metres in either direction. That is the right order for both readings, which reframes
-them: **−0.055 m³ was a lucky near-cancellation, not a property**, and this scenario's
-mass gate has always been a few-cubic-metre coin flip that nobody had cause to look at.
-Equal steps make every step slightly shorter than the scheme's `dt`, so there are
-marginally more adds each rounding marginally worse — a mechanism with the right sign,
-though not one this pass measured directly.
+**Systematic, not a lucky draw — measured, because the two obvious readings of that
+paragraph contradict each other.** "A few cubic metres of round-off" could mean the
+old 5.53e-08 was a fortunate near-cancellation that could have landed anywhere, or it
+could mean the new scheduler structurally costs this scenario ~1.5 m³. Those imply
+different things, so both schedulers were run at two further output cadences chosen
+to be **incommensurate with the 900 s sediment interval**, which genuinely changes the
+sync set and the whole `Δt` sequence:
+
+| `output_every` | old scheduler | new scheduler |
+|---|---|---|
+| 600 s | 6.93e-08 | 7.16e-07 |
+| 1200 s | 6.36e-08 | 6.18e-07 |
+| 1800 s (shipped) | 5.53e-08 | 4.79e-07 |
+
+Three partitions each, and the two clusters do not overlap or approach each other:
+**5.5–6.9e-08 against 4.8–7.2e-07, a consistent ~9×.** It is a property of the change,
+not a draw, and the plan says so rather than filing it as noise. (A fourth cadence,
+3600 s, returns results *bit-identical* to 1800 s — both are multiples of 900, so the
+sediment activations already own every sync point and nothing moves. Worth knowing
+before designing a perturbation.)
+
+Note what cannot be used as evidence here: CPU and CUDA agree closely (5.45e-07 vs
+4.79e-07), but both backends run the *same* deterministic `Δt` sequence, so agreement
+is expected under either reading.
+
+**Where it most likely sits, still a hypothesis.** The four `[[inflow]]` cells add
+`Q·dt/A ≈ 0.03 m` onto a depth of order 1 m, once per cell per step, in float32 and
+**deliberately uncompensated** — `precision-sources.md` §2 scoped point sources out on
+the grounds that inflow measured ~1.3 % of the residual it was fixing. Each add can
+discard up to half an ulp, ~1.2e-3 m³ at this cell size; over four cells and a few
+thousand steps the available drift is several cubic metres, the right order for both
+clusters. Equal steps make every step slightly shorter than the scheme's `dt`, so
+there are marginally more adds each rounding marginally worse — a mechanism with the
+right sign and the right magnitude, but this pass did not isolate it to those cells.
 
 **Carried, not fixed.** Compensating point sources is `sources.py`'s idiom applied to
 a second call site and is squarely out of this pass's fence (§6); it needs its own
-before/after across every inflow-bearing scenario. What is recorded here is that the
-justification for leaving point sources uncompensated — "~1.3 % of the residual" —
-was measured on a *rain-driven* scenario, and does not transfer to a flood-driven one
-where inflow is the only source. On `reach_alluvial` it is plausibly ~100 % of it.
+before/after across every inflow-bearing scenario. The transferable finding, and the
+reason this is a `roadmap.md` carried item and a `CLAUDE.md` gotcha rather than an
+appendix: **the justification for leaving point sources uncompensated was measured on
+a rain-driven scenario and does not transfer to a flood-driven one.** On
+`reach_alluvial`, where `outflow_cum` is exactly zero and there is no areal source at
+all, inflow is not 1.3 % of the residual — it is plausibly all of it.

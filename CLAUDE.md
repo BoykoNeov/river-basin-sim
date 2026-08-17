@@ -67,9 +67,12 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   `scenarios/reach_alluvial.toml` — the M6 basin flood-driven instead of storm-driven —
   moves **167 043 m³** of bed with peak scour/fill **−228/+257 mm**, mass **9.22e-8 CPU /
   5.53e-8 CUDA**, sediment **5.5e-17 / 4.1e-17**, the two backends agreeing to 1.05e-4 in
-  volume and 0.990 mm in the field. **333 → 336 tests green.** **Two carried findings,
-  both loud:** the scheduler's sync-point `Δt` clamp degrades LI with *no gate able to
-  see it* (see the gotcha below — this is the next piece of work), and the morphological
+  volume and 0.990 mm in the field. Since the scheduler pass: bed **168 563 m³** (+0.9%,
+  inside the interval-halving sensitivity) and mass **5.45e-7 CPU / 4.79e-7 CUDA** — a
+  systematic ~9×, and the reason point-source compensation is now a carried item (see
+  the gotcha below). **333 → 336 tests green.** **Two carried findings, both loud:**
+  ~~the scheduler's sync-point `Δt` clamp degrades LI with *no gate able to see it*~~
+  (**fixed 2026-08-17**, see the scheduler pass above), and the morphological
   Courant diagnostic overstates the splitting error by more than an order of magnitude
   on a reach with a wetting front (peak 46 425 set by one cell of 1414; 19.4 even
   in-range; yet halving `interval_s` moves the bed 0.9%). See
@@ -441,6 +444,21 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   — `reservoir_release` had `rate_mm_hr = 0.0` written out, which is a previous author
   hitting this and working around it. When adding a table, decide explicitly what its
   absence means and test it.
+- **A point source is also an *uncompensated* float32 accumulator, and "inflow is only
+  1.3% of the residual" was measured on the wrong kind of scenario.** The precision
+  pass gave rain per-cell Kahan compensation and deliberately left `[[inflow]]` alone,
+  on evidence from a **rain-driven** run. That does not transfer to a **flood-driven**
+  one where inflow is the *only* source: on `reach_alluvial` the four inflow cells add
+  `Q·dt/A ≈ 0.03 m` onto ~1 m of water in float32, once per cell per step, and
+  `outflow_cum` is exactly 0.0 all run — so the entire mass residual is stored float32
+  volume against the float64 inflow ledger. The scheduler pass moved that residual
+  **5.53e-08 → 4.79e-07** (2.1× under the gate) and it is **systematic**: across two
+  further `Δt` partitions the old code holds 5.5–6.9e-08 and the new 4.8–6.2e-07. In
+  absolute terms it is −2.1 m³ in 4.45 million (3.6e-10 m per cell), so it is
+  arithmetic and not physics — but the headroom is real and the fix is known
+  (`sources.py`'s idiom at a second call site). **Before blaming a scheme for a
+  flood-driven scenario's residual, check whether the run has an areal source at all.**
+  Carried, `docs/plans/scheduler-equal-steps.md` §8.5.
 - **A point source is a splitting artefact with a scale, the same way a slow process
   is.** `[[inflow]]` hands its whole discharge to *one* cell: 90 m³/s into a 100 m cell
   digs its own crater, and on M7's demo that one patch carried **83% of the run's gross
