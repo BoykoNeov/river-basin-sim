@@ -181,3 +181,39 @@ def test_channel_fields_align_to_the_tile_mosaic(tmp_path):
         assert raw.size == ny * nx
     # The coefficients travel with the fields -- they are calibration, not constants.
     assert "coefficients" in json.loads((fields_dir / "channels.json").read_text())
+
+
+def test_channel_fields_threads_coarsen_and_connectivity_through(tmp_path):
+    """The run resolution and the connectivity fix reach the fields and the record.
+
+    Behaviour is gated in ``test_channels.py`` on inputs it controls exactly; this is
+    the plumbing check -- that ``coarsen`` is not silently the tile ``dx`` again, and
+    that the connectivity pass ran and said what it did.
+    """
+    from pipeline.channels import channel_fields
+
+    src = tmp_path / "dem.tif"
+    cond_dir = tmp_path / "conditioned"
+    tiles_dir = tmp_path / "tiles"
+    _write_geographic_dem(src, n=64)
+    condition_dem(src, cond_dir, dst_crs="EPSG:32617")
+    tile_dem(cond_dir, tiles_dir, size=32)
+
+    fine = channel_fields(cond_dir, tiles_dir, tmp_path / "f1", coarsen=1, min_area_km2=0.0)
+    coarse = channel_fields(cond_dir, tiles_dir, tmp_path / "f4", coarsen=4, min_area_km2=0.0)
+
+    assert fine["run_dx_m"] == pytest.approx(fine["dx_m"])
+    assert coarse["run_dx_m"] == pytest.approx(fine["dx_m"] * 4)
+    # A coarser run cell cannot clip more rivers than a finer one.
+    assert coarse["width_clipped_to_run_dx"] <= fine["width_clipped_to_run_dx"]
+    assert coarse["coarsen"] == 4
+
+    # The connectivity pass ran, reported, and can be turned off.
+    assert fine["rook_connected"] is True
+    assert set(fine["connectivity"]) >= {"isolated", "components_4", "components_8"}
+    raw = channel_fields(cond_dir, tiles_dir, tmp_path / "f0", connect=False, min_area_km2=0.0)
+    assert raw["rook_connected"] is False
+    assert raw["cells_inserted_for_connectivity"] == 0
+
+    with pytest.raises(ValueError):
+        channel_fields(cond_dir, tiles_dir, tmp_path / "bad", coarsen=0)

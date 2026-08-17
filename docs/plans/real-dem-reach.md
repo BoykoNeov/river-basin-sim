@@ -1,6 +1,6 @@
 # Real DEM, end to end — the reach machinery on terrain that was not built to suit it
 
-**Status: planned, 2026-08-17.** Not a milestone. M0–M7 are signed off and every carried
+**Status: steps 1–2 done, 2026-08-17; steps 3–7 planned.** Not a milestone. M0–M7 are signed off and every carried
 item is closed; this is the first thing chosen after the roadmap ran out. It is the one
 path the repo has never walked: **every reach-scale run in the repo is synthetic.**
 `scripts/make_reach_demo.py` builds the basin, the river and the channel fields that
@@ -252,6 +252,57 @@ Each step is independently checkable, and the first two are the substance.
    that `--rbverify` never looks at the water surface, so the picture is a separate gate.
 7. **Write it up**, including everything in §1 and §4 that real terrain does to the
    model's assumptions.
+
+## 5.1 Steps 1–2 as shipped (2026-08-17)
+
+`pipeline/channels.py` gains `rook_connect`, `isolated_cells`, `components`,
+`connectivity_report` and `d8_offsets`; `channel_fields` takes `coarsen` and `connect`;
+the CLI takes `--coarsen` and `--no-connect`. **374 → 387 tests green.** The new gates
+live in `pipeline/test_channels.py`, deliberately **not** behind the geo extra's
+`importorskip` the way `test_pipeline.py` is — they gate a defect nothing else can see,
+so they have to run in a bare `uv run pytest`.
+
+**Measured on the real DEM** (M0 tile, 1024² @ 28.1 m, derived at `coarsen = 4`), the
+same fields with and without the fix, reported both as authored and as the solver
+actually consumes them after its own block-max coarsening:
+
+| | channel cells | 4-conn components | largest | 8-conn | interior orphans |
+|---|---|---|---|---|---|
+| as-is, authored | 18 302 | **7 712** | 27 (0.1 %) | 29 | 3 969 |
+| as-is, **as the solver runs it** | 5 918 | **435** | 151 (2.6 %) | 27 | 79 |
+| fixed, authored | 25 962 | **29** | 19 934 (76.8 %) | 29 | **0** |
+| fixed, **as the solver runs it** | 6 373 | **27** | 4 891 (76.7 %) | 27 | **0** |
+
+The fixed network's rook-connected component count equals its 8-connected one at both
+resolutions — the strongest form the gate can take — and coarsening does not undo it.
+
+**Three things the implementation turned up that the plan did not predict.**
+
+*A windowed domain legitimately has isolated cells.* After the fix exactly one cell on
+the M0 tile has no 4-connected neighbour, and it sits on **row 0**: its river continues
+outside the window. Counting that as a defect would make the gate unpassable for every
+domain, since every domain is a window. `isolated_cells` grew an `interior_only` flag and
+the report carries both numbers; the warning fires on the interior count.
+
+*The clip count goes **up** when connectivity is fixed* — 1850 → 2740 cells on this tile
+— because inserted cells inherit the through-river's width, so more cells carry a big
+river. That is correct, and it would read as a regression to anyone who did not expect it.
+
+*A float32 cast can undo the clip.* `validate_geometry` rejects on a strict `w > grid.dx`,
+and the real coarsen-4 cell size 112.58551545578392 m has nearest float32
+**112.58551788** — *larger*. Clipping in float64 and casting would hand the solver a
+field it refuses, from data correct by construction. It passes today only because
+`Grid.dx` is a Python float and NEP 50 therefore makes the comparison in float32; a
+float64 `dx` off a manifest would turn that luck into an unexplained rejection. The clip
+now steps down one ulp when the cast rounds up, and a test asserts the comparison the
+solver actually makes. Verified end to end: the real derived fields, coarsened by the
+solver's own `block_reduce` and passed to its own `validate_geometry`, are **accepted**,
+with the widest channel at exactly `1.000000 × dx`.
+
+**Not changed:** `scripts/make_reach_demo.py` has the same clip-resolution defect (it
+passes the 50 m tile `dx` while `reach_basin` runs at 100 m), but its widths top out at
+26 m so nothing is clipped at either resolution and every recorded demo figure is
+unaffected. Left alone deliberately rather than fixed and re-measured.
 
 ## 6. Gates
 
