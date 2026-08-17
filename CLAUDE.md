@@ -15,6 +15,39 @@ A faithful research/education sandbox validated against benchmarks — **not a
 regulatory-certification tool**. State that honestly anywhere it matters.
 
 ## Status
+- **Point-source compensation: done (2026-08-17).** The second of M7's two carried
+  findings, and the last bare float32 `h += rate*dt` in the repo. Each `[[inflow]]`
+  entry now carries its own Kahan compensation term through `sources.kahan_add`
+  (`solver/processes/inflow.py`) — indexed by *source entry*, not by cell, which is what
+  keeps one-thread-per-entry safe now that duplicate cells are already rejected; and
+  **owned by the injector rather than arming `State.h_comp`**, because both schemes
+  dispatch their *areal* source kernels on `h_comp` and a point source has no business
+  moving a rain-free run onto a different path. **The ledger still banks the float32
+  request, not the field's delta** — banking the delta would zero the residual by
+  construction and blind the mass gate to the whole defect class. **The pass also
+  corrected the finding that asked for it.** Probing the target cells in float64 around
+  each launch: uncompensated the add put **+1.215 m³** more into the field than the
+  ledger banked (of 4.446 M m³ over 5630 steps); compensated, **−0.000093 m³** —
+  **13 000×**. But `reach_alluvial`'s total residual only halved,
+  **4.79e-07 → 2.66e-07 CUDA**, so inflow was not "the entire residual" as carried; the
+  rest is the flux-divergence floor `precision-sources.md` §5 already named as
+  untouched. (No percentage: the attribution is signed positive, the ledger's residual
+  row is negative, so they do not subtract.) **Why it drifts at all**: while nothing
+  else writes `h`
+  the low bits stay correlated and the same rounding decision repeats, so errors add
+  (**489×** in pure accumulation); once continuity rewrites `h` every step they
+  decorrelate into a random walk, and the same A/B on a *flowing* fixture's mass
+  residual reads **0.8× / 2.8× / 7.0×** — sometimes "worse". So the five new tests gate
+  **accumulation**, not a stepped run's mass balance (ratios not thresholds, plus a
+  fast-math canary on the new array and a bit-for-bit check that the control arm really
+  is the old plain add). Fallout, each scenario run twice with only the injector swapped
+  and every "before" arm reproducing its recorded figure exactly: `river_reach`
+  1.84e-08 → 1.80e-08, `river_reach_hllc` 1.51e-07 → 1.16e-07, `reservoir_release`
+  2.38e-07 → 2.32e-07, `reach_basin` 5.95e-08 → **6.00e-08** on CUDA and
+  6.07e-08 → **6.10e-08** on CPU (marginally worse on both, same noise).
+  Scenarios with no `[[inflow]]` build no injector, so `demo_basin_rain` and
+  `spatial_fields` are bitwise unchanged **by construction**. **353 → 358 tests green.**
+  See `docs/plans/point-source-compensation.md`.
 - **Scheduler pass — equal steps to the sync point: done (2026-08-17).** The first of
   M7's two carried findings. The scheduler filled the span to each sync point with full
   steps **plus a remainder**, and that remainder ran at up to **one 585th** of the steps
@@ -70,7 +103,9 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   volume and 0.990 mm in the field. Since the scheduler pass: bed **168 563 m³** (+0.9%,
   inside the interval-halving sensitivity) and mass **5.45e-7 CPU / 4.79e-7 CUDA** — a
   systematic ~9×, and the reason point-source compensation is now a carried item (see
-  the gotcha below). **333 → 336 tests green.** **Two carried findings, both loud:**
+  the gotcha below). Since point-source compensation that mass roughly halves on both
+  backends, **2.14e-7 CPU / 2.66e-7 CUDA**, with the bed at **169 999 m³** (CPU) and
+  sediment **5.19e-17**. **333 → 336 tests green.** **Two carried findings, both loud:**
   ~~the scheduler's sync-point `Δt` clamp degrades LI with *no gate able to see it*~~
   (**fixed 2026-08-17**, see the scheduler pass above), and the morphological
   Courant diagnostic overstates the splitting error by more than an order of magnitude
@@ -108,7 +143,10 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   the Windows `os.replace` race not firing across 4× the file handoffs. Demo
   `scenarios/reach_basin.toml`: a **6×6 mosaic, 76.8 km square**, run at 768² @ 100 m with
   2232 channel cells, mass **7.21e-8** on CPU / **1.60e-7** on the 5090 (was 2.79e-7 /
-  3.08e-7 before the precision pass; **6.07e-8 / 5.95e-8** since the scheduler pass). **234 tests green.** M6's loud carried finding — the
+  3.08e-7 before the precision pass; **6.07e-8 / 5.95e-8** since the scheduler pass;
+  **6.10e-8 / 6.00e-8** since point-source compensation — marginally *worse* on both
+  backends, which is the noise floor, not a regression: its inflow lands on floodplain
+  and rain is what wets this run). **234 tests green.** M6's loud carried finding — the
   same demo at `coarsen = 4` exceeding the gate — **is fixed**: see the precision pass
   below. See `docs/plans/M6-reach.md`.
 - **Precision pass — compensated areal sources: done (2026-08-09).** The first of M6's two
@@ -122,9 +160,10 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   add discards are repaid by the next one. `h` stays float32 (**§2 untouched**, no field
   promoted, one extra f32 array). Armed **only when rain actually falls**, so every run
   without an areal source is **bitwise unchanged** (dam-break, lake-at-rest, the EA
-  benchmarks, M5's `reservoir_release`); **point sources are deliberately out of scope**
-  (inflow measured ~1.3% of the residual, and arming on it would perturb rain-free
-  scenarios). **Result: 3.77e-6 → 1.28e-7** on the failing `coarsen = 4` case — 647 m³ of
+  benchmarks, M5's `reservoir_release`); **point sources were deliberately out of scope**
+  (inflow measured ~1.3% of the residual — on a *rain-driven* run, which is why that
+  number did not transfer; they got their own compensation on 2026-08-17, see the
+  point-source pass below). **Result: 3.77e-6 → 1.28e-7** on the failing `coarsen = 4` case — 647 m³ of
   storm drift becomes −3.15 m³, and the ~21 m³ left is flux/limiter round-off, the floor a
   source-only fix can reach. Every rain-bearing figure was re-measured (all improved except
   the M1/M2 demos, 2.12e-8 → 2.59e-8 — at that magnitude source drift was never what set
@@ -192,6 +231,9 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   down under proportional control (Q easing 40.8 → 12.7 m³/s as the stage falls toward
   its target). **Signed off on GPU + CPU, 2026-08-09, out of order — after M6**: mass
   **1.36e-7 CPU / 3.15e-7 CUDA** (**1.30e-7 / 2.38e-7** since the scheduler pass;
+  **1.87e-7 / 2.32e-7** since point-source compensation — it moved *up* on CPU and
+  *down* on CUDA under the same deterministic Δt sequence, which is how that pass
+  established the number is noise-dominated here rather than systematic;
   a 1.8e-7 backend delta, so reduction order is not what
   sets it), pool peaks at 77.04 m under the 78 m crest and never overtops, the rule
   engages at 75.11 m and eases monotonically to 12.7 m³/s while the stage falls to
@@ -229,7 +271,8 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   **UK EA SC080035 Test 2 + Test 3**. GPU demo `scenarios/river_reach_hllc.toml` mass
   6.66e-7 vs the LI baseline's 1.24e-7 on the same scenario (**1.31e-7 vs 1.68e-8**
   since the precision pass — both scenarios carry rain; **1.51e-7 / 1.84e-8** on the
-  5090 since the scheduler pass). No viewer change — the
+  5090 since the scheduler pass; **1.16e-7 / 1.80e-8** since point-source
+  compensation). No viewer change — the
   Zarr contract is scheme-agnostic. 111 tests green. **Read the plan's carried
   limitations before extending this**: EA Test 3 is a *within-HLLC momentum* gate, not
   a scheme discriminator (Bates LI keeps `∂q/∂t`, so it is on HLLC's side and both
@@ -253,7 +296,9 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   mild steady channel reaches **Manning normal depth within 1%**; a steep basin
   drains with `h.min() >= 0`. Two GPU demos green (`river_reach` mass 1.24e-7,
   `spatial_fields` 7.57e-8; **1.68e-8 / 7.36e-9** since the precision pass, **1.84e-8 /
-  8.68e-9** on the 5090 since the scheduler pass). 82 tests green. See `docs/plans/M3-real-scenarios.md`.
+  8.68e-9** on the 5090 since the scheduler pass; `river_reach` **1.80e-8** since
+  point-source compensation, `spatial_fields` unchanged — it has no `[[inflow]]`, so it
+  builds no injector at all). 82 tests green. See `docs/plans/M3-real-scenarios.md`.
 - **M2 — The loop closes: done.** The §7 contracts
   are live end to end: **§7.1 config-in** (`solver/io/config.py` — TOML → `Scenario`,
   parses the full schema but *rejects* not-yet-built features with a milestone-naming
@@ -444,21 +489,32 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   — `reservoir_release` had `rate_mm_hr = 0.0` written out, which is a previous author
   hitting this and working around it. When adding a table, decide explicitly what its
   absence means and test it.
-- **A point source is also an *uncompensated* float32 accumulator, and "inflow is only
-  1.3% of the residual" was measured on the wrong kind of scenario.** The precision
-  pass gave rain per-cell Kahan compensation and deliberately left `[[inflow]]` alone,
-  on evidence from a **rain-driven** run. That does not transfer to a **flood-driven**
-  one where inflow is the *only* source: on `reach_alluvial` the four inflow cells add
-  `Q·dt/A ≈ 0.03 m` onto ~1 m of water in float32, once per cell per step, and
-  `outflow_cum` is exactly 0.0 all run — so the entire mass residual is stored float32
-  volume against the float64 inflow ledger. The scheduler pass moved that residual
-  **5.53e-08 → 4.79e-07** (2.1× under the gate) and it is **systematic**: across two
-  further `Δt` partitions the old code holds 5.5–6.9e-08 and the new 4.8–6.2e-07. In
-  absolute terms it is −2.1 m³ in 4.45 million (3.6e-10 m per cell), so it is
-  arithmetic and not physics — but the headroom is real and the fix is known
-  (`sources.py`'s idiom at a second call site). **Before blaming a scheme for a
-  flood-driven scenario's residual, check whether the run has an areal source at all.**
-  Carried, `docs/plans/scheduler-equal-steps.md` §8.5.
+- **A float32 accumulator drifts only while its low bits stay correlated — otherwise it
+  random-walks, and an A/B on the mass gate then measures a coin flip. (Point-source
+  compensation, fixed 2026-08-17.)** `[[inflow]]` was the last bare `h += rate*dt` in
+  the repo; each entry now carries its own Kahan term through `sources.kahan_add`
+  (`solver/processes/inflow.py`), owned by the injector so neither scheme's
+  areal-source dispatch on `h_comp` moves. **The pass corrected the finding that asked
+  for it, and that correction is the lesson.** Probing the target cells in float64
+  around each launch: uncompensated, the add put **+1.215 m³** more into the field than
+  the ledger banked (4.446 M m³ requested, 5630 steps); compensated, **−0.000093 m³** —
+  13 000× better. Yet `reach_alluvial`'s total residual only halved,
+  **4.79e-07 → 2.66e-07** — so inflow was not "the entire residual" as carried, and the
+  rest is the flux-divergence floor. **Do not turn that into a percentage**: the
+  attribution is signed *positive* and the ledger's residual row is *negative*, so the
+  two do not subtract; the defensible pair is "13 000× on the term, roughly half on the
+  total". Why the drift is systematic at
+  all: while nothing else writes `h`, the same rounding decision is taken every step and
+  the errors add (**489×** improvement in pure accumulation). Once continuity rewrites
+  `h` the bits decorrelate, it becomes a random walk, and the same A/B on a *flowing*
+  fixture reads **0.8× / 2.8× / 7.0×** — sometimes "worse". **So: gate the arithmetic on
+  an accumulation fixture, never a short flowing run's mass residual; and when
+  attributing a residual, probe the suspect term directly instead of inferring it from
+  the total.** `reach_basin` got marginally *worse* on both backends (5.95e-08 →
+  6.00e-08 CUDA, 6.07e-08 → 6.10e-08 CPU) and that is
+  the same noise. Still true and still worth checking first: before blaming a scheme for
+  a flood-driven scenario's residual, check whether the run has an areal source at all.
+  See `docs/plans/point-source-compensation.md`.
 - **A point source is a splitting artefact with a scale, the same way a slow process
   is.** `[[inflow]]` hands its whole discharge to *one* cell: 90 m³/s into a 100 m cell
   digs its own crater, and on M7's demo that one patch carried **83% of the run's gross

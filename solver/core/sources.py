@@ -41,9 +41,15 @@ bitwise unchanged. Rain-bearing runs *do* change, by design: uncompensated
 accumulation was a defect, not a contract (the same call M4 made when the
 conservative donor-beta limiter replaced the non-conservative ``max(h, 0)`` clamp).
 
-**Scope: areal sources only.** Inflow hydrographs stay uncompensated. They are
-point sources over a handful of cells and measured ~1.3% of the reach-demo
-residual, and compensating them would perturb scenarios that have no rain at all.
+**Scope: areal sources.** This module owns the *distributed* case -- rain here,
+M7's sediment transport integral through :func:`kahan_add`. Inflow hydrographs were
+scoped out when this landed, on evidence that they were ~1.3% of the reach-demo
+residual; that measurement was taken on a **rain-driven** run and did not transfer
+to a flood-driven one, so :mod:`solver.processes.inflow` now carries its own
+per-entry compensation through :func:`kahan_add` as well (2026-08-17). It owns that
+array rather than arming ``State.h_comp``, because the schemes dispatch their
+*areal* source kernels on ``h_comp`` and a point source has no business moving a
+rain-free run onto a different code path.
 
 **Sub-ULP caveat.** The compensation term is exact under Fast2Sum's condition
 ``|h| >= |y|``. A cell drier than the increment itself (``h < ~1e-4`` m during the

@@ -581,3 +581,19 @@ appendix: **the justification for leaving point sources uncompensated was measur
 a rain-driven scenario and does not transfer to a flood-driven one.** On
 `reach_alluvial`, where `outflow_cum` is exactly zero and there is no areal source at
 all, inflow is not 1.3 % of the residual — it is plausibly all of it.
+
+> **Resolved 2026-08-17 — and the last sentence was half right.**
+> `point-source-compensation.md` built the fix and, more usefully, built the
+> instrument this section lacked: probe the four target cells in float64 around each
+> launch, so the add's own error is measured instead of inferred from the total.
+> Uncompensated it is **+1.215 m³** of the run's **2.13 m³** residual — a bit over
+> half, not all of it; compensated it is **−0.000093 m³**, and the total falls
+> **4.79e-07 → 2.66e-07**. The remainder is the flux-divergence floor.
+> The paragraph above got the mechanism, the sign and the order of magnitude right
+> from the ledger alone, and still overshot the share — which is the argument for
+> probing a suspect term directly whenever one is available.
+> One thing it did *not* anticipate: the drift is systematic only while nothing else
+> writes `h`. Once continuity rewrites it every step the low bits decorrelate and the
+> residual random-walks, so on other scenarios the fix moves the gate either way
+> (`reach_basin` 5.95e-08 → 6.00e-08). Removing a systematic term does not make a
+> noise-dominated number monotonically better.

@@ -45,20 +45,27 @@ Detailed per-milestone plans live alongside this file as `M<n>-*.md`.
    `solver/test_scheduler.py`); determinism is untouched. One consequence worth
    knowing: the shipped 900 s cadence was never clean either, only 20× less dirty.
    See `scheduler-equal-steps.md`.
-2. **Point sources are uncompensated, and on a flood-driven scenario that is the whole
-   residual.** Found by the scheduler pass (2026-08-17), which moved `reach_alluvial`'s
-   mass error from 5.53e-08 to 4.79e-07 — 2.1× under the gate. A/B'd with only
-   `scheduler.py` swapped, and **systematic, not a draw**: across two further Δt
-   partitions the old code holds 5.5–6.9e-08 and the new one 4.8–6.2e-07. In absolute
-   terms it is **−2.1 m³ in 4.45 million** (3.6e-10 m per cell), and `outflow_cum` is
-   exactly 0.0 all run, so the residual is entirely float32 stored volume against the
-   float64 inflow ledger. The likely seat is the four `[[inflow]]` cells, whose
-   `Q·dt/A` add is float32 and deliberately uncompensated: `precision-sources.md` §2
-   scoped point sources out because inflow was **~1.3 % of the residual** — but that
-   was measured on a *rain-driven* scenario, and does not transfer to a flood-driven
-   one where inflow is the only source. Fix is `sources.py`'s Kahan idiom at a second
-   call site; it needs its own before/after across every inflow-bearing scenario, so
-   it is its own commit. See `scheduler-equal-steps.md` §8.5.
+2. ~~**Point sources are uncompensated, and on a flood-driven scenario that is the whole
+   residual.**~~ **Done 2026-08-17** — each `[[inflow]]` entry now carries its own float32
+   Kahan term through `sources.kahan_add` (`solver/processes/inflow.py`), owned by the
+   injector rather than arming `State.h_comp`, so neither scheme's areal-source dispatch
+   moves. **The pass also corrected the finding that asked for it.** Probing the target
+   cells in float64 around each launch shows the uncompensated add put **+1.215 m³** more
+   into the field than the ledger banked (of 4.446 M m³ requested, 5630 steps), and
+   compensated that becomes **−0.000093 m³** — a 13 000× cut in the point source's own
+   error. But the run's total residual only **halves, 4.79e-07 → 2.66e-07** on CUDA
+   (5.45e-07 → 2.14e-07 on CPU — both backends agree on the size), so inflow
+   was not "the whole residual" as carried; the rest is the flux-divergence floor
+   `precision-sources.md` §5 already named. (Resist turning that into a percentage: the
+   attribution is signed *positive* and the ledger's residual row is *negative*, so they
+   do not subtract — the honest pair is "13 000× on the term, roughly half on the
+   total".) One lesson generalizes: the drift is
+   systematic only while nothing else writes `h` (489× in pure accumulation), because
+   correlated low-order bits make the same rounding decision repeatedly; once continuity
+   rewrites `h` every step it decorrelates into a random walk and an A/B on a *flowing*
+   fixture's mass residual reads as noise (0.8× / 2.8× / 7.0×) — so the gates are on
+   accumulation, not on a stepped run's mass balance. See
+   `point-source-compensation.md`.
 3. **The morphological Courant diagnostic overstates the error, and cannot be filtered
    without moving a load-bearing gate.** On the M7 demo it peaks at 46 425 (one wetting-
    front cell of 1414) and still reads 19.4 over in-range cells, while halving the

@@ -202,9 +202,17 @@ def test_rain_field_is_read_per_cell(scheme_name):
 def test_unarmed_state_keeps_the_original_kernels():
     """No areal source -> no compensation array -> the pre-existing arithmetic.
 
-    This is the property that keeps dam-break, lake-at-rest, the EA benchmarks and
-    M5's `reservoir_release` bitwise unchanged: the schemes branch on `h_comp`, and
-    nothing arms it unless rain actually falls.
+    This is the property that keeps dam-break, lake-at-rest and the EA benchmarks
+    bitwise unchanged: the schemes branch on `h_comp`, and nothing arms it unless
+    rain actually falls.
+
+    It is no longer the whole story for `reservoir_release`, which this docstring
+    used to name. That scenario has no areal source and still takes the original
+    kernels here -- but it does carry `[[inflow]]`, and point sources gained their
+    own compensation on 2026-08-17 (`solver/processes/inflow.py`, a separate array
+    that deliberately does *not* arm `h_comp`). So it is unchanged **on this path**
+    and changed on that one; see `docs/plans/point-source-compensation.md` for its
+    re-measured figures.
     """
     st = _flat_state(depth=1.0)
     assert st.h_comp is None
