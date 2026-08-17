@@ -508,13 +508,18 @@ func _report_channel_surface() -> void:
 			% int(chan.get("cells", 0))
 			+ "geometry did not load -- water over the river is drawn too high")
 		return
-	print("River Basin viewer: %d sub-grid channel cells (width <= %.1f m, bank-full "
-		% [int(chan.get("cells", 0)), float(chan.get("width_max_m", 0.0))]
-		+ "depth <= %.2f m); overbank water takes the storage curve, in-bank water is "
+	var head := "River Basin viewer: %d sub-grid channel cells (width <= %.1f m, bank-full " \
+		% [int(chan.get("cells", 0)), float(chan.get("width_max_m", 0.0))] \
+		+ "depth <= %.2f m); overbank water takes the storage curve, " \
 		% float(chan.get("depth_max_m", 0.0))
-		+ "drawn at the bank -- up to %.2f m above its true surface on %d cells (frame %d)"
-		% [float(chan.get("in_bank_offset_m", 0.0)), int(chan.get("in_bank_cells", 0)),
-			int(chan.get("frame", -1))])
+	if int(chan.get("in_bank_cells", 0)) == 0:
+		# Every wet channel cell was overbank, so the drawn surface *is* the curve here.
+		print(head + "and no cell was ever wet below bank full")
+		return
+	print(head + "in-bank water is drawn at the bank -- up to %.2f m above its true "
+		% float(chan.get("in_bank_offset_m", 0.0))
+		+ "surface on %d cells (frame %d)"
+		% [int(chan.get("in_bank_cells", 0)), int(chan.get("frame", -1))])
 
 
 func _report_domain() -> void:

@@ -362,9 +362,13 @@ def export_frames(
     # frame, because the worst in-bank cell is a barely-wet one and the last frame is
     # not where the flood is (`_channel_note`).
     dx = float(ds.attrs.get("dx", 1.0))
-    channels = _channel_geometry(ds) if field == "depth" else None
+    channels = _channel_geometry(ds)
+    # The geometry ships regardless of which field was exported -- it describes the run,
+    # not the frames. The *residual* is a property of the water surface, so it is only
+    # measurable on a depth export.
+    measure_channels = channels is not None and field == "depth"
     chan_offset = {"offset": 0.0, "cells": 0, "frame": -1}
-    if channels is not None:
+    if measure_channels:
         chan_w, chan_d = channels
         chan_has = (chan_w > 0) & (chan_d > 0)
         chan_h_bf = np.where(chan_has, chan_w * chan_d / dx, 0.0)
@@ -376,7 +380,7 @@ def export_frames(
             arr, out_dir, layout, field=field, stem=f"f{i:04d}_{field}", tiled=tiled
         )
 
-        if channels is not None:
+        if measure_channels:
             # Only below bank full does `render_eta` depart from `eta_from_h`, and it
             # departs upward -- so the residual is the drawn surface minus the true one
             # over wet in-channel cells, and it is one-sided by construction.
@@ -427,7 +431,7 @@ def export_frames(
     }
     static = _export_static(ds, out_dir, layout, tiled, channels)
     if static is not None:
-        if channels is not None:
+        if measure_channels:
             # What the viewer draws over a river, and where that drawing is knowingly
             # an approximation -- beside the geometry it is derived from, not in a log.
             static["channel"] = _channel_note(channels, chan_offset, dx)
