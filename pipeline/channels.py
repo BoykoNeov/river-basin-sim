@@ -265,6 +265,21 @@ def components(mask: np.ndarray, *, diagonal: bool = False) -> tuple[int, int]:
     return int(counts.size), int(counts.max())
 
 
+def _block_max(field: np.ndarray, k: int) -> np.ndarray:
+    """Block-max a field over ``k x k``, trailing partial blocks cropped.
+
+    Mirrors :func:`solver.io.coarsen.block_reduce` for channel width -- duplicated
+    rather than imported because ``solver.io.coarsen`` pulls in the solver package,
+    and this module must stay importable with nothing but numpy.
+    """
+    if int(k) <= 1:
+        return field
+    ny, nx = field.shape
+    cropped = field[: ny - ny % k, : nx - nx % k]
+    ny, nx = cropped.shape
+    return cropped.reshape(ny // k, k, nx // k, k).max(axis=(1, 3))
+
+
 def connectivity_report(width: np.ndarray) -> dict:
     """Diagnostics for a channel-width field: is this network able to convey?
 
@@ -493,9 +508,12 @@ def route_report(
                 " go in the derived network"
             )
 
+    # "Same piece" is a question about a *pair*: with no outlet given there is nothing
+    # to be in the same piece as, and a run of inlets all in one piece must not read as
+    # a connected route.
     same = None
     labs = [e["component"] for e in ins + outs]
-    if labs and all(x is not None for x in labs):
+    if ins and outs and all(x is not None for x in labs):
         same = len(set(labs)) == 1
         if not same:
             warnings.append(
@@ -744,6 +762,9 @@ def channel_fields(
         "rook_connected": bool(connect),
         "cells_inserted_for_connectivity": inserted,
         "connectivity": connectivity_report(width),
+        # The fields are authored at the tile resolution and the solver block-maxes them
+        # to its own; quoting only the authored figure invites a "did not reproduce".
+        "connectivity_at_run_dx": connectivity_report(_block_max(width, int(coarsen))),
         "drainage": drainage_check(width, area, fdir, dirmap=dirmap),
     }
     if inlets or outlets:
@@ -837,6 +858,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     print(f"  channel     : {rec['channel_cells']} cells, width <= {rec['width_max_m']:.1f} m")
     if rec["rook_connected"]:
+        run = rec["connectivity_at_run_dx"]
         print(
             f"  connectivity: +{rec['cells_inserted_for_connectivity']} cells inserted at"
             f" diagonal steps; {con['components_4']} components (4-connected) vs"
@@ -844,6 +866,12 @@ def main(argv: list[str] | None = None) -> None:
             f" ({con['isolated'] - con['isolated_interior']} more on the window edge, where"
             " the river continues outside the domain)"
         )
+        if rec["coarsen"] > 1:
+            print(
+                f"                as the solver runs it ({run['channel_cells']} cells after"
+                f" block-max at coarsen {rec['coarsen']}): {run['components_4']} vs"
+                f" {run['components_8']}, {run['isolated_interior']} isolated"
+            )
     if con["isolated_interior"] or con["components_4"] > con["components_8"]:
         print(
             f"  WARNING: {con['isolated_interior']} interior channel cells have no 4-connected"
@@ -892,17 +920,21 @@ def main(argv: list[str] | None = None) -> None:
                 f" piece {e['component']} ({e['component_cells']} cells)"
             )
         same = route["same_component"]
+        off = [e["cell"] for e in route["inlets"] + route["outlets"] if not e["in_channel"]]
         if same is True:
             print("  route       : inlet and outlet are in the same piece of channel")
         elif same is False:
             print("  route       : inlet and outlet are in DIFFERENT pieces of channel")
+        elif not route["outlets"]:
+            pass  # no outlet given: there is no route to have a verdict about
         elif cut is not None:
             print(
-                "  route       : not a channel-to-channel route -- with a cutoff set the main"
-                " stem is floodplain on purpose, so read the flow path above instead"
+                f"  route       : {off} not in the channel, so there is no channel-to-channel"
+                " route -- with a cutoff set the main stem is floodplain on purpose, so read"
+                " the flow path above instead"
             )
         else:
-            print("  route       : one of the cells is not in the channel (see the warning)")
+            print(f"  route       : {off} not in the channel, so 'same piece' has no answer")
     for msg in route["warnings"] if route else []:
         print(f"  WARNING: {msg}")
     print("  coefficients are regional calibration inputs; see channels.json")

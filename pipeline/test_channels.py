@@ -285,8 +285,13 @@ def test_the_cutoff_cannot_orphan_a_cell_inserted_for_connectivity():
     """It is applied *after* :func:`rook_connect`, and that ordering is load-bearing.
 
     An inserted corner inherits ``min(area_upstream, area_downstream)`` = the upstream
-    end's area, so whenever the upstream cell survives the cutoff its corner does too:
-    trimming the trunk cannot leave a corner cell stranded beside a dropped river.
+    end's area, so whenever the corner's *own* area is also below the cutoff it survives
+    exactly when the step it serves does. The exception is a corner that happens to sit
+    on a bigger river of its own — it takes ``max(own, through)``, so it can be dropped
+    while both ends of the diagonal step stay, and the wall comes back. It is a
+    hillslope cell by construction, so this is rare rather than impossible, which is
+    why the per-run 4-vs-8 component check is what actually verifies it (it read
+    69 vs 69, 0 isolated, on the real derivation).
     """
     area, fdir = _diagonal_river(n=16)
     fixed, inserted = rook_connect(area, fdir, min_area_km2=1.0)
@@ -420,3 +425,25 @@ def test_an_inlet_and_an_outlet_in_different_pieces_are_reported():
     assert together["warnings"] == []
     assert together["inlets"][0]["route"]["reason"] == "reached_stop"
     assert together["inlets"][0]["route"]["channel_steps"] == 6
+
+
+def test_same_piece_is_a_question_about_a_pair_and_needs_both_cells():
+    """Four inflow cells in one piece are not a route -- there is nothing to reach.
+
+    "Check my inflow cells are in the river" is the obvious use with no outlet, and
+    answering it with "inlet and outlet are in the same piece" would be a connection
+    nobody established.
+    """
+    area, fdir = _two_rivers()
+    w, _, _ = hydraulic_geometry(area, dx=1000.0, min_area_km2=1.0)
+
+    inlets_only = route_report(w, fdir, [(3, 6), (3, 7), (3, 8)])
+    assert [e["in_channel"] for e in inlets_only["inlets"]] == [True, True, True]
+    assert {e["component"] for e in inlets_only["inlets"]} == {
+        inlets_only["inlets"][0]["component"]
+    }
+    assert inlets_only["same_component"] is None
+    assert inlets_only["outlets"] == []
+
+    # An outlet off the channel leaves the pair unanswerable rather than answered.
+    assert route_report(w, fdir, [(3, 6)], [(5, 5)])["same_component"] is None

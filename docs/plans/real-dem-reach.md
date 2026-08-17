@@ -343,6 +343,14 @@ the inlet to the outlet is 396 cells either way, and **397 of 397 were channel b
 cutoff against 123 of 396 after it**. The water is put into a sub-grid channel and then
 travels two thirds of the way to the outlet as ordinary on-grid flow.
 
+**The field was handed to the code that consumes it**, which §5.1 established is where
+the float32-ulp trap lives: `data/fields/smoky` block-maxed by `solver.io.coarsen` and
+passed to `solver.core.channels.validate_geometry` is **accepted**, 5740 channel cells at
+the run resolution (the figure `channels.json` now records beside the authored 23 222),
+widest **0.968 dx**. One consequence to carry into step 4: the deepest channel left is
+**1.29 m** bank full, because depth follows area too — with the cutoff on, the carried
+rivers spill overbank early, and that is the model, not a bug.
+
 That is the right trade at this resolution and it should still be said out loud. A
 1262 km² river is 289 m wide — 2.6 cells at 112.59 m — so it does not need a sub-grid
 model and cannot have one; carrying it clipped meant "the river is exactly one cell
@@ -416,8 +424,13 @@ The pair chosen for step 4, on `data/fields/smoky` (M0 tile, `coarsen = 4`, cuto
   (19 934 cells); with it the outlet is floodplain, which the CLI says in those words
   rather than reporting an unanswered question as a failure.
 
+One thing `route_report` deliberately refuses to answer: with inlets and no outlet there
+is no pair, so `same_component` is `None` rather than `True` — four inflow cells in one
+piece are not a route to anywhere, and reporting them as one would be a connection nobody
+established. (It did, briefly. Advisor-caught.)
+
 The census, the cutoff and the route are all written into `channels.json` beside the
-coefficients. **387 → 400 tests green** — the connectivity, cutoff, trace and route gates
+coefficients. **387 → 401 tests green** — the connectivity, cutoff, trace and route gates
 in `pipeline/test_channels.py` (pure numpy, no geo extra, because they gate defects
 nothing else can see), the `channel_fields` plumbing in `pipeline/test_pipeline.py`.
 

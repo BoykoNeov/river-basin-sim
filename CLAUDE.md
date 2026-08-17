@@ -43,7 +43,7 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   channel cells (14.5 %), drain to a dead end inside the domain**, and water put there
   ponds. `drainage_check` finds them; `route_report` answers whether a scenario's inflow
   cells are in the channel and on a piece that gets out (`--inlet` / `--outlet`, recorded
-  in `channels.json`). **374 → 400 tests green** across both passes (the connectivity
+  in `channels.json`). **374 → 401 tests green** across both passes (the connectivity
   gates run in a bare `uv run pytest`; the `channel_fields` plumbing needs
   `uv sync --extra geo`). Two things measured and *not* true: the
   min-area cutoff **cannot** sever a river (accumulation is monotone downstream, so the
