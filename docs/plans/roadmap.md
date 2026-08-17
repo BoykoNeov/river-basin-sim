@@ -46,6 +46,20 @@ Detailed per-milestone plans live alongside this file as `M<n>-*.md`.
    (2232/2232), and the full loop is green at 2.30e-08. See `viewer-channel-surface.md`
    and `viewer-terrain-mosaic.md` §4.
 
+**After the roadmap.** M0–M7 are signed off and every carried item is closed, so the
+table above is finished. The first thing chosen past it is **real DEM, end to end**
+(`real-dem-reach.md`, planned 2026-08-17): every reach-scale run in this repo is
+synthetic, and `pipeline/channels.py` — which exists to derive channel geometry from real
+flow accumulation — has never been run. The survey behind that plan found a blocker worth
+knowing before anything else touches channel fields: **a D8-derived network is not
+4-connected, and the solver's faces are.** 48.3 % of channel cells take a diagonal step,
+which leaves 40 448 real channel cells as **19 008** rook-connected fragments (largest 37
+cells) where the same mask is 61 components under 8-connectivity — a chain of pools that
+would fill rather than convey, and pass the mass gate while doing it. The fix is measured
+and complete (61 components, zero isolated cells, holds through coarsening), but only when
+the inserted corner cell is given **the through-path's width**: on its own accumulation it
+is a 3.6 % aperture, a pinhole rather than a wall. See `real-dem-reach.md` §2.
+
 **Carried out of M7.** Two, both measured and both deliberately unshipped.
 
 1. ~~**The sync-point `Δt` clamp degrades local-inertial, and no gate can see it.**~~
