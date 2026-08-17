@@ -41,7 +41,14 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   `solver/core/sediment.py` — **the one new constant, and nothing branches on it**; the
   moment something does, M7 step 8's objection returns. Verified as a pure observer:
   `reach_alluvial` on CUDA **byte-identical** before and after in every array, `courant`
-  unmoved to every digit, `.zattrs` additive only. The `.copy()` on the `dz_cum` snapshot
+  unmoved to every digit, `.zattrs` additive only. On CPU every recorded figure
+  reproduces exactly (mass **2.14e-7**, sediment **5.19e-17**, bed **170 000 m³**) and the
+  cross-backend run hands over a free finding: **the raw peak is backend-sensitive and
+  the breakdown is not** — 39 271 CUDA vs **39 256** CPU (0.04%, because a field max over
+  a divergent expression inherits the noise of whichever cell is thinnest), while the
+  in-regime peak **19.38**, the **578 of 1414** counts and the **88%** share are identical
+  to every digit. So the breakdown may be quoted without a backend label; the raw peak,
+  like the bed volume, may not. The `.copy()` on the `dz_cum` snapshot
   is load-bearing and **CPU-only** (`warp.array.numpy()` copies on CUDA, lends a view on
   CPU); its gate was checked by re-introducing the bug — one test fails, nothing else
   notices. Suite run against the changed code *before* any test was added: **358 green,
@@ -518,10 +525,15 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   every threshold that quiets the demo also quiets the worst run in the repo.** The
   trigger and `MORPH_COURANT_GATE = 1.0` therefore stand, and the run prints the
   breakdown instead (`courant_moving` / `courant_in_regime` / `over_courant_share` /
-  `courant_cells` / `live_cells`, `sediment.courant_summary`). Two things to carry:
+  `courant_cells` / `live_cells`, `sediment.courant_summary`). **Three** things to carry:
   **a "peak" that is a field max over a divergent law is a guard reading, so give it a
-  denominator before believing it**; and when a diagnostic is loud on the good run,
-  check what your proposed filter says about the *bad* run before shipping it. Related
+  denominator before believing it**; when a diagnostic is loud on the good run,
+  check what your proposed filter says about the *bad* run before shipping it; and such
+  a peak is **backend-sensitive where its denominators are not** — this one reads 39 271
+  on CUDA against 39 256 on CPU (0.04%, it inherits the reduction noise of whichever
+  cell is thinnest), while `courant_in_regime` 19.38, the 578-of-1414 counts and the 88%
+  share are identical to every digit. So quote the peak with its backend, the way bed
+  volumes are quoted; the breakdown needs no label. Related
   and still true: **do not shorten `interval_s` on this warning's say-so** — check the
   bed against a *longer* interval first. See `docs/plans/morph-courant-diagnostic.md`.
 - **A distributed source is an accumulator, and float32 accumulators need

@@ -330,7 +330,31 @@ in-regime peak 19.38, up to 578 of 1414 cells over the gate, max share 0.883.
 
 **CPU**: the byte comparison above is CUDA-only, because the step-1 baseline store is
 a CUDA run. On CPU the run reproduces its recorded figures instead. That is the
-weaker claim and is stated as such — but note the trap in §2.3 is a **CPU-only**
+weaker claim and is stated as such — but it came back stronger than "reproduces",
+and in the one place that matters:
+
+| | CUDA | CPU | recorded CPU baseline |
+|---|---|---|---|
+| mass max rel | 2.66e-07 | **2.14e-07** | 2.14e-07 |
+| sediment rel | 4.1e-17 | **5.19e-17** | 5.19e-17 |
+| bed moved | 168 563 m³ | **169 999.6 m³** | ~170 000 m³ |
+| Courant peak, raw | 39 271.12 | **39 256.32** | — |
+| … at `h_col/d50 ≥ 35` | 19.38 | **19.38** | — |
+| cells over gate | 578 of 1414 | **578 of 1414** | — |
+| max over-gate share | 0.88 | **0.88** | — |
+
+Every recorded CPU figure reproduces exactly. The free finding is the last four rows:
+**the raw peak is backend-sensitive and the breakdown is not.** The peak differs by
+0.04 % between backends — it is a field maximum over a divergent expression evaluated
+at the wet/dry guard, so it inherits the reduction-order noise of the cell that happens
+to be thinnest — while the in-regime peak, the cell counts and the share are identical
+to every digit printed. That is the diagnostic's own argument arriving as a
+measurement: the number that overstates is the one that wobbles, and the numbers that
+give it a denominator are stable across backends. It also means the breakdown can be
+quoted without a backend label, which the raw peak and the bed volume cannot
+(CLAUDE.md's existing warning about unlabelled bed volumes applies to the peak too).
+
+Note the trap in §2.3 is a **CPU-only**
 failure mode (`warp.array.numpy()` copies on CUDA and lends a view on CPU), so the
 test that gates it, `test_the_per_activation_bed_change_is_a_copy_and_not_the_array_warp_lends_back`,
 runs on the backend where it can actually fire. Verified by re-introducing the bug:
