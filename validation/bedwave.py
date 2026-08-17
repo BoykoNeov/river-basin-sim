@@ -78,27 +78,48 @@ Every one of these is a constraint, and they pull against each other:
 6. **Small amplitude.** 15 mm on 1.5 m of water. At 30 mm the crest travelled 3%
    fast and the shape 2% fast -- nonlinear steepening, since ``c_b`` rises with bed
    elevation -- which is real physics but not what the gate is written against.
-7. **The activation interval is the fixture's own, not the 900 s default, and it is
-   fenced on both sides.** Above, at 900 s, this bed wave crosses 3.1 cells per
+7. **The activation interval is the fixture's own, not the 900 s default, and its
+   upper fence is the splitting.** At 900 s this bed wave crosses 3.1 cells per
    activation, which is a splitting artefact rather than a result (M7 plan §1.3).
-   Below, the limit is not the splitting at all but the **scheme**: a shorter
-   interval means more sync-point activations, every one of which clamps ``dt`` and
-   so hands local-inertial an abrupt shorten-then-restore that excites a
-   short-wavelength mode (M7 plan §4, *"a clamped step is not a free step"*).
-   Measured on this fixture with the **bump removed**, so every departure below is
-   spurious: +-0.16 mm at 90 s, **+-0.11 mm at 45 s**, +-8.85 mm at 22.5 s and
-   +-29.3 mm at 11.25 s -- against a 15 mm bump. 45 s sits inside the band, and
-   ``xcorr`` celerity over ``c_b`` across it reads 0.99 at 45 s, 0.996 at 90 s and
-   0.97 at 180 s.
+   45 s puts the morphological Courant number at 0.155, comfortably inside.
 
-   **The first draft of this constraint said the opposite and it was wrong.** It
-   read *"short intervals couple the water to the bed more tightly (the physical
-   answer is slightly slower than the rigid-lid celerity)"* -- i.e. it took the
-   short-interval readings for convergence toward a coupled answer and quoted them
-   as physics. They are a numerical artefact, and the discriminator is that they
-   appear with **no bed at all**: the same clamp cadence applied to water alone,
-   with sediment never armed, ripples a steady 1.4959 m reach by 74 mm at 22.5 s
-   and destroys it at 11.25 s, while the mass gate reads 1e-8 throughout.
+   **There used to be a lower fence too, and it was a bug in the clock, not a
+   property of the fixture.** Until 2026-08-17 the scheduler filled the span to each
+   activation with full steps *plus a remainder*, and that remainder could be a
+   585th of the step beside it -- an abrupt shorten-then-restore that local-inertial
+   answers with a short-wavelength standing mode. More activations meant more of
+   them, so a shorter interval measured the scheme's damage rather than the
+   transport law. That is fixed (``docs/plans/scheduler-equal-steps.md``,
+   ``solver.scheduler.fill_span``, which this module's :func:`drive` imports), and
+   the fence is gone. Re-measured across a **16x** range of intervals, water-only
+   ripple with the bump removed so every departure is spurious, against a 15 mm
+   bump:
+
+   ==============  ==============  ==============  ==============
+   interval        ripple, before  ripple, after   ``xcorr``/``c_b``
+   ==============  ==============  ==============  ==============
+   180 s           --              +-0.004 mm      1.003
+   90 s            +-0.16 mm       +-0.006 mm      0.996
+   **45 s**        **+-0.11 mm**   **+-0.004 mm**  **0.992**
+   22.5 s          +-8.85 mm       +-0.121 mm      0.989
+   11.25 s         +-29.3 mm       +-0.122 mm      0.988
+   ==============  ==============  ==============  ==============
+
+   The celerity is now monotone and **interval-independent to 1.5% across the whole
+   range**, which is the property the gate in ``test_bed_wave.py`` was always trying
+   to assert. 45 s is kept because it is the derived design point, not because
+   anything below it is unsafe.
+
+   **Two drafts of this constraint were wrong, in opposite directions, and both are
+   worth remembering.** The first read *"short intervals couple the water to the bed
+   more tightly (the physical answer is slightly slower than the rigid-lid
+   celerity)"* -- it took the corrupted short-interval readings for convergence
+   toward a coupled answer and quoted an artefact as physics. The second correctly
+   identified the artefact but then wrote it into the fixture's design as a
+   permanent lower fence, which turned a fixable defect into a documented
+   constraint. The discriminator that settled it both times is the same: the
+   readings appear with **no bed at all**. A numerical effect that survives
+   switching off the physics it appears to be about is not that physics.
 
 **The ends are pinned, and that is a sediment boundary condition, not a fudge.**
 Boundary faces carry no bedload (they are never updated, which is the closed BC),
@@ -189,6 +210,7 @@ from solver.core.state import State
 from solver.io.config import Inflow
 from solver.processes.inflow import InflowInjector
 from solver.processes.morphology import MorphologyProcess
+from solver.scheduler import fill_span
 
 # Water in at the head, out at the toe. The east edge is the M3 post-interior sink
 # (solver.core.boundaries): it passes water and, by construction, no sediment.
@@ -610,11 +632,14 @@ def drive(
     there. The physics is not hand-wired: the transport integral accumulates inside
     ``step`` and the activation is one ``advance`` call.
 
-    **The clamp below is the scheduler's, deliberately.** Landing exactly on each
-    activation is what :class:`~solver.scheduler.MultiRateScheduler` does for every
-    real run (``dt = min(dt, next_sync - t)``), so the fixture inherits the artefact
-    constraint (7) describes rather than dodging it. A harness that skipped the clamp
-    would measure a cleaner reach than any scenario can actually run.
+    **The span arithmetic below is the scheduler's, deliberately** -- imported from it
+    (:func:`solver.scheduler.fill_span`) rather than reimplemented, so the fixture
+    steps exactly the way a real run does and cannot quietly drift from it. Until
+    2026-08-17 this was a hand-written copy of the scheduler's ``dt = min(dt, edge - t)``
+    clamp, kept so the fixture would inherit the artefact constraint (7) describes
+    rather than dodge it. That artefact is fixed and the copy is gone; the principle
+    that the harness must not measure a cleaner reach than any scenario can run is
+    why the import replaced it instead of the clamp simply being deleted.
     """
     st = fx.state("cpu")
     inj = InflowInjector(fx.inflows(), st.grid, "cpu")
@@ -639,8 +664,7 @@ def drive(
         else:
             edge = end
         edge = min(edge, end)
-        if t + dt > edge:
-            dt = edge - t
+        dt = fill_span(edge - t, dt)
         assert dt > 0.0, f"harness made no progress at t={t} (edge={edge}, acts={acts})"
 
         # Arm *at* the warm-up boundary: `z0` is captured here and is still the

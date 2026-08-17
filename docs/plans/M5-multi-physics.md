@@ -249,6 +249,11 @@ tolerances. Same policy M4 used for Tests 2 and 3.
 - [x] **Pre-M5 runs bitwise-identical**: verified against stored LI / M3-sources / HLLC
       baselines, and guarded in-tree by a test that replays the pre-M5 inline loop as an
       executable reference and asserts float equality on every step.
+      **Retired 2026-08-17** (`scheduler-equal-steps.md`). It did its job — it proved
+      this extraction was inert — but the arithmetic it pinned turned out to be a
+      defect: filling a span with full steps plus a remainder hands local-inertial a
+      discontinuity of up to 585x between adjacent steps. The reference loop stays in
+      `solver/test_scheduler.py` as a tombstone; four invariants replace the assertion.
 - [x] **`[[structures]]`** dams and levees: barrier geometry (`cells` + `crest_m` raised
       into the bed, so impoundment and overtopping stay ordinary solver physics) plus
       `fixed` / `target_stage` release rules on the structure's own slow clock; release

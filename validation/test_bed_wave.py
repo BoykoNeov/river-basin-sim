@@ -8,6 +8,11 @@ the bed is big enough to be mistaken for that. Step 8 promotes it rather than
 tightening it: the +-20% on the shape estimator is what the sizing evidence supports
 (a 7% spread across a 32x range of activation intervals), and shrinking it to +-5%
 because the design point happens to read 0.993 would be fitting the gate to one run.
+*(Since the scheduler pass of 2026-08-17 that spread is 1.5% over a 16x range and the
+design point reads 0.992 -- most of the old 7% was the sync-clamp artefact, not the
+splitting. The +-20% stays: it is sized for the estimator's own failure modes, which
+have not changed, and re-tightening a gate onto the run that happens to be in front
+of you is the thing this paragraph exists to refuse.)*
 The crest fit and the centroid stay **printed, not gated**, for the reason
 :mod:`validation.bedwave` gives: they fail differently and their disagreement is
 information.
@@ -26,9 +31,11 @@ Three findings from sizing it, each now asserted rather than remembered:
   reach 30% -- so the fixture pins its end cells with the bound
   :func:`~solver.core.sediment.exner_update` already carries;
 * the 900 s activation interval that follows the reservoir would move this bed wave
-  3.1 cells per activation, which is why the fixture carries its own -- and step 8
-  gates that from *both* sides, because the interval is fenced below as well
-  (:mod:`validation.bedwave` constraint (7), M7 plan §4).
+  3.1 cells per activation, which is why the fixture carries its own. Step 8 gated
+  that from *both* sides; since 2026-08-17 only the upper fence is physics. The lower
+  one was the scheduler handing local-inertial a remainder step, and it is fixed
+  (:mod:`validation.bedwave` constraint (7), ``docs/plans/scheduler-equal-steps.md``).
+  The interval-independence test below is kept and is strictly stronger now.
 
 **The harness is no longer provisional, and no longer lives here.** A private
 ``_drive`` was written at build step 3 hand-wiring what

@@ -4,11 +4,15 @@ The scheduler is deliberately a *clock*, not a driver (M5 plan §1.1), which is 
 lets these tests drive it with a stub ``dt_fn`` and assert the properties that
 actually matter: a step never crosses a sync point, every sync point is landed on
 exactly, slow processes fire at exact multiples of their interval regardless of the
-fast timestep, and the whole sequence still matches the inline loop M1-M4 ran (the
-bitwise non-regression guard for the refactor).
+fast timestep, and -- since 2026-08-17 -- that the span between two sync points is
+filled with **equal** steps rather than full steps plus a remainder.
+
+That last one replaced this file's oldest assertion. See *the tombstone* below.
 """
 
 from __future__ import annotations
+
+import math
 
 import pytest
 
@@ -25,14 +29,26 @@ def _cycle(values: list[float]):
     return lambda: next(it)
 
 
-# --- the pre-M5 inline loop, kept as an executable reference ------------------ #
-def _reference_ticks(end_time, output_every, events, dt_fn):
-    """The M1-M4 `run.py` clamping loop verbatim -> [(t0, dt, t1, is_output), ...].
+# --- the tombstone ------------------------------------------------------------ #
+# `_reference_ticks` is the M1-M4 inline clamping loop, and until 2026-08-17 this
+# file asserted that MultiRateScheduler reproduced it float for float -- the
+# "pre-M5 runs are bitwise-identical" invariant M4, M5 and M6 all cite.
+#
+# The scheduler pass (docs/plans/scheduler-equal-steps.md) ended that assertion on
+# purpose, because the arithmetic it pinned was a defect: the remainder step this
+# reference produces runs at up to one 585th of the steps either side of it, and
+# local-inertial answers that with a short-wavelength standing mode that ripples a
+# uniform reach by 2.3 m while the mass balance reads 1e-8.
+#
+# The reference is kept because it documents what changed and lets a reader diff the
+# two schedules directly, and because the *event set* it builds is still the live
+# one -- `test_the_sync_points_themselves_are_unchanged` below asserts exactly that.
+# What it no longer pins is how a span is filled. The four invariants that replace
+# it are grouped under "the replacement invariants".
 
-    Any divergence between this and MultiRateScheduler is a behaviour change in the
-    one loop every prior milestone depends on, so it is asserted exactly (float
-    equality), not approximately.
-    """
+
+def _reference_ticks(end_time, output_every, events, dt_fn):
+    """The M1-M4 `run.py` clamping loop verbatim -> [(t0, dt, t1, is_output), ...]."""
     n_frames = int(round(end_time / output_every)) + 1
     ev = [output_every * k for k in range(1, n_frames)] + list(events) + [end_time]
     out = []
@@ -49,13 +65,125 @@ def _reference_ticks(end_time, output_every, events, dt_fn):
     return out
 
 
-def test_matches_the_pre_scheduler_inline_loop_exactly():
-    """The refactor must not move a single float: same steps, same output ticks."""
-    events = [300.0, 137.5, 900.0]  # rain end + hydrograph knots (unsorted, as before)
-    sched = MultiRateScheduler(end_time=1200.0, output_every=300.0, events=events)
-    got = [(t.t0, t.dt, t.t1, t.is_output) for t in sched.ticks(_cycle([73.3, 41.0, 210.0]))]
-    want = _reference_ticks(1200.0, 300.0, events, _cycle([73.3, 41.0, 210.0]))
-    assert got == want
+# --- the replacement invariants ------------------------------------------------ #
+# Four properties that together say everything the retired bitwise assertion said
+# which was worth saying, plus the one it could not say (no remainder steps).
+
+_EVENTS = [300.0, 137.5, 900.0]  # rain end + hydrograph knots, unsorted as in run.py
+_DTS = [73.3, 41.0, 210.0]
+
+
+def _sched(**kw):
+    kw.setdefault("end_time", 1200.0)
+    kw.setdefault("output_every", 300.0)
+    kw.setdefault("events", _EVENTS)
+    return MultiRateScheduler(**kw)
+
+
+def test_the_scheduler_never_lengthens_the_step_the_scheme_asked_for():
+    """Invariant 1: ``dt <= dt_raw``, every step.
+
+    The scheduler now chooses how *many* steps fill a span, so it does more than
+    clamp -- and this is the line it must not cross. Freezing the step count at the
+    span start (the rejected reading of "equal steps") violates it by up to 1.59x,
+    which is a CFL bug the scheduler invented rather than one the scheme asked for.
+    """
+    raws: list[float] = []
+    it = iter(_DTS * 10_000)
+
+    def dt_fn():
+        raws.append(next(it))
+        return raws[-1]
+
+    for tick in _sched().ticks(dt_fn):
+        assert tick.dt <= raws[-1] + 1e-12, f"step {tick.dt} exceeds dt_raw {raws[-1]}"
+
+
+def test_no_step_is_a_small_fraction_of_its_neighbour():
+    """Invariant 2: the span is filled with equal steps, not a remainder.
+
+    The one the retired assertion could not make, because it asserted the remainder.
+    With a constant ``dt_fn`` every step inside a span must be identical; the only
+    changes allowed are at a sync point, where the next span's arithmetic starts.
+    """
+    sched = _sched(end_time=1000.0, output_every=250.0, events=[137.0])
+    ticks = list(sched.ticks(_const(97.0)))
+    syncs = sorted(set(sched.sync_times))
+    for a, b in zip(ticks, ticks[1:], strict=False):
+        if any(abs(a.t1 - s) < EPS_T for s in syncs):
+            continue  # a span boundary -- a new span may legitimately pick a new dt
+        assert a.dt == pytest.approx(b.dt, rel=1e-9), (
+            f"dt changed from {a.dt} to {b.dt} inside a span (t={a.t1})"
+        )
+
+
+def test_the_sync_points_themselves_are_unchanged():
+    """Invariant 3: frame times, ``n_frames`` and the output tick set do not move.
+
+    These are pure schedule arithmetic that never saw ``dt``, so the pass must not
+    have touched them -- asserted against the retired reference, which is why it is
+    kept in the file.
+    """
+    sched = _sched()
+    got = [t.t1 for t in sched.ticks(_cycle(_DTS)) if t.is_output]
+    want = [t[2] for t in _reference_ticks(1200.0, 300.0, _EVENTS, _cycle(_DTS)) if t[3]]
+    assert got == pytest.approx(want)
+    assert got == pytest.approx([300.0, 600.0, 900.0, 1200.0])
+    assert sched.n_frames == 5
+    assert sched.sync_times == [300.0, 600.0, 900.0, 1200.0, *_EVENTS, 1200.0]
+
+
+def test_the_schedule_is_reproducible():
+    """Invariant 4: same inputs, same floats. Determinism (HANDOFF §8/§12) is the
+    property that actually mattered; only the sequence moved, once."""
+    a = [(t.t0, t.dt, t.t1, t.is_output) for t in _sched().ticks(_cycle(_DTS))]
+    b = [(t.t0, t.dt, t.t1, t.is_output) for t in _sched().ticks(_cycle(_DTS))]
+    assert a == b
+
+
+# --- the arithmetic that is load-bearing now ------------------------------------ #
+
+
+@pytest.mark.parametrize(
+    ("span", "dt_raw"),
+    [
+        (100.0, 100.0),  # exactly one step
+        (100.0, 250.0),  # the scheme wants more than the span
+        (100.0, 50.0),  # divides exactly
+        (100.0, 99.9),  # just under: two steps of 50, not 99.9 + 0.1
+        (100.0, 51.0),  # the classic remainder case
+        (100.0, 33.4),  # n = 3
+        (100.0, 0.0007),  # many steps
+    ],
+)
+def test_a_span_is_filled_with_equal_steps_none_longer_than_the_scheme_asked(span, dt_raw):
+    """``n = ceil(span/dt_raw)`` steps of ``span/n``, and the sync point landed on."""
+    sched = MultiRateScheduler(end_time=span, output_every=span)
+    ticks = list(sched.ticks(_const(dt_raw)))
+    assert len(ticks) == max(1, math.ceil(span / dt_raw))
+    assert all(t.dt <= dt_raw + 1e-12 for t in ticks)
+    assert all(t.dt == pytest.approx(ticks[0].dt, rel=1e-9) for t in ticks)
+    assert ticks[-1].t1 == pytest.approx(span)
+
+
+def test_a_span_of_two_steps_is_the_worst_case_for_requantisation():
+    """The residual path back to the defect, bounded and asserted.
+
+    ``dt`` is recomputed from the remaining span every step, so when the scheme's
+    ``dt`` drifts down and the step count ticks up, ``dt`` moves by ``1/n`` -- which
+    is largest where ``n`` is smallest. A span barely longer than one step is that
+    case: the jump can reach 50%, and it must not exceed it.
+    """
+    span = 100.0
+    # dt_raw drifts down just enough to force n: 1 -> 2 -> 3 across the span.
+    it = iter([100.0, 60.0, 40.0, 30.0, 25.0] + [25.0] * 100)
+    sched = MultiRateScheduler(end_time=span, output_every=span)
+    ticks = list(sched.ticks(lambda: next(it)))
+    assert ticks[-1].t1 == pytest.approx(span)
+    jumps = [abs(b.dt - a.dt) / a.dt for a, b in zip(ticks, ticks[1:], strict=False)]
+    assert max(jumps, default=0.0) <= 0.5 + 1e-12, (
+        f"re-quantisation jumped by {100 * max(jumps):.1f}%, past the 1/n bound"
+    )
 
 
 def test_steps_never_cross_a_sync_point_and_land_on_every_one():

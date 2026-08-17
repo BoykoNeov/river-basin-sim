@@ -399,4 +399,157 @@ the re-baseline, and the doc rewrites listed in §5. One commit, in the shape
 
 ## 8. Measured result
 
-*(filled in at completion)*
+### 8.1 The defect, gone
+
+`validation/test_clamp_ripple.py`, same fixture, before and after, on the untrimmed
+interior window:
+
+| quantity | 45 s cadence | 11.25 s cadence |
+|---|---|---|
+| interior curvature `max\|∂²h\|` | 14.037 → **0.0137 mm** | 75.703 → **0.0116 mm** |
+| interior spread (printed) | 14.501 → 0.011 mm | 54.114 → 0.131 mm |
+| depth vs an uninterrupted run | 8.740 → **0.010 mm** | 47.671 → **0.146 mm** |
+| `Δt` step-to-step change, mean | 29.4 % → **0.00000 %** | 44.1 % → **0.00833 %** |
+| `Δt` step-to-step change, max | 5 652 % → 0.00 % | 70.4 % → 7.41 % |
+| `Δt` range (s) | 0.0034..0.4568 → 0.3430..0.4545 | 0.0078..0.4568 → 0.3086..0.4500 |
+| mass balance | 3.5e-08 → 8.8e-08 | 9.1e-09 → 2.7e-08 |
+
+The last row is the point of the whole exercise: **the mass balance is unchanged to
+within its own noise while the reach goes from 54 mm of spurious standing wave to
+0.13 mm.** It was never going to catch this.
+
+`dt/dt_state_derived` peaks at **0.999766** over 5 453 steps, so the scheduler never
+lengthened a step.
+
+### 8.2 The bed-wave fixture's lower fence dissolved
+
+`validation/bedwave.py` constraint (7) sized M7's activation interval partly *against*
+this artefact. Re-measured across a 16× range of intervals — water-only ripple with
+the bump removed, and the gated celerity with it present:
+
+| interval | ripple before | ripple after | `xcorr`/`c_b` after |
+|---|---|---|---|
+| 180 s | — | ±0.004 mm | 1.003 |
+| 90 s | ±0.16 mm | ±0.006 mm | 0.996 |
+| **45 s** | **±0.11 mm** | **±0.004 mm** | **0.992** |
+| 22.5 s | ±8.85 mm | ±0.121 mm | 0.989 |
+| 11.25 s | ±29.3 mm | ±0.122 mm | 0.988 |
+
+The celerity is now monotone and **interval-independent to 1.5 % across the whole
+range**, against the 7 % spread M7 recorded over 32×. Most of that spread was the
+clamp, not the operator splitting. The ±20 % gate in `test_bed_wave.py` stays as it
+is: it is sized for the estimator's failure modes, and re-tightening a gate onto
+whichever run is in front of you is exactly what its docstring refuses to do.
+
+`bedwave.drive` no longer carries a hand-written copy of the scheduler's clamp — it
+imports `solver.scheduler.fill_span`, which is why the fixture could not silently
+keep stepping the old way.
+
+### 8.3 Test suite
+
+**336 → 353 green, one predicted failure resolved.**
+
+The full suite was run against the changed scheduler before anything else moved, and
+**exactly one test failed: `test_matches_the_pre_scheduler_inline_loop_exactly`**, the
+retired invariant. Every physics gate held inside its own tolerance without being
+touched — dam-break, EA Tests 1/2/3, Manning normal depth, sub-grid channel, HLLC
+(all files), `fixed_stage`, reservoir, the bed-wave celerity and interval
+independence, and the morphology threshold pair including its **bit-exact** 0-cells
+claim at 0.9 θ_c. §5 predicted the last two as the fragile ones; they held.
+
+Net +17 tests: 6 in `validation/test_clamp_ripple.py`, 11 in `solver/test_scheduler.py`
+(the four replacement invariants, the seven-case span-arithmetic parametrisation, and
+the `n = 2` re-quantisation bound), less the one retired.
+
+### 8.4 Scenario re-baseline
+
+Every shipped scenario, re-run on this machine, each into its own output directory.
+The "before" column is what the repository recorded; where it recorded one number
+without a device, it is repeated.
+
+| scenario | before (CPU / CUDA) | after CPU | after CUDA |
+|---|---|---|---|
+| `demo_basin_rain` (M2) | 2.59e-08 | 2.79e-08 | 2.30e-08 |
+| `river_reach` (M3) | 1.68e-08 | 2.16e-08 | 1.84e-08 |
+| `spatial_fields` (M3) | 7.36e-09 | 9.47e-09 | 8.68e-09 |
+| `river_reach_hllc` (M4) | 1.31e-07 (CUDA) | *not measured* | 1.51e-07 |
+| `reservoir_release` (M5) | 1.36e-07 / 3.15e-07 | **1.30e-07** | **2.38e-07** |
+| `reach_basin` (M6) | 7.21e-08 / 1.60e-07 | **6.07e-08** | **5.95e-08** |
+| `reach_alluvial` (M7) | 9.22e-08 / 5.53e-08 | see §8.5 | **4.79e-07** |
+
+No systematic direction: the three small demos drift up by ~20 %, the two largest
+scenarios improve (`reach_basin` on CUDA by 2.7×), HLLC is flat. All are one to two
+orders inside the 1e-6 gate. **`river_reach_hllc` on CPU was not measured** — no CPU
+figure was ever recorded for it, and the run costs over an hour on this machine while
+adding nothing to a comparison that has no "before".
+
+Not re-verified, and unchanged from their sign-offs because nothing in this pass
+touches them: `reservoir_release`'s pool peak (77.04 m under a 78 m crest), the
+release rule's engagement stage and its 40.8 → 12.7 m³/s easing, and the viewer
+registration figures. Its mass figure moved by 4 % and 24 %, which is the evidence
+that the run is the same run.
+
+### 8.4.1 The Godot loop
+
+The §7 contract is scheme- and clock-agnostic, but the Windows file-handoff race only
+reproduces under the live viewer, so both headless checks were re-run rather than
+assumed:
+
+* `--rblaunch` — full subprocess loop, `starting → running → writing → done`,
+  `success=true`, 13 frames, mass **2.30e-08** (2.59e-08 before), no `os.replace`
+  race across the handoffs.
+* `--rbverify` — read path and terrain registration, **OK**: 1024×1024 @ 28.15 m,
+  4356 wet samples, imported surface 365.3..1560.7 m bracketed against the exported
+  bed 365.3..1563.9 m, `run_bed=true`.
+
+### 8.5 `reach_alluvial`'s mass residual — measured, explained, and carried
+
+**The one result this pass did not predict**, so it was A/B'd rather than explained
+away: the same scenario, same machine, same hour, with **only `solver/scheduler.py`
+swapped**.
+
+| | old scheduler | new scheduler |
+|---|---|---|
+| mass rel. error | **5.53e-08** | **4.79e-07** |
+| bed volume moved | 167 026 m³ | 168 563 m³ (+0.92 %) |
+| morphological Courant peak | 46 425.49 | 39 262.56 |
+| sediment balance | 4.09e-17 | 4.09e-17 |
+
+The old scheduler reproduces the M7 sign-off's 5.53e-08 and its 46 425 Courant peak
+**exactly**, which is what makes the comparison clean — nothing else in the tree or
+the data drifted. So the change is responsible, and the honest first statement is
+that it made this number **8.7× worse**, to within 2.1× of the gate.
+
+The second statement is the scale. From the ledger's own final row:
+
+```
+old:  volume 4 446 000.055   inflow 4 445 999.9995   outflow 0.0   residual -0.055 m3
+new:  volume 4 446 002.092   inflow 4 445 999.9726   outflow 0.0   residual -2.119 m3
+```
+
+**`outflow_cum` is exactly 0.0 for the whole run** — nothing leaves the domain — so
+the residual is entirely the float32 stored volume disagreeing with the float64
+inflow ledger. Two cubic metres in four and a half million: **3.6e-10 m of depth per
+cell**, three orders of magnitude below one float32 ulp at this depth. Physically it
+is nothing, and the *bed* — the thing this demo exists to show — moved by 0.9 %,
+inside the interval-halving sensitivity M7 already documented.
+
+**Leading explanation, stated as a hypothesis because it is not proven.** The four
+`[[inflow]]` cells add `Q·dt/A ≈ 0.03 m` onto a depth of order 1 m, once per cell per
+step, in float32 and **deliberately uncompensated** — `precision-sources.md` §2 put
+point sources out of scope on the grounds that inflow measured ~1.3 % of the residual
+it was fixing. Each such add discards up to half an ulp, ~1.2e-3 m³ at this cell size;
+over four cells and a few thousand steps the *available* drift is several cubic
+metres in either direction. That is the right order for both readings, which reframes
+them: **−0.055 m³ was a lucky near-cancellation, not a property**, and this scenario's
+mass gate has always been a few-cubic-metre coin flip that nobody had cause to look at.
+Equal steps make every step slightly shorter than the scheme's `dt`, so there are
+marginally more adds each rounding marginally worse — a mechanism with the right sign,
+though not one this pass measured directly.
+
+**Carried, not fixed.** Compensating point sources is `sources.py`'s idiom applied to
+a second call site and is squarely out of this pass's fence (§6); it needs its own
+before/after across every inflow-bearing scenario. What is recorded here is that the
+justification for leaving point sources uncompensated — "~1.3 % of the residual" —
+was measured on a *rain-driven* scenario, and does not transfer to a flood-driven one
+where inflow is the only source. On `reach_alluvial` it is plausibly ~100 % of it.

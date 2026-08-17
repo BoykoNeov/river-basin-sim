@@ -11,7 +11,7 @@ diagnostic and the validation harness gate every step.
 | **M2** | **The loop closes** | §7 contracts: config-in/results-out, subprocess + status.json, per-frame tiles; Godot timeline + depth colormap + water surface. | **done** |
 | **M3** | **Real scenarios** | Scenario system + command log + spatially-varying parameter fields; inflow hydrographs + open boundaries. **Validate: channel normal depth.** | **done** |
 | **M4** | **Fidelity step** | Well-balanced HLLC FV behind the same kernel interface. **Validate: lake-at-rest + UK EA 2D suite.** *Also: harden the mass-gate denominator against drain-to-empty collapse (`massbalance.py` causal peak-volume floor + a drain test) before running the suite.* | **done** |
-| **M5** | **Multi-physics** | Multi-rate scheduler (single simulated clock, sync points, operator splitting), exercised by reservoir operations (`[[structures]]` + release rules). Also lands the M4 deferrals: **`fixed_stage`** BC (HLLC-only), the **datum shift**, and **EA Test 1**. Pre-M5 runs stay bitwise-identical. | **done** (confirmed 2026-08-09, after M6) |
+| **M5** | **Multi-physics** | Multi-rate scheduler (single simulated clock, sync points, operator splitting), exercised by reservoir operations (`[[structures]]` + release rules). Also lands the M4 deferrals: **`fixed_stage`** BC (HLLC-only), the **datum shift**, and **EA Test 1**. ~~Pre-M5 runs stay bitwise-identical~~ (retired 2026-08-17 — see the carried item below). | **done** (confirmed 2026-08-09, after M6) |
 | **M6** | **Reach** | Tiling-at-scale (the domain is the tile mosaic) + resolution choice with conservative coarsening + **sub-grid channels**, validated by a fine-vs-coarse equivalence gate. *Nested two-way multi-resolution and the 1D network stay unbuilt — §12's interface conservation is **avoided**, not solved.* | **done** |
 | **M7** | **Morphology** | Sediment transport (Exner + transport capacity) on the slow clock: MPM at capacity, Exner in float64, LI-only, sub-grid channels carried. **Validate: bed-wave celerity + threshold pair + sediment mass conservation.** | **done** (signed off on GPU + CPU, 2026-08-10) |
 
@@ -34,15 +34,17 @@ Detailed per-milestone plans live alongside this file as `M<n>-*.md`.
 
 **Carried out of M7.** Two, both measured and both deliberately unshipped.
 
-1. **The sync-point `Δt` clamp degrades local-inertial, and no gate can see it.** Not a
-   morphology bug — it reproduces with sediment never armed, and it predates M5, since
-   M1–M4 clamped inline. A uniform steady reach ripples 0.010 mm unclamped, 14 mm at a
-   45 s cadence and **2342 mm at 11.25 s**, while mass balance reads 1e-8 throughout,
-   because mass *is* conserved and only the water's position is wrong. A measured fix
-   (fill each span with `ceil(span/dt)` equal steps: 14.2 → 0.009 mm) is recorded and
-   unshipped, because it moves every run's `Δt` sequence and the pre-M5 bitwise-identity
-   invariant with it — its own commit, like the precision pass. **This is the next
-   piece of work.** See `M7-morphology.md` §4.
+1. ~~**The sync-point `Δt` clamp degrades local-inertial, and no gate can see it.**~~
+   **Done 2026-08-17** — the scheduler fills each span with `ceil(span/dt)` *equal*
+   steps instead of full steps plus a remainder. The largest step-to-step change in
+   `Δt` falls from **58 575 % to under 8 %**, and the interior ripple on a uniform
+   steady reach from **2342 mm to 0.012 mm** at an 11.25 s cadence. Gated by
+   `validation/test_clamp_ripple.py` — on depth **curvature**, because max-minus-min
+   cannot tell an oscillation from a backwater slope. Retires the pre-M5
+   bitwise-identity invariant on purpose (four replacement invariants in
+   `solver/test_scheduler.py`); determinism is untouched. One consequence worth
+   knowing: the shipped 900 s cadence was never clean either, only 20× less dirty.
+   See `scheduler-equal-steps.md`.
 2. **The morphological Courant diagnostic overstates the error, and cannot be filtered
    without moving a load-bearing gate.** On the M7 demo it peaks at 46 425 (one wetting-
    front cell of 1414) and still reads 19.4 over in-range cells, while halving the

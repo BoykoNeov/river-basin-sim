@@ -15,6 +15,34 @@ A faithful research/education sandbox validated against benchmarks — **not a
 regulatory-certification tool**. State that honestly anywhere it matters.
 
 ## Status
+- **Scheduler pass — equal steps to the sync point: done (2026-08-17).** The first of
+  M7's two carried findings. The scheduler filled the span to each sync point with full
+  steps **plus a remainder**, and that remainder ran at up to **one 585th** of the steps
+  beside it. Local-inertial answers that discontinuity with a short-wavelength standing
+  mode: a uniform steady reach rippled 14 mm at a 45 s cadence and **2342 mm at 11.25 s**
+  with **no sediment armed at all**, while the mass balance read 1e-8 throughout — mass
+  *is* conserved, only the water's position was wrong. **`solver/scheduler.py` now takes
+  `ceil(span/Δt)` equal steps** (`fill_span`, which `validation/bedwave.py` imports rather
+  than copying). Largest step-to-step change in `Δt`: **58 575 % → under 8 %**; interior
+  ripple **2342 → 0.012 mm**; `Δt ≤ Δt_state-derived` still holds every step (peak
+  0.999766). **Two readings of "equal steps" and only one works** — freezing the step
+  count at the span start exceeds the state-derived `Δt` by **1.59×** and wrecks a
+  long-cadence reach (535 mm); the shipped one recomputes from the *remaining* span
+  every step. **Gated on curvature, not spread** (`validation/test_clamp_ripple.py`):
+  max-minus-min cannot tell an oscillation from a legitimate backwater slope, so it
+  would have been calibrated by its measurement window; the second difference of depth
+  separates **4700×** on the untrimmed window. **Retires the pre-M5 bitwise-identity
+  invariant on purpose** — it was a refactor-safety proof, not a user guarantee, and it
+  pinned the defect; four invariants replace it and determinism is untouched. Fallout
+  worth knowing: the **shipped 900 s cadence was never clean either**, only 20× less
+  dirty; M7's bed-wave fixture had a *lower* fence on `interval_s` that was this bug and
+  is now gone (celerity interval-independent to **1.5 % over 16×**, against 7 % over 32×);
+  and the M7 §4 notes that 22.5 s and 11.25 s "both settle at 1.908 mm" (they quantise to
+  the same two step sizes) and a "32.9 mm end-cell offset" (not reproducible, withdrawn)
+  are resolved. Suite **336 → 353 green**: run against the changed scheduler before
+  anything else moved, **exactly one test failed and it was the retired invariant** —
+  every physics gate held inside its own tolerance untouched, including the bit-exact
+  0-cells threshold claim. See `docs/plans/scheduler-equal-steps.md`.
 - **M7 — Morphology: done (signed off on GPU + CPU, 2026-08-10).** The bed moves.
   Meyer-Peter-Mueller transport **at capacity** plus Exner on the **slow clock**
   (`solver/core/sediment.py` kernels + `solver/processes/morphology.py`, armed by a
@@ -77,7 +105,7 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   the Windows `os.replace` race not firing across 4× the file handoffs. Demo
   `scenarios/reach_basin.toml`: a **6×6 mosaic, 76.8 km square**, run at 768² @ 100 m with
   2232 channel cells, mass **7.21e-8** on CPU / **1.60e-7** on the 5090 (was 2.79e-7 /
-  3.08e-7 before the precision pass). **234 tests green.** M6's loud carried finding — the
+  3.08e-7 before the precision pass; **6.07e-8 / 5.95e-8** since the scheduler pass). **234 tests green.** M6's loud carried finding — the
   same demo at `coarsen = 4` exceeding the gate — **is fixed**: see the precision pass
   below. See `docs/plans/M6-reach.md`.
 - **Precision pass — compensated areal sources: done (2026-08-09).** The first of M6's two
@@ -131,9 +159,11 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   forcing breakpoints, `end_time`, **slow-process activations**) and yields a `Tick`.
   It is a **clock, not a driver** — `run.py` keeps state/stepping/forcing/accounting/IO,
   which is what makes the sync-point algebra unit-testable with a stub `dt_fn` and no GPU.
-  With no slow processes the event set and its arithmetic are unchanged, so **pre-M5 runs
-  are bitwise-identical** (verified against stored LI/M3/HLLC baselines; guarded in-tree
-  by a test that replays the pre-M5 inline loop as an executable reference).
+  With no slow processes the **event set** is unchanged, so frame times and forcing
+  segments are exactly M1–M4's. ~~Pre-M5 runs are bitwise-identical~~ — **retired
+  2026-08-17** by the scheduler pass below: how a span is *filled* changed, on purpose,
+  because the old arithmetic was a defect. The reference loop is kept in
+  `solver/test_scheduler.py` as a tombstone, with four invariants in its place.
   Exercised by **reservoir operations** (`[[structures]]` + `solver/processes/reservoir.py`):
   a structure is **barrier geometry plus a rule** — cells' bed raised to `crest_m` (so
   impoundment and overtopping are ordinary solver physics, nothing to re-validate) plus
@@ -158,7 +188,8 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   `scenarios/reservoir_release.toml` fills a valley reservoir to 0.5 Mm³ then draws it
   down under proportional control (Q easing 40.8 → 12.7 m³/s as the stage falls toward
   its target). **Signed off on GPU + CPU, 2026-08-09, out of order — after M6**: mass
-  **1.36e-7 CPU / 3.15e-7 CUDA** (a 1.8e-7 backend delta, so reduction order is not what
+  **1.36e-7 CPU / 3.15e-7 CUDA** (**1.30e-7 / 2.38e-7** since the scheduler pass;
+  a 1.8e-7 backend delta, so reduction order is not what
   sets it), pool peaks at 77.04 m under the 78 m crest and never overtops, the rule
   engages at 75.11 m and eases monotonically to 12.7 m³/s while the stage falls to
   75.63 m. Because M6 refactored `solver/io/` underneath this scenario, that run is also
@@ -194,7 +225,8 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   **Manning normal depth 0.59%** on a transcritical channel; drain-to-empty 3.0e-8;
   **UK EA SC080035 Test 2 + Test 3**. GPU demo `scenarios/river_reach_hllc.toml` mass
   6.66e-7 vs the LI baseline's 1.24e-7 on the same scenario (**1.31e-7 vs 1.68e-8**
-  since the precision pass — both scenarios carry rain). No viewer change — the
+  since the precision pass — both scenarios carry rain; **1.51e-7 / 1.84e-8** on the
+  5090 since the scheduler pass). No viewer change — the
   Zarr contract is scheme-agnostic. 111 tests green. **Read the plan's carried
   limitations before extending this**: EA Test 3 is a *within-HLLC momentum* gate, not
   a scheme discriminator (Bates LI keeps `∂q/∂t`, so it is on HLLC's side and both
@@ -217,7 +249,8 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   scenario into `.zattrs` + a `<store>.provenance.json` sidecar. **Validated:** a
   mild steady channel reaches **Manning normal depth within 1%**; a steep basin
   drains with `h.min() >= 0`. Two GPU demos green (`river_reach` mass 1.24e-7,
-  `spatial_fields` 7.57e-8; **1.68e-8 / 7.36e-9** since the precision pass). 82 tests green. See `docs/plans/M3-real-scenarios.md`.
+  `spatial_fields` 7.57e-8; **1.68e-8 / 7.36e-9** since the precision pass, **1.84e-8 /
+  8.68e-9** on the 5090 since the scheduler pass). 82 tests green. See `docs/plans/M3-real-scenarios.md`.
 - **M2 — The loop closes: done.** The §7 contracts
   are live end to end: **§7.1 config-in** (`solver/io/config.py` — TOML → `Scenario`,
   parses the full schema but *rejects* not-yet-built features with a milestone-naming
@@ -233,8 +266,9 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   auto-loads results, and renders a **lifted depth-coloured water surface**
   (`water_surface.gdshader`: η = bed + depth reconstructed in-shader, dry-cell
   discard) with a timeline scrubber. Full loop verified from Godot (`--rblaunch`)
-  on the RTX 5090; mass gate 2.12e-8 (**2.59e-8** since the precision pass — the loop
-  itself is unchanged and still green); error path writes `state="error"` (viewer
+  on the RTX 5090; mass gate 2.12e-8 (**2.59e-8** since the precision pass, **2.30e-8**
+  since the scheduler pass — the loop itself is unchanged and re-verified green end to
+  end, `--rbverify` included); error path writes `state="error"` (viewer
   never hangs); 38 tests green. See `docs/plans/M2-loop-closes.md`.
 - **M1 — Water moves: done.** Local-inertial (Bates
   2010) shallow-water solver in Warp on the staggered raster: uniform rainfall,
@@ -354,24 +388,28 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   gate failure as a bug, check the depth-to-elevation ratio and step count; the fix is
   usually `[grid] datum` or a better-scaled test, not a change to the scheme. (M4's EA
   Test 2 note is the same effect measured on horizon length.)
-- **A clamped step is not a free step, and no gate can see the damage.** The
-  scheduler clamps every step to land on a sync point (`dt = min(dt, next_sync - t)`
-  — output cadence, forcing breakpoints, slow-process activations; M1–M4 did the same
-  inline). That hands local-inertial an abrupt shorten-then-restore, which excites a
-  short-wavelength mode. Measured on a uniform steady reach with **no sediment armed
-  at all**: interior depth ripple 0.010 mm unclamped, 14 mm at a 45 s cadence, 74 mm
-  at 22.5 s, **2342 mm at 11.25 s** — while the mass balance reads 1e-8 throughout,
-  because mass *is* conserved and the water is merely in the wrong places. Isolated
-  to the scheme by two controls (a closed box with no inflow and no open edge does it
-  too; smooth drift of the state-derived `dt` does not). Existing scenarios sit at a
-  900 s cadence (0.165 mm), which is why nothing caught it. **So: a frequent sync
-  cadence is not the safe direction** — before shortening `output_every` or a slow
-  process's interval, re-check a quantity a ripple would break and the mass gate
-  would not: the spread of interior depth along a reach that should be uniform, or
-  normal depth against the Manning value `validation/test_channel_flow.py` gates.
-  A measured candidate fix (fill each span with `ceil(span/dt)` *equal* steps) is
-  recorded but unshipped, because it moves every run's `dt` sequence and with it the
-  pre-M5 bitwise-identity invariant. Full tables + controls: `docs/plans/M7-morphology.md` §4.
+- **A remainder step is not a small step — it is a discontinuity. (Fixed 2026-08-17;
+  the lesson generalizes.)** The scheduler used to fill the span to each sync point
+  with full steps *plus whatever was left over*, and that leftover routinely ran at
+  **one 585th** of the steps either side of it. Local-inertial answers an abrupt
+  shorten-then-restore with a short-wavelength standing mode: a uniform steady reach
+  rippled 0.010 mm unclamped, 14 mm at a 45 s cadence and **2342 mm at 11.25 s**, with
+  **no sediment armed at all** — while the mass balance read 1e-8 throughout, because
+  mass *is* conserved and only the water's position was wrong. **Now** each span is
+  filled with `ceil(span/dt)` *equal* steps (`solver/scheduler.py`): the largest
+  step-to-step change drops from 58,575% to under 8%, the ripple to hundredths of a
+  millimetre at every cadence, and `validation/test_clamp_ripple.py` gates it. So a
+  frequent `output_every` or a short slow-process interval is a safe direction again.
+  **Three things to carry forward:** the mass gate is *blind* to this class of defect
+  and always was — if you change the scheme's time integration, gate a quantity a
+  ripple would break (interior depth spread on a reach that should be uniform, or
+  normal depth against `validation/test_channel_flow.py`); gate it on **curvature,
+  not spread**, because max-minus-min cannot tell an oscillation from a legitimate
+  backwater slope and will make you pick a window by its answer; and note the shipped
+  900 s cadence was never *clean*, only 20× less dirty — "no symptom" meant no
+  instrument. **`solver/test_scheduler.py` no longer asserts pre-M5 bitwise
+  identity** and says so at the tombstone; determinism is untouched.
+  See `docs/plans/scheduler-equal-steps.md`.
 - **A slow process hands over a whole interval at once — that is the splitting, not a
   bug, but it has a scale.** 60 m³/s over a 900 s reservoir interval is 54,000 m³; into
   a single 40 m cell that is a 34 m instantaneous column. Deliver over a *reach* (the

@@ -869,7 +869,21 @@ sediment.
   is a visible one. Either pin the end cells (`dz_lo == dz_hi == 0`, banked into the
   ledger) or keep every quoted measurement clear of the boundaries and say which.
 - **A clamped step is not a free step: sync-point `dt` clamping degrades
-  local-inertial, and no existing gate can see it.** Found at build step 8 while
+  local-inertial, and no existing gate can see it.**
+  **RESOLVED 2026-08-17 — see `scheduler-equal-steps.md`.** The candidate fix below
+  shipped: each span is filled with `ceil(span/dt)` *equal* steps, the largest
+  step-to-step change in `dt` falls from 58 575 % to under 8 %, the ripple from
+  2342 mm to 0.012 mm, and `validation/test_clamp_ripple.py` gates it on depth
+  curvature. Three corrections to what is written below, all measured:
+  **(a)** "fill the span with equal steps" had two readings and only one works —
+  freezing the step count at the span start exceeds the state-derived `dt` by 1.59×
+  and wrecks a long-cadence reach; the numbers recorded below are the
+  recompute-every-step reading. **(b)** The 1.908 mm floor is not the fix's limit,
+  it is the inflow point source's spatial adjustment in two cells, and 22.5 s and
+  11.25 s agree because they quantise to the same two step sizes. **(c)** The
+  "32.9 mm end-cell offset" could not be reproduced and is withdrawn. The rest of
+  this note is kept as the record of how the defect was found.
+  Found at build step 8 while
   measuring §3's interval-independence gate, which is why that gate is worded the way
   it is. **This is not a morphology bug** — it reproduces with sediment never armed —
   and it predates M7: `solver/scheduler.py` clamps every step with
@@ -912,7 +926,8 @@ sediment.
   morphology **rectifies** the oscillation into a permanent bed signature instead of
   letting it average out.
 
-  **Candidate fix, measured, deliberately not shipped in step 8:** fill the span to
+  **Candidate fix — shipped 2026-08-17, see the RESOLVED note at the head of this
+  bullet.** Fill the span to
   the next sync point with `n = ceil(span/dt)` *equal* steps rather than full steps
   plus a remainder — still never exceeding the state-derived `dt`, still landing
   exactly on the sync point. Ripple 14.248 → **0.009 mm** at 45 s, 2341.566 → 1.908 mm
@@ -920,9 +935,10 @@ sediment.
   so the pre-M5 bitwise-identity invariant M4/M5/M6 all held — and the in-tree test
   that replays the pre-M5 inline loop as an executable reference — would move. That is
   a milestone-scale change deserving its own commit and its own before/after, the way
-  the precision pass got one. Two numbers in it are also still unexplained: 22.5 s and
+  the precision pass got one. ~~Two numbers in it are also still unexplained: 22.5 s and
   11.25 s both settle at 1.908 mm, and a 32.9 mm end-cell offset is identical across
-  all three cadences. Carried the way M6 carried `coarsen = 4`.
+  all three cadences.~~ Both resolved — see (b) and (c) at the head of this bullet.
+  Carried the way M6 carried `coarsen = 4`, and cleared the same way.
 
 - **The morphological Courant number samples the flow; the transport integrates it.**
   `celerity_field` runs at the activation *instant*, so an interval in which a flood

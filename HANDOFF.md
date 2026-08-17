@@ -520,12 +520,27 @@ so diagnose before assuming the scheme is wrong.
 sub-cycles with a deterministic adaptive `Δt` computed from state (never from wall-clock
 or framerate); slow processes (reservoir daily rules, sediment morphology on a long
 clock) advance at sync points via operator splitting. The scheduler is a **clock, not a
-driver** — it clamps the scheme's own state-derived `Δt` so a step never crosses a sync
-point (output cadence, forcing breakpoint, `end_time`, slow-process activation) and
-yields a tick; state, stepping, forcing, accounting and IO stay in the run loop, which
-is what keeps the sync-point algebra testable without a GPU. With no slow processes the
-event set and its arithmetic are unchanged, so runs predating the scheduler stay
-bitwise-identical.
+driver** — it never invents a `Δt`, only shortens the scheme's own state-derived one so
+a step never crosses a sync point (output cadence, forcing breakpoint, `end_time`,
+slow-process activation) and yields a tick; state, stepping, forcing, accounting and IO
+stay in the run loop, which is what keeps the sync-point algebra testable without a GPU.
+With no slow processes the **event set** is unchanged, so frame times and forcing
+segments are exactly M1–M4's.
+
+**How a span is filled is not, as of 2026-08-17, and the old answer was a defect.** The
+scheduler takes `ceil(span/Δt)` **equal** steps to the next sync point rather than full
+steps plus a remainder. A remainder step ran at up to one 585th of the steps beside it,
+and local-inertial answers that discontinuity with a short-wavelength standing mode: a
+uniform steady reach rippled 2.3 m at an 11.25 s cadence **while the mass balance read
+1e-8**, because mass is conserved and only the water's position is wrong. This retires
+the earlier claim here that runs predating the scheduler stay bitwise-identical — that
+was a refactor-safety proof, not a guarantee to users, and it pinned the defect.
+Determinism (§8, §12) is untouched: `Δt` still derives from state alone and a rerun
+still reproduces bit for bit. See `docs/plans/scheduler-equal-steps.md`; gated by
+`validation/test_clamp_ripple.py`, whose lesson generalises — **the mass gate is blind
+to this whole class of defect**, so a change to time integration must be gated on a
+quantity a ripple would break, and on depth *curvature* rather than spread, since
+max-minus-min cannot tell an oscillation from a legitimate backwater slope.
 
 **A slow process hands over a whole interval at once — that is the splitting, not a
 bug, but it has a scale.** 60 m³/s over a 900 s interval is 54,000 m³; into one 40 m
