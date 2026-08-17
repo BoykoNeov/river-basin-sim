@@ -30,7 +30,10 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   ascent** on the raw 28.15 m bed, climbs **143.04 m** at `coarsen = 2` and **314.92 m** at
   `coarsen = 4` — **1.17× its own drop**, 49 of 118 steps uphill. **Not one valley**: over
   23 sampled routes, `k=4` puts **38.6 %** of steps uphill and, on 18 of 21 routes with a
-  real drop, more ascent than descent; 2 of 23 end *higher* than they start. Block **min**
+  real drop, more ascent than descent; 2 of 23 end *higher* than they start. **The route
+  the previous pass had already chosen is worse still** — the M0 tile's `[266,327]` reads
+  **1.72×** — so this was sitting in the plan a pass before it was found, and every check
+  that existed then passed on it. Block **min**
   preserves it exactly at every `k` and is **not** the fix — it lowers the whole terrain
   and destroys the storage property; the better shape is the sub-grid channel invert
   `z − d`, and that is design work not attempted here. **The synthetic sign-offs stand and

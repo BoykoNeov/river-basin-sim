@@ -231,6 +231,11 @@ accumulation produce.
 
 Each step is independently checkable, and the first two are the substance.
 
+> **Steps 3–5 are done and step 5's outcome supersedes what is written below: read §5.3
+> first.** The run happened and did not convey, so step 5's "run it on both backends" was
+> deliberately not completed — a CPU arm of a run that moves nothing measures nothing —
+> and steps 6–7 are blocked on the defect §5.3.5 describes rather than on work remaining.
+
 1. **Rook-connect the derived network** (`pipeline/channels.py`). Insert the corner cell
    at each diagonal step of the flow path, choosing the higher-accumulation of the two,
    **and carry the through-path's width onto it** (§2.1 — without that it is a pinhole,
@@ -540,6 +545,12 @@ on the bed the solver steps:
 | block min, `k=4` | 112.59 m | 267.3 m | 0.00 m | 0 / 118 | 0.00 m |
 
 At the resolution the plan chose, **the river climbs 1.17× as much as it descends**.
+
+**And the route §5.2.3 had already chosen was worse.** Re-deriving `data/fields/smoky`
+(the M0 tile) with the pre-flight in place puts its inlet `[266, 327]` at **135.1 m of
+ascent against a 78.3 m drop — 1.72×**, 51 of 131 steps uphill. So the failure was
+waiting in the route this plan picked a pass earlier, and nothing measured at the time
+could have shown it: every check §5.2.3 ran passed on that route too.
 
 **It is not one valley.** Over 23 independently sampled routes (20–200 km² headwaters,
 ≥ 50 cells long), block mean:
