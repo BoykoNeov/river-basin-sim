@@ -2,10 +2,17 @@
 
 The last finding carried out of M7 (`roadmap.md`, "Carried out of M7" item 3). The
 warning that says *"the bed wave crosses more than a cell per activation, so the bed
-change is a splitting artefact"* fires on the M7 demo at **46 425** — and the bed is
+change is a splitting artefact"* fires on the M7 demo at **39 271** — and the bed is
 right to **0.9%** when the interval is halved. A diagnostic that is wrong by four
 orders of magnitude on the only shipped scenario that arms it does not warn anybody;
 it trains them to ignore the line.
+
+> **The headline number moved between M7 and this pass: 46 425 → 39 271.** Same
+> scenario, same `interval_s`; the scheduler equal-steps pass and point-source
+> compensation both changed the Δt sequence, and the peak is a field maximum over a
+> wetting front, which is the least reproducible statistic in the run. Quote the new
+> figure. This is exactly the "unlabelled number invites a false *did not reproduce*"
+> hazard `CLAUDE.md` already flags for bed volumes.
 
 This is a **diagnostic-only** change. Nothing here reads into the physics: the bed,
 the water, the ledgers and the store's `bed_change` field must come out **bit-for-bit
@@ -28,6 +35,12 @@ celerity, **exactly one** sits below `h_col/d50 = 10`, and that one cell sets th
 46 425. The peak over cells the law applies to (`h_col/d50 ≥ 35`) is **19.4**.
 
 A max over the whole field is therefore reporting the guard, not the reach.
+
+> **§3 step 1 measured this and half of it is wrong.** The in-regime peak reproduces
+> exactly (**19.38**), and up to **14** cells sit below `h_col/d50 = 10` at once rather
+> than one. But the guard cell **moves bed**: over the whole run the peak restricted to
+> cells that carried bed change this activation is **39 271.12** — *the same number, to
+> every digit*. See §1.3.
 
 ### 1.2 …and 19.4 is still an overstatement, which the carried finding does not say
 
@@ -61,6 +74,55 @@ is reduced in the way most likely to maximise it, and it is presented as a
 measurement.** Part 1.1 is fixable arithmetic. Part 1.2 is a property of the
 reference and is fixed by *saying so*, not by tuning a constant.
 
+### 1.3 What §3 step 1 actually measured
+
+Four runs through one observer wrapper on `MorphologyProcess.advance`, which
+differences `dz_cum` per activation and evaluates `celerity_field` beside it. All
+figures below are that observer's; nothing in the solver moved to obtain them.
+
+| | fixture 45 s | fixture 900 s | `reach_alluvial` | miniature + rain sheet |
+|---|---|---|---|---|
+| activations | 103 | 5 | 96 | 12 |
+| peak Courant, raw | 0.162 | 3.298 | **39 271** | 5.0e8 |
+| … over cells that moved bed | 0.162 | 3.298 | **39 271** | 5.0e8 |
+| … over cells at `h_col/d50 ≥ 35` | 0.162 | 3.298 | **19.38** | 88.3 |
+| max over-gate share of \|Δz\| | 0.000 | 1.000 | 0.883 | 0.477 |
+| gross-weighted over-gate share | 0.000 | 1.000 | **0.495** | **0.012** |
+| cells over the gate (max) | 0 | 239 / 240 | 578 / 1414 | 48 |
+| cells below `h_col/d50 = 10` | 0 | 0 | 14 | 23 |
+
+`reach_alluvial` reproduced its recorded run while being observed — mass **2.66e-07**,
+sediment **4.21e-17**, bed **168 557 m³** against the recorded 168 563 m³ CUDA — and
+the aliasing gate of §2.3 held: differenced field vs the record's own `applied_m3`,
+max absolute error **1.4e-12 m³**.
+
+**Three findings, in descending order of how much they change the plan.**
+
+1. **A share-based trigger is not merely unable to go quiet — it is anti-correlated
+   with badness, and that closes the branch on principle.** The last column is the
+   rain-sheet arm of `validation/test_morphology_gates.py::_regime_share`: the
+   configuration this repo *removed rain from `reach_alluvial` to avoid*, which moved
+   **1.9e9 m³** of nonsense bed and, as a scenario bug, once read `bed_moved` 1.46e11.
+   Its share is **0.012** — an order of magnitude *below* the demo's 0.495, and below
+   the demo's max-share too. **Under either aggregation, every threshold that quiets
+   the demo also quiets the rain sheet.** The mechanism is §5's understatement
+   compounding with the weighting: the sheet's bed moved where the flow had already
+   left, so those cells read celerity zero at the sampling instant and carry the
+   volume anyway.
+2. **§2.2's premise is refuted.** Weighting the *peak* by where the bed moved changes
+   nothing on the run that matters: 39 271.12 either way. Per activation the filter
+   does bite (at t = 1800 s, 1016.5 raw against 16.7 moving), but the guard cell moves
+   bed often enough that the run maximum is untouched. `courant_moving` therefore
+   ships as an *honest null* — recorded because a reader comparing it to `courant`
+   learns something real, not because it fixed §1.1.
+3. **The roadmap's stated blocker is false, and cleanly so.** It claims a regime-aware
+   diagnostic *"would silently change what the Courant-3.30 fixture asserts."* The
+   fixture runs at `h/d50 = 187.0`, its **minimum** submergence over live cells is
+   **130.1**, it has **zero** cells below `h_col/d50 = 10`, and its raw, bed-weighted
+   and in-regime peaks are *numerically identical* on both arms. No plausible cut-off
+   touches it. The real blocker is `_sediment_bowl` at `h/d50 = 0.5`, which the
+   roadmap never names — and §2.1 named it before the measurement.
+
 ---
 
 ## 2. The design
@@ -79,18 +141,34 @@ which is additive by §7.2):
 | field | what it is |
 |---|---|
 | `courant_moving` | peak Courant over cells that carried bed change **this activation** |
+| `courant_in_regime` | peak Courant over cells at `h_col/d50 ≥ MORPH_REGIME_FLOOR` |
 | `over_courant_share` | fraction of this activation's gross \|Δz\| sitting in cells with Courant > `MORPH_COURANT_GATE` |
 | `courant_cells` | how many cells are over the gate (so "one cell" is visible as one cell) |
 
-**No relative-submergence cut-off.** `h ≥ k·d50` was refused at M7 build step 8 for a
+**A relative-submergence cut-off, but only ever as a number that is printed.** The
+plan opened refusing one, because `h ≥ k·d50` was refused at M7 build step 8 for a
 reason that still holds: `_sediment_bowl` runs at `h/d50 = 0.5`, so a submergence
 guard would keep several tests green *for a second, unrelated reason*
 (`solver/test_run.py:319-333` says this at length, and
-`validation/test_morphology_gates.py:161` repeats it). Weighting by **where the bed
-actually moved** achieves the same discrimination with no new physical constant: a
-cell that is dry-ish and fast but moves no bed drops out on its own weight.
+`validation/test_morphology_gates.py:161` repeats it).
 
-### 2.2 Why "where the bed moved" is the right weight
+**That objection is about a cut-off in a trigger or a gate, and §1.3 froze the
+trigger.** With nothing acting on it, `courant_in_regime` changes no test's outcome
+and cannot hold one green — and it is the most informative number in the whole
+dataset, 19.38 against 39 271, a **2000×** contrast, and the figure the carried
+finding already quotes. So `_REGIME_FLOOR = 35.0` moves out of
+`validation/test_morphology_gates.py` and into `solver/core/sediment.py` as
+`MORPH_REGIME_FLOOR`, with the validation module importing it rather than keeping its
+own copy. The cost is stated rather than hidden: **a regime constant now lives in the
+solver**, for a diagnostic. If it ever becomes load-bearing, M7 step 8's objection
+comes straight back and `_sediment_bowl`'s docstring already prescribes the remedy.
+
+**Weighting by where the bed moved stays, and stays honest about what it did.** §1.3
+finding 2 measured that it does not drop the guard cell from the run maximum. It is
+recorded because the comparison is informative per activation, not because it fixed
+§1.1.
+
+### 2.2 Why "where the bed moved" is the right weight — and where it is not
 
 The splitting error is the bed change applied at once; a cell that applies none
 cannot contribute one, whatever its celerity. And a genuinely unresolved bed wave
@@ -98,6 +176,14 @@ cannot contribute one, whatever its celerity. And a genuinely unresolved bed wav
 this weighting cannot hide the failure mode the diagnostic exists for. It is also
 exactly what the warning text already tells the reader to do by hand
 (`run.py:469`, *"check where the bed change actually is before acting"*).
+
+**Both halves of that argument survive as a description and fail as a trigger**, and
+§1.3 is why. The converse of "a cell that moves no bed contributes no error" is not
+true in the form the trigger would need: a cell can move a great deal of bed and read
+celerity **zero**, because `celerity_field` samples the flow at the activation instant
+and the flood that moved the bed has already passed (§5). The rain-sheet arm is that
+case at full size — 1.9e9 m³ moved, share 0.012. So the weighting is a good way to
+*describe* an activation and a dangerous way to *decide* whether to warn.
 
 ### 2.3 Cost
 
@@ -114,91 +200,82 @@ declare success on a bug. Gated directly: for an activation known to move the be
 the differenced field must sum to `applied_m3 / (A·(1−p))`, which is already computed
 beside it.
 
-### 2.4 The trigger
+### 2.4 The trigger — asked, answered, and then refuted by the measurement
 
-**Asked and answered — with a caveat that outranks the answer.** The user chose
-"quiet on a lone cell, plus the numbers". That question was posed on the premise that
-the peak is a lone guard cell, and §1.2 (written after the question was asked)
-says it is not: the in-regime peak is 8–16 across the whole run, so the demo is over
-the gate *where the transport is real*. **A filter of any kind therefore probably
-cannot reach "quiet"** — only moving `MORPH_COURANT_GATE` could, and §5 refuses that.
-The choice is recorded as the intended branch and the prediction against it is
-recorded beside it; the measurement in §3 step 1 settles which is right, and the user
-gets told before any code is written against either.
-
-If the quiet branch survives the measurement, the firing condition moves from
+**The user chose "quiet on a lone cell, plus the numbers".** That question was posed
+on the premise that the peak is a lone guard cell. §1.2 doubted the premise before
+the measurement; §1.3 destroyed it. **The trigger does not move.** The firing
+condition stays exactly
 
 ```
 peak_courant >= MORPH_COURANT_GATE
 ```
 
-to a share-based rule, and the message leads with the share and the cell count rather
-than the raw peak. `MORPH_COURANT_GATE = 1.0` is **unchanged** — the share is what is
-new, not the threshold — so nothing recalibrates the physics claim.
+and `MORPH_COURANT_GATE` stays 1.0. What lands is the second half of the user's
+answer — *plus the numbers* — in full.
 
-Two consequences, both real work and both in the build order:
+**Why, in one line each.** A share-based trigger cannot go quiet on the demo (0.495
+gross-weighted, 0.883 peak); a bed-weighted peak does not move the demo's headline at
+all (39 271 either way); and — decisively — **any threshold that quiets the demo also
+quiets the rain sheet**, which is the one configuration in the repo with no other
+symptom. Calibrating a constant until the demo goes quiet was already the named
+failure mode here, the mistake `test_clamp_ripple.py` was built to prevent during the
+scheduler pass (*"a gate calibrated by its measurement window"*). The measurement
+found something worse than an uncalibratable constant: a statistic that points the
+wrong way.
 
-1. **`test_a_scenario_over_the_morphological_courant_gate_warns` must be re-homed.**
-   It is built on `_sediment_bowl`, which transports at `h/d50 = 0.5` — a sheet
-   shallower than one grain. Its own docstring prescribes the remedy verbatim:
-   *"re-home them to channel flow then, do not weaken the assertions."* The
-   replacement is a small sub-grid-channel reach (M6 machinery, already available in
-   the test suite) driven over-Courant on purpose.
-2. **The share threshold is a new constant and must be justified, not picked — and
-   the prediction is that it cannot be.** The discriminating quantity is named here,
-   before it is measured, so the measurement can refute it: **the share of
-   `reach_alluvial`'s gross \|Δz\| sitting in cells over the gate.** §1.2 predicts
-   that share is **large** — not set by the lone guard cell at all, but by the 8–16
-   in-regime cells, which is where most of the bed change is. If that prediction
-   holds, **no choice of threshold reaches "quiet"**, because the demo is over the
-   gate exactly where the transport is real; the only thing that would silence it is
-   moving `MORPH_COURANT_GATE` itself, which §5 refuses. In that case the trigger
-   does **not** move, the new keys and the message change still land, and §1.2 becomes
-   the finding this pass carries. Calibrating the constant until the demo goes quiet
-   is the failure mode to avoid — it is the mistake `test_clamp_ripple.py` was built
-   to prevent during the scheduler pass (*"a gate calibrated by its measurement
-   window"*).
+**Two items this deletes from the build order rather than completing.**
+
+1. **`test_a_scenario_over_the_morphological_courant_gate_warns` is not re-homed.**
+   The re-homing existed only to stop a moved trigger from silencing a
+   `h/d50 = 0.5` fixture. The trigger did not move, so the test stays green on
+   `_sediment_bowl`, untouched. `_sediment_bowl`'s standing contingency is unspent.
+2. **There is no share threshold**, so there is no new constant to justify.
+
+**What the reader gets instead.** The warning keeps firing on the same condition and
+stops pretending the peak is a measurement of the reach: it leads with the in-regime
+peak and the over-gate cell count against the live cell count, and prints the raw
+peak as what it is. A reader who sees *"39 271 peak, but 19.4 over the 1400 cells the
+law applies to, and 578 of them over the gate"* can act; one who sees 39 271 alone
+learns to skip the line.
 
 ---
 
 ## 3. Build order
 
-1. **Measure before touching anything.** Instrument a throwaway script (not the
-   repo) that re-runs `reach_alluvial` and the celerity fixture and dumps, per
-   activation: raw peak Courant, the peak restricted to cells that moved, the
-   over-gate share, the cell count, and the submergence distribution. Record the
-   numbers. This produces the "before" column and settles §1.2.
-   - **Also settle the roadmap's stated blocker.** It claims a regime-aware
-     diagnostic *"would silently change what the Courant-3.30 fixture asserts."* The
-     fixture runs at `h ≈ 1.5 m` on `d50 = 8 mm` — `h/d50 ≈ 187`. Confirm the
-     distribution, and if it is as expected, **the stated reason for the deferral was
-     wrong** and the plan says so (the real blocker is `_sediment_bowl`, which the
-     roadmap never names).
-2. **Decision point.** With step 1's numbers: does the demo's bed change actually
-   concentrate in in-gate cells? If yes → move the trigger onto the share (the user's
-   choice). If no → the trigger stays where it is, the new keys and the message
-   change still land, and §1.2 becomes the finding this pass carries. **Write down
-   which branch was taken and why.**
+1. ~~**Measure before touching anything.**~~ **Done** — §1.3. A throwaway observer
+   (kept out of the repo, `M:\claud_projects\temp\morph-courant\measure.py`) wrapped
+   `MorphologyProcess.advance` across four runs. It also settled the roadmap's stated
+   blocker: **wrong**, and §1.3 finding 3 says why.
+2. ~~**Decision point.**~~ **Done — the trigger stays.** §2.4 records the branch and
+   the reason. The user's choice was refuted by the measurement it was scheduled to
+   be tested against, which is what the step existed for.
 3. **`solver/core/sediment.py`** — a small host helper beside `celerity_field` that
-   takes the celerity field and the activation's `Δz` field and returns the three
-   summary numbers. Pure numpy, no kernel, nothing in the physics reads it. It sits
-   here rather than in `morphology.py` because `celerity_field` and
+   takes the celerity field, the activation's `Δz` field, the interval and `dx`, and
+   returns the summary numbers. Pure numpy, no kernel, nothing in the physics reads
+   it. It sits here rather than in `morphology.py` because `celerity_field` and
    `MORPH_COURANT_GATE` already do, even though its `Δz` argument is a
    morphology-process concept — **the whole summary lives in one file either way**,
-   it is not split across the two.
+   it is not split across the two. `MORPH_REGIME_FLOOR` lands here too, and
+   `validation/test_morphology_gates.py` imports it instead of keeping its own copy.
 4. **`solver/processes/morphology.py`** — hold the previous `dz_cum` copy, difference
    it, populate the new record fields, keep `courant` byte-identical. Track the
-   companion peaks the way `_peak_courant` is tracked.
-5. **`solver/run.py`** — the warning: trigger per step 2, message leads with share +
-   cell count, still names `interval_s`, still prints unconditionally. Keep the
-   existing "check the bed against a longer interval" remedy — step 1 will have
-   re-confirmed it.
-6. **Tests.** Unit tests for the helper (a synthetic field with one hot cell that
-   moves nothing, and one with the bed change *in* the hot cells — the pair is the
-   argument, one arm alone passes by construction). The re-homed scenario-level
-   warning test if step 2 took the quiet branch. A test that the demo-shaped case —
-   one guard cell at a huge celerity — reports a share near zero.
-7. **The before/after run** (§4) and the docs.
+   companion peaks the way `_peak_courant` is tracked. **The `.copy()` is load-bearing
+   (§2.3)**, and the observer's own aliasing gate transfers directly: 1.4e-12 m³.
+5. **`solver/run.py`** — the warning: **trigger unchanged**, message leads with the
+   in-regime peak and the over-gate cell count, still names `interval_s`, still prints
+   unconditionally. Keep the "check the bed against a longer interval" remedy — step 1
+   re-confirmed it. The verbose `bed courant` line gains the same breakdown.
+6. **Tests.** Unit tests for the helper: one hot cell that moves no bed (so
+   `courant_moving` drops it while `courant` does not), one where the bed change *is*
+   in the hot cells (so nothing drops), and one below the regime floor (so
+   `courant_in_regime` drops it while the other two do not). The pair-or-better is
+   the argument; a single arm passes by construction. Plus a shape test that the
+   record and `.zattrs` carry the new keys, and that `courant` is unmoved.
+   **Not** a "demo-shaped case reports a share near zero" test — measured 0.495, so
+   that expectation was backwards.
+7. **The before/after run** (§4) and the docs — including the roadmap's item 3, whose
+   stated reason is now known to be false, and its headline figure.
 
 ---
 
@@ -210,19 +287,22 @@ Two consequences, both real work and both in the build order:
   the before run, gross volume identical, water mass residual identical, sediment
   residual identical. Not "within tolerance" — *identical*. If it is not, the change
   leaked into the physics and that is the whole finding.
-- The full suite green with **no gate's tolerance touched**. The scheduler pass set
-  the standard here: run the changed code against the untouched suite *first*, and
-  expect the only failures to be the tests this plan says are being re-homed. Any
-  other failure is a real one.
+  The baseline store for that comparison already exists: the §3 step 1 observer run
+  wrote one at `M:\claud_projects\temp\morph-courant\alluvial.zarr` under an unmodified
+  solver. Reproducing the recorded *figures* (168 557 m³, 2.66e-07, 4.21e-17) is
+  consistent but is **not** the byte comparison this bullet asks for.
+- The full suite green with **no gate's tolerance touched**, and — since §2.4 froze
+  the trigger — with **no test re-homed either**. The scheduler pass set the standard:
+  run the changed code against the untouched suite *first*. Here the bar is higher
+  than it was when this plan was written: **any failure at all is a real one.**
 - `test_an_interval_that_moves_the_bed_a_cell_per_activation_is_caught` still asserts
   exactly what it asserted, on an unmoved `courant` value. This is the fixture that
   proves the Courant gate and the celerity gate are not substitutes — it is the one
   thing this pass is most likely to damage silently.
 
-**The numbers table** (the deliverable of the pass): for `reach_alluvial`, raw peak /
-moving peak / over-gate share / cells over gate, before and after, alongside the
-already-measured 0.9% interval-halving sensitivity. Plus the same row for the
-re-homed over-Courant scenario, which must be loud on all four.
+**The numbers table** is §1.3, produced before any code changed. What the after-run
+must show is that the shipped helper reproduces those columns from inside the solver
+— same four runs, same figures — and that the `courant` column did not move.
 
 ---
 
@@ -236,7 +316,10 @@ re-homed over-Courant scenario, which must be loud on all four.
   reduction **every fast step**, which M7 build step 8 priced and refused for a
   diagnostic. Folding it in here would also make the before/after unreadable — the
   bed-weighted share and an interval maximum would move the same number for two
-  different reasons. **Still carried, deliberately.**
+  different reasons. **Still carried, deliberately** — and §1.3 raised its stakes: the
+  understatement is *why* the share points the wrong way on the rain sheet, so it is
+  no longer just an incompleteness, it is the reason a whole class of trigger is
+  unavailable.
 - **`c_b` stays a rigid-lid upper bound.** §1.2's mechanism is not fixed, it is
   documented. A slenderness-aware celerity is a change to the *reference* the
   celerity gate is measured against, which is a physics change with its own
@@ -245,6 +328,14 @@ re-homed over-Courant scenario, which must be loud on all four.
   that 3.3 is already broken *where the reference is valid*. Raising the constant to
   make the demo quiet would be calibrating a threshold by the answer it gives on one
   scenario — the opposite of what this pass is for.
-- **No relative-submergence guard anywhere**, for the reason in §2.1. If a future
-  pass wants one, `_sediment_bowl`'s docstring already states the contingency: the
-  tests built on it must be re-homed to channel flow, not weakened.
+- **No relative-submergence guard**, only a relative-submergence *report*. §2.1 says
+  where the line is: `MORPH_REGIME_FLOOR` is printed and stored, and nothing branches
+  on it. The moment anything does — a gate, a trigger, a clamp — M7 step 8's objection
+  returns in full, and `_sediment_bowl`'s docstring already states the contingency:
+  the tests built on it must be re-homed to channel flow, not weakened.
+- **The demo stays loud, and that is now the finding rather than the defect.** After
+  this pass `reach_alluvial` still prints a warning. What changes is that the warning
+  is legible: it says 19.4 over 1414 cells with 578 over the gate, not 39 271. The
+  remaining overstatement is §1.2's rigid-lid mechanism, which is a property of the
+  reference and is carried, in writing, in place of the vaguer *"the diagnostic
+  overstates"* the roadmap carried before.
