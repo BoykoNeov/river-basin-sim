@@ -27,11 +27,18 @@ extends Node3D
 ## Terrain is therefore built *from results* and rebuilt whenever they change (a run
 ## finishing can change the grid under us), not once in `_ready`.
 ##
-## Carried limitation: the water shader reconstructs the surface as `bed + depth`,
-## which is the M1 storage relation. With M6 sub-grid channels a channel cell's true
-## surface is `z - d + h*dx/w` below bank full, so the rendered sheet sits up to the
-## channel depth `d` high along the river. Terrain and water register; the *channel*
-## surface is still the floodplain approximation.
+## The **sub-grid channel geometry** travels the same way and for the same reason. The
+## shader used to reconstruct every surface as `bed + depth`, the M1 relation, which over
+## a river cell draws the sheet up to the bank-full depth `d` too high (2.74 m on the M6
+## demo). So `manifest["static"]` now ships `channel_width`/`channel_depth` too and the
+## shader takes the M6 storage curve where the water is overbank. Below bank full it
+## draws the **bank**, flat, rather than the true surface: that surface is *under* the
+## floodplain bed -- up to 2.46 m under it on the same demo -- and the rendered terrain
+## has no sub-grid trench to hold it, so drawing it there would hide the river inside the
+## ground. That residual is one-sided, measured by the export per run, and printed
+## (`_report_channel_surface`) for the same reason gap fill and a stale morphed bed are:
+## the picture has to be able to say what it is not. See
+## `docs/plans/viewer-channel-surface.md`.
 
 const TILES_SUBPATH := "data/tiles/demo"
 const RESULTS_SUBPATH := "data/results"
@@ -54,6 +61,15 @@ var _bed_from_results := false
 # Exported bed min/max from `manifest["static"]`, to check the *imported* surface
 # against. Zero when the results ship no bed.
 var _bed_range := Vector2.ZERO
+# Sub-grid channel geometry from `manifest["static"]` (M6 runs only): what lets the
+# shader take the storage curve instead of lifting every cell as `bed + depth`. False
+# for a run without channels, and then the water surface is the pre-M6 one exactly.
+var _has_channels := false
+var _chan_w_img: Image = null
+var _chan_d_img: Image = null
+# Depth-buffer offset for water drawn *at* the bank, metres. Not physics: an in-bank
+# surface is coplanar with the terrain, and coplanar surfaces z-fight.
+const BANK_BIAS := 0.05
 # M0 terrain-tile geometry (the fallback surface, and nothing else).
 var _grid_w := 0
 var _grid_h := 0
@@ -206,6 +222,9 @@ func _apply_geometry(bed: Image, w: int, h: int, dx: float) -> void:
 		# The shader lifts water by sampling the bed: it must be the *run's* bed, or
 		# the surface is reconstructed over elevations the solver never used.
 		_water_mat.set_shader_parameter("bed_tex", ImageTexture.create_from_image(bed))
+		# Bank full is `w*d/dx`, so the storage curve needs the cell size this grid was
+		# fitted at -- it belongs here with everything else the domain sets.
+		_water_mat.set_shader_parameter("cell_size", dx)
 	_fit_camera(w, h, dx)
 
 
@@ -225,6 +244,11 @@ func _build_water() -> void:
 	_water_mat.set_shader_parameter("h_dry", 0.001)
 	_water_mat.set_shader_parameter("depth_max", 1.0)
 	_water_mat.set_shader_parameter("flip_v", false)
+	# No channels until a results manifest ships them: the samplers are bound to 1x1
+	# zeros regardless, because an unbound sampler is undefined, not "off".
+	_set_channel_geometry(null, null)
+	_water_mat.set_shader_parameter("cell_size", _dx)
+	_water_mat.set_shader_parameter("bank_bias", BANK_BIAS)
 
 	_water = MeshInstance3D.new()
 	_water.name = "Water"
@@ -241,6 +265,26 @@ func _build_water() -> void:
 	)
 	_water.visible = false
 	add_child(_water)
+
+
+func _set_channel_geometry(w_img: Image, d_img: Image) -> void:
+	## Bind (or unbind) the sub-grid channel fields the shader takes the storage curve
+	## from. Pass nulls for a run without channels: the samplers are still bound, to 1x1
+	## zeros, because a zero width is what switches the shader back to `bed + depth` and
+	## an *unbound* sampler is undefined rather than off. Called on every results load,
+	## so a channel-free run loaded after a channelled one cannot inherit its river.
+	if _water_mat == null:
+		return
+	_has_channels = w_img != null and d_img != null
+	_chan_w_img = w_img
+	_chan_d_img = d_img
+	var blank := Image.create(1, 1, false, Image.FORMAT_RF)
+	blank.set_pixel(0, 0, Color(0.0, 0.0, 0.0, 1.0))
+	var wt := ImageTexture.create_from_image(w_img if _has_channels else blank)
+	var dt := ImageTexture.create_from_image(d_img if _has_channels else blank)
+	_water_mat.set_shader_parameter("chan_w_tex", wt)
+	_water_mat.set_shader_parameter("chan_d_tex", dt)
+	_water_mat.set_shader_parameter("has_channels", _has_channels)
 
 
 func _viridis_texture() -> ImageTexture:
@@ -284,6 +328,12 @@ func _load_results(manifest_path: String) -> void:
 	if _res_tiles.size() <= 1:
 		_res_tiles = []          # one file per frame -- the M2 path
 
+	# Sub-grid channel geometry, before the geometry is applied: `_apply_geometry` fits
+	# the water plane and sets `cell_size`, and the shader needs all three together or
+	# it evaluates bank full against the wrong cell size for one frame.
+	var chan := _read_results_channels()
+	_set_channel_geometry(chan[0], chan[1])
+
 	# The terrain is the run's own bed when the manifest ships one, which is the only
 	# surface that registers with the depth field on a mosaic/coarsened domain.
 	var run_bed := _read_results_bed()
@@ -307,6 +357,7 @@ func _load_results(manifest_path: String) -> void:
 				+ "%dx%d @ %.2fm -- re-export frames to ship the run's bed"
 				% [_grid_w, _grid_h, _dx])
 	_report_domain()
+	_report_channel_surface()
 	_report_morphology()
 
 	var gdepth: Dictionary = _manifest.get("global", {}).get("depth", {})
@@ -423,6 +474,47 @@ func _read_results_bed() -> Image:
 			and static_entry.get("tiles", {}).get("bed", []).is_empty():
 		return null
 	return _read_field_image(static_entry, "bed", "static bed")
+
+
+func _read_results_channels() -> Array:
+	## The run's sub-grid channel width/depth from `manifest["static"]`, as
+	## `[width, depth]`, or `[null, null]` when the run had no channels (or the export
+	## predates them). Same tile layout as the frames, so the same decoder reads them.
+	var static_entry: Dictionary = _manifest.get("static", {})
+	var fields: Array = static_entry.get("fields", [])
+	if not (fields.has("channel_width") and fields.has("channel_depth")):
+		return [null, null]
+	return [
+		_read_field_image(static_entry, "channel_width", "channel width"),
+		_read_field_image(static_entry, "channel_depth", "channel depth"),
+	]
+
+
+func _report_channel_surface() -> void:
+	## Say how the river is drawn, and by how much that is an approximation (M6/§7.3).
+	##
+	## Overbank water takes the exact storage curve; water still inside the channel is
+	## drawn at the **bank**, because its true surface is below the floodplain bed and
+	## the terrain carries no sub-grid trench. The export measures the resulting offset
+	## on the run's own frames, so the number is a property of this picture rather than
+	## a bound from the geometry. Same idiom as `_report_domain` / `_report_morphology`.
+	var chan: Dictionary = _manifest.get("static", {}).get("channel", {})
+	if chan.is_empty():
+		return
+	if not _has_channels:
+		# The manifest declares channels but the fields did not decode: the shader is
+		# lifting `bed + depth` over a river, which is exactly the old defect.
+		push_warning("River Basin viewer: manifest declares %d channel cells but the "
+			% int(chan.get("cells", 0))
+			+ "geometry did not load -- water over the river is drawn too high")
+		return
+	print("River Basin viewer: %d sub-grid channel cells (width <= %.1f m, bank-full "
+		% [int(chan.get("cells", 0)), float(chan.get("width_max_m", 0.0))]
+		+ "depth <= %.2f m); overbank water takes the storage curve, in-bank water is "
+		% float(chan.get("depth_max_m", 0.0))
+		+ "drawn at the bank -- up to %.2f m above its true surface on %d cells (frame %d)"
+		% [float(chan.get("in_bank_offset_m", 0.0)), int(chan.get("in_bank_cells", 0)),
+			int(chan.get("frame", -1))])
 
 
 func _report_domain() -> void:
@@ -703,19 +795,48 @@ func _verify_then_quit() -> void:
 		surface_ok = (relief >= 0.5 * (_bed_range.y - _bed_range.x)
 			and sampled.x >= _bed_range.x - tol and sampled.y <= _bed_range.y + tol)
 		against = "bed %.1f..%.1f m" % [_bed_range.x, _bed_range.y]
+	# And that a channelled run's river geometry actually reached the shader. The blank
+	# a failed tile read returns is the right *size*, so shape proves nothing here --
+	# count the channel cells and match the export's own count. Without this the water
+	# is silently lifted `bed + depth` over the river again, and no other check looks.
+	var chan: Dictionary = _manifest.get("static", {}).get("channel", {})
+	var chan_declared := int(chan.get("cells", 0))
+	var chan_decoded := _count_channel_cells()
+	var channels_ok := chan.is_empty() or (_has_channels and chan_decoded == chan_declared)
+	if not channels_ok:
+		push_error("River Basin viewer: manifest declares %d channel cells, decoded %d "
+			% [chan_declared, chan_decoded]
+			+ "(has_channels=%s) -- the river's surface is not the storage curve"
+			% _has_channels)
 	var terrain_ok := registered and surface_ok
 	if not terrain_ok:
 		push_error("River Basin viewer: terrain %dx%d @ %.2fm sampled %.1f..%.1f m does "
 			% [_terrain_w, _terrain_h, _terrain_dx, sampled.x, sampled.y]
 			+ "not match results %dx%d @ %.2fm / %s (bed_from_results=%s)"
 			% [_res_w, _res_h, _res_dx, against, _bed_from_results])
-	var pass_all := ok and wet > 0 and terrain_ok
+	var pass_all := ok and wet > 0 and terrain_ok and channels_ok
 	print("River Basin viewer: headless verify %s (frames=%d, wet_samples=%d, "
 		% ["OK" if pass_all else "FAIL", _frames.size(), wet]
-		+ "terrain=%dx%d @ %.2fm sampled %.1f..%.1f m vs %s, run_bed=%s)"
+		+ "terrain=%dx%d @ %.2fm sampled %.1f..%.1f m vs %s, run_bed=%s, "
 		% [_terrain_w, _terrain_h, _terrain_dx, sampled.x, sampled.y, against,
-			_bed_from_results])
+			_bed_from_results]
+		+ "channel_cells=%d/%d)" % [chan_decoded, chan_declared])
 	get_tree().quit(0 if pass_all else 1)
+
+
+func _count_channel_cells() -> int:
+	## Cells whose decoded width *and* depth are positive -- the same test the shader
+	## and `viewer_export` use for "this cell has a channel". Full scan: this runs once,
+	## in `--rbverify`, and an exact count is the point (a strided sample of a river two
+	## cells wide is a coin flip).
+	if _chan_w_img == null or _chan_d_img == null:
+		return 0
+	var n := 0
+	for y in range(_chan_w_img.get_height()):
+		for x in range(_chan_w_img.get_width()):
+			if _chan_w_img.get_pixel(x, y).r > 0.0 and _chan_d_img.get_pixel(x, y).r > 0.0:
+				n += 1
+	return n
 
 
 func _sampled_height_range() -> Vector2:

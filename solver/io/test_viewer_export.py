@@ -10,11 +10,13 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 import warp as wp
 import xarray as xr
 import zarr
 
-from solver.io.viewer_export import export_frames
+from solver.core.channels import eta_from_h
+from solver.io.viewer_export import export_frames, render_eta
 from solver.run import Scenario, run_simulation
 
 wp.init()
@@ -257,6 +259,191 @@ def test_a_still_bed_leaves_the_manifest_exactly_as_it_was(tmp_path):
     """No morphology, no note: an unarmed run's manifest is M6's, key for key."""
     manifest = json.loads((export_frames(_make_run(tmp_path), tmp_path / "f")).read_text())
     assert "morphology" not in manifest
+
+
+def _make_channel_run(tmp_path):
+    """A run with a sub-grid channel band down one column (M6 geometry, tiny grid).
+
+    A band rather than a uniform width, so "channel cell" and "floodplain cell" are
+    both present and the counts in the manifest mean something.
+    """
+    ny, nx = 16, 20
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    # A valley sloping north so water runs, with the channel down its floor.
+    bed = (0.4 * yy + 0.05 * (xx - nx / 2) ** 2).astype(np.float32)
+    width = np.zeros((ny, nx), dtype=np.float32)
+    depth = np.zeros((ny, nx), dtype=np.float32)
+    width[:, nx // 2] = 8.0  # dx = 20 -> a channel narrower than its cell
+    depth[:, nx // 2] = 1.0  # h_bf = 8*1/20 = 0.4 m of cell-mean depth
+    (tmp_path / "w.r32").write_bytes(width.astype("<f4").tobytes())
+    (tmp_path / "d.r32").write_bytes(depth.astype("<f4").tobytes())
+    scn = Scenario(
+        name="export_channels",
+        dx=20.0,
+        end_time=600.0,
+        output_every=150.0,
+        dt_max=5.0,
+        rain_mm_hr=150.0,
+        rain_duration=600.0,
+        channel_width_field=str(tmp_path / "w.r32"),
+        channel_depth_field=str(tmp_path / "d.r32"),
+    )
+    zarr_path = tmp_path / "chan.zarr"
+    run_simulation(scn, bed, zarr_path, device="cpu", verbose=False)
+    return zarr_path
+
+
+def test_the_drawn_surface_is_the_storage_curve_overbank_and_the_bank_below_it(tmp_path):
+    """`render_eta` is the renderable projection of the physical curve, and only that.
+
+    Above bank full it *is* `channels.eta_from_h`; below it, it draws the bank instead
+    of the true surface, which is under the floodplain bed on a terrain that carries no
+    sub-grid trench. The three properties that make it safe to render: it agrees with
+    the physics exactly overbank, it never draws *below* the true surface (the residual
+    is one-sided, so the manifest's single number bounds it), and it is continuous at
+    bank full so scrubbing a rising flood does not step.
+    """
+    dx = 20.0
+    z = np.full(9, 100.0)
+    w = np.full(9, 8.0)
+    d = np.full(9, 1.0)
+    h_bf = 8.0 * 1.0 / dx  # 0.4
+    h = np.array([0.0, 0.05, 0.2, 0.399, h_bf, 0.401, 0.6, 1.0, 3.0])
+
+    drawn = render_eta(h, z, w, d, dx)
+    true = eta_from_h(h, z, w, d, dx)
+    over = h > h_bf
+
+    assert np.allclose(drawn[over], true[over], rtol=0, atol=0)  # exact overbank
+    assert np.all(drawn[~over] == z[~over])  # the bank, flat
+    assert np.all(drawn >= true - 1e-12)  # one-sided: never below the true surface
+    # Continuous at bank full, from both sides.
+    assert drawn[3] == pytest.approx(drawn[5], abs=2e-3)
+    assert drawn[4] == z[4]
+    # The worst case is a barely-wet channel: drawn at the bank, truly a depth `d` down.
+    assert drawn[1] - true[1] == pytest.approx(d[1] - h[1] * dx / w[1], rel=1e-12)
+
+
+def test_a_cell_without_a_channel_is_drawn_exactly_as_before(tmp_path):
+    """No channel, no change: the M1 relation `z + h`, bit for bit.
+
+    This is what keeps every pre-M6 run's picture identical -- the same argument the
+    solver makes for its unarmed paths.
+    """
+    z = np.array([1.0, 250.0, -3.5])
+    h = np.array([0.0, 0.001, 2.25])
+    zeros = np.zeros(3)
+    assert np.array_equal(render_eta(h, z, zeros, zeros, 20.0), z + h)
+    # Half a channel is no channel (the solver normalises to w = d = 0, but a field pair
+    # read off an older store must not select the curve on width alone).
+    assert np.array_equal(render_eta(h, z, np.full(3, 8.0), zeros, 20.0), z + h)
+    assert np.array_equal(render_eta(h, z, zeros, np.full(3, 1.0), 20.0), z + h)
+
+
+def test_static_ships_the_channel_geometry_beside_the_bed(tmp_path):
+    """The viewer cannot tell a river cell from a floodplain cell without these.
+
+    Same static mechanism as the bed, same tile layout, same entry shape -- which is
+    what "anything the composite depends on travels through the manifest" means.
+    """
+    zarr_path = _make_channel_run(tmp_path)
+    out = tmp_path / "frames"
+    export_frames(zarr_path, out)
+
+    ds = xr.open_zarr(zarr_path, consolidated=False)
+    manifest = json.loads((out / "manifest.json").read_text())
+    static = manifest["static"]
+
+    assert static["fields"] == ["bed", "channel_width", "channel_depth"]
+    for name in ("channel_width", "channel_depth"):
+        got = np.fromfile(out / static["files"][name], dtype="<f4")
+        expected = ds[name].values.astype("<f4")
+        assert np.array_equal(got.reshape(expected.shape), expected)
+
+    chan = static["channel"]
+    w, d = ds["channel_width"].values, ds["channel_depth"].values
+    assert chan["cells"] == int(((w > 0) & (d > 0)).sum()) == 16  # one column of 16
+    assert chan["width_max_m"] == float(w.max()) == 8.0
+    assert chan["depth_max_m"] == float(d.max()) == 1.0
+    assert chan["dx_m"] == manifest["dx"]
+
+
+def test_channel_geometry_is_tiled_with_the_frame_layout(tmp_path):
+    """Tiled export: the channel fields ride the frames' tile grid, like the bed."""
+    zarr_path = _make_channel_run(tmp_path)
+    out = tmp_path / "frames_tiled"
+    export_frames(zarr_path, out, tile_size=8)
+
+    ds = xr.open_zarr(zarr_path, consolidated=False)
+    manifest = json.loads((out / "manifest.json").read_text())
+    tiles = manifest["tile_grid"]["tiles"]
+    static = manifest["static"]
+
+    assert static["files"] == {}
+    for name in ("bed", "channel_width", "channel_depth"):
+        names = static["tiles"][name]
+        assert len(names) == len(tiles)
+        expected = ds[name].values.astype(np.float32)
+        rebuilt = np.zeros(expected.shape, dtype=np.float32)
+        for t, fname in zip(tiles, names, strict=True):
+            block = np.fromfile(out / fname, dtype="<f4").reshape(t["height"], t["width"])
+            rebuilt[t["y"] : t["y"] + t["height"], t["x"] : t["x"] + t["width"]] = block
+        assert np.array_equal(rebuilt, expected)
+
+
+def test_the_manifest_measures_how_far_above_the_true_surface_the_river_is_drawn(tmp_path):
+    """The picture declares its own approximation, measured on the run's own frames.
+
+    Not bounded by `d`: a bound is a property of the geometry, this is a property of
+    this run's frames -- and it is taken over *all* of them, because the worst in-bank
+    cell is a barely-wet one and the last frame is not where the flood is.
+    """
+    zarr_path = _make_channel_run(tmp_path)
+    out = tmp_path / "frames"
+    export_frames(zarr_path, out)
+
+    ds = xr.open_zarr(zarr_path, consolidated=False)
+    manifest = json.loads((out / "manifest.json").read_text())
+    chan = manifest["static"]["channel"]
+
+    dx = float(manifest["dx"])
+    h_dry = float(manifest["h_dry"])
+    z = ds["bed"].values
+    w, d = ds["channel_width"].values, ds["channel_depth"].values
+    has = (w > 0) & (d > 0)
+    h_bf = np.where(has, w * d / dx, 0.0)
+
+    best = (0.0, 0, -1)
+    for i in range(manifest["n_frames"]):
+        h = ds["depth"].isel(time=i).values
+        in_bank = has & (h >= h_dry) & (h <= h_bf)
+        if not in_bank.any():
+            continue
+        gap = float((render_eta(h, z, w, d, dx) - eta_from_h(h, z, w, d, dx))[in_bank].max())
+        if gap > best[0]:
+            best = (gap, int(in_bank.sum()), i)
+
+    assert best[1] > 0, "fixture must wet the channel below bank full somewhere"
+    assert chan["in_bank_offset_m"] == pytest.approx(best[0], rel=1e-12)
+    assert chan["in_bank_cells"] == best[1]
+    assert chan["frame"] == best[2]
+    # The offset is real and bounded by the bank-full depth, which is what makes it a
+    # declaration rather than an alarm.
+    assert 0.0 < chan["in_bank_offset_m"] <= chan["depth_max_m"]
+
+
+def test_a_channel_free_run_ships_no_channel_geometry(tmp_path):
+    """No channels, no extra keys and no extra files: the M6 manifest, key for key."""
+    zarr_path = _make_run(tmp_path)
+    out = tmp_path / "frames"
+    export_frames(zarr_path, out)
+
+    manifest = json.loads((out / "manifest.json").read_text())
+    static = manifest["static"]
+    assert static["fields"] == ["bed"]
+    assert "channel" not in static
+    assert list(static["files"]) == ["bed"]
+    assert not any("channel" in p.name for p in out.iterdir())
 
 
 def test_untiled_export_bytes_are_unchanged_by_the_m6_export(tmp_path):

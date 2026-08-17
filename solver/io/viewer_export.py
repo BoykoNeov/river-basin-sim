@@ -42,6 +42,24 @@ cell size **by construction** rather than by two implementations agreeing.
 ``assemble_mosaic`` fills uncovered cells at the minimum covered elevation and
 rendering that is a flat plateau no one can tell from a bug.
 
+**So does the sub-grid channel geometry, and it does not buy the storage curve.**
+When the store carries ``channel_width``/``channel_depth`` (§7.2, M6) they ride along
+as static fields through the same mechanism, because without them a viewer cannot tell
+a river cell from a floodplain cell and has to lift every cell as ``bed + depth`` --
+which draws the surface along a river up to the bank-full depth `d` too high (measured:
+2.74 m on the M6 demo). What the viewer does with them is **not** the physical storage
+curve, and that is a measured decision rather than a shortcut: below bank full the true
+surface ``z - d + h·dx/w`` is *under* the floodplain bed -- up to 2.46 m under it on the
+same demo, on 1030 of 2232 channel cells -- and the rendered terrain has no trench to
+put it in, because the channel is sub-grid. Drawing it there hides the river inside the
+ground. So :func:`render_eta` is what the viewer draws: **above** bank full the exact
+curve (``z + (h - h_bf)``, which is where the old lift was wrong by up to ``h_bf``), and
+**below** it the bank itself, flat -- never above the terrain, never buried under it.
+The residual is then one-sided and measurable, so the export measures it on the run's
+own frames and ``manifest["static"]["channel"]`` declares it (``in_bank_offset_m``), the
+same way ``domain`` declares gap fill and ``morphology`` declares a stale bed: a picture
+has to be able to say what it is not. See ``docs/plans/viewer-channel-surface.md``.
+
 **A morphological run's bed is the one it started on.** ``bed`` in the canonical
 store is always the initial bed and M7's ``bed_change`` is not exported as frames
 (plan §1.7 -- terrain animation is a viewer milestone, and the shader's
@@ -72,6 +90,7 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 
+from solver.core.channels import eta_from_h
 from solver.core.grid import H_DRY
 
 # Frames larger than this in either dimension are split into a tile grid (M6). 512
@@ -83,6 +102,35 @@ DEFAULT_TILE_SIZE = 512
 # (deterministically) so memory stays bounded on large runs. Percentiles are
 # robust to this uniform thinning.
 _PCTL_SAMPLE_CAP = 4_000_000
+
+
+def render_eta(
+    h: np.ndarray,
+    z: np.ndarray,
+    w: np.ndarray,
+    d: np.ndarray,
+    dx: float,
+) -> np.ndarray:
+    """The water-surface elevation the **viewer draws** -- not the physical one.
+
+    The physical relation is :func:`solver.core.channels.eta_from_h`; this is the
+    renderable projection of it onto a terrain that has no sub-grid trench, and the
+    two differ *only* below bank full::
+
+        h >  h_bf :  z + (h - h_bf)     the exact storage curve
+        h <= h_bf :  z                  the bank, flat (true surface is below it)
+        no channel:  z + h              the M1 relation, bit for bit
+
+    Continuous at ``h = h_bf`` (both branches give ``z``) and monotone in ``h``, so
+    scrubbing a rising flood never steps. Kept here in host numpy because it is the
+    reference the GLSL in ``viewer/shaders/water_surface.gdshader`` is written from and
+    what :func:`_channel_note` measures the residual with -- one formula, two consumers,
+    which is the same reason M6's face geometry lives in one place.
+    """
+    h, z, w, d = (np.asarray(v, dtype=np.float64) for v in (h, z, w, d))
+    has = (w > 0.0) & (d > 0.0)
+    h_bf = np.where(has, w * d / dx, 0.0)
+    return np.where(has, z + np.maximum(h - h_bf, 0.0), z + h)
 
 
 def _robust_stats(wet: np.ndarray) -> dict:
@@ -146,8 +194,36 @@ def _write_field(
     return {"files": {}, "tiles": {field: names}}
 
 
-def _export_bed(ds, out_dir: Path, layout: list[dict], tiled: bool) -> dict | None:
-    """Export the store's static bed through the frame tile layout (viewer terrain).
+def _channel_geometry(ds) -> tuple[np.ndarray, np.ndarray] | None:
+    """The store's sub-grid channel width/depth (§7.2), or ``None`` if it has none.
+
+    Both or neither: ``run.py`` writes the pair together, and half of it cannot select
+    a branch of the storage curve.
+    """
+    if "channel_width" not in ds or "channel_depth" not in ds:
+        return None
+    return (
+        np.ascontiguousarray(ds["channel_width"].values, dtype="<f4"),
+        np.ascontiguousarray(ds["channel_depth"].values, dtype="<f4"),
+    )
+
+
+def _export_static(
+    ds,
+    out_dir: Path,
+    layout: list[dict],
+    tiled: bool,
+    channels: tuple[np.ndarray, np.ndarray] | None,
+) -> dict | None:
+    """Export the run's static fields through the frame tile layout (viewer terrain).
+
+    Always the bed -- the surface the run stepped on, which is what makes water and
+    terrain register (module docstring). Plus ``channel_width``/``channel_depth`` when
+    the run carried sub-grid channels, because a viewer that cannot tell a river cell
+    from a floodplain cell has to draw every cell the same way and gets the river up to
+    ``d`` too high. Every field goes through :func:`_write_field`, so the static entry
+    keeps exactly one payload shape and a channel-free run's manifest is unchanged, key
+    for key.
 
     Returns the ``manifest["static"]`` entry, or ``None`` for a store written before
     the bed was part of §7.2 (the viewer then falls back to the M0 terrain tile).
@@ -156,20 +232,61 @@ def _export_bed(ds, out_dir: Path, layout: list[dict], tiled: bool) -> dict | No
         return None
     bed = np.ascontiguousarray(ds["bed"].values, dtype="<f4")
     entry = _write_field(bed, out_dir, layout, field="bed", stem="bed", tiled=tiled)
-    entry["fields"] = ["bed"]
+    fields = ["bed"]
+    if channels is not None:
+        for name, arr in zip(("channel_width", "channel_depth"), channels, strict=True):
+            payload = _write_field(arr, out_dir, layout, field=name, stem=name, tiled=tiled)
+            entry["files"].update(payload["files"])
+            if "tiles" in payload:
+                entry.setdefault("tiles", {}).update(payload["tiles"])
+            fields.append(name)
+    entry["fields"] = fields
     entry["bed"] = {"min": float(bed.min()), "max": float(bed.max())}
     return entry
+
+
+def _channel_note(
+    channels: tuple[np.ndarray, np.ndarray],
+    offset: dict,
+    dx: float,
+) -> dict:
+    """Declare the channel geometry the picture uses **and** where it approximates.
+
+    ``in_bank_offset_m`` is how far above its true surface the drawn sheet sits on the
+    worst wet in-channel cell of the run -- the one place :func:`render_eta` knowingly
+    departs from the physics, because the true surface there is below a floodplain bed
+    the rendered terrain has no trench in. Measured on the run's own frames rather than
+    bounded by ``d``: a bound is a property of the geometry, this is a property of the
+    picture. Same species as ``manifest["morphology"]``, and for the same reason.
+    """
+    w, d = channels
+    has = (w > 0) & (d > 0)
+    return {
+        "cells": int(has.sum()),
+        "width_max_m": float(w.max()),
+        "depth_max_m": float(d.max()),
+        "dx_m": float(dx),
+        "in_bank_offset_m": offset["offset"],
+        "in_bank_cells": offset["cells"],
+        "frame": offset["frame"],
+        "note": (
+            "water below bank full is drawn at the bank: its true surface is under the "
+            "floodplain bed and the rendered terrain carries no sub-grid trench"
+        ),
+    }
 
 
 def _morphology_note(ds, last_frame: int) -> dict | None:
     """Declare that the exported bed is the *initial* one, when the run moved it.
 
     M7 ships ``bed_change (T, Y, X)`` in the canonical store but deliberately does
-    **not** animate the viewer's terrain (M7 plan §1.7): re-fitting the height map
-    per frame is a viewer milestone, and the carried debt makes it worse rather than
-    better -- the shader still lifts water as ``bed + depth`` instead of through the
-    sub-grid storage curve (§7.3 *Known gap*), so a moving bed would move that
-    mis-lift with it. Fix the lift first, then animate.
+    **not** animate the viewer's terrain (M7 plan §1.7): re-fitting the height map per
+    frame -- and with it the water plane, the bed texture and the registration check --
+    is a viewer milestone of its own. The lift that used to be the *other* reason is
+    fixed (:func:`render_eta`), so what remains is the animation, not a debt riding on
+    it: the curve's other input is ``channel_depth``, and M7 freezes the section (Exner
+    moves ``z`` and the invert ``z - d`` translates with it), so a moving bed leaves
+    ``d`` valid and only the terrain stale.
 
     What is *not* acceptable is a picture that quietly implies the terrain is
     current, which is the same failure the mosaic terrain fix was about. So a store
@@ -215,8 +332,9 @@ def export_frames(
 
     The store's static ``bed`` rides along through the same layout as
     ``manifest["static"]`` -- the surface the run actually stepped on, which after M6
-    is a mosaic and need not be any tile on disk. Returns the written
-    ``manifest.json`` path.
+    is a mosaic and need not be any tile on disk -- and so does the sub-grid channel
+    geometry when the run had any, because the viewer needs it to know which cells are
+    river (:func:`render_eta`). Returns the written ``manifest.json`` path.
     """
     zarr_path = Path(zarr_path)
     out_dir = Path(out_dir)
@@ -239,11 +357,42 @@ def export_frames(
     wet_samples: list[np.ndarray] = []
     global_max = 0.0
 
+    # Sub-grid channels change what the viewer draws, so the export both ships the
+    # geometry and measures where the drawing departs from the physics -- over every
+    # frame, because the worst in-bank cell is a barely-wet one and the last frame is
+    # not where the flood is (`_channel_note`).
+    dx = float(ds.attrs.get("dx", 1.0))
+    channels = _channel_geometry(ds) if field == "depth" else None
+    chan_offset = {"offset": 0.0, "cells": 0, "frame": -1}
+    if channels is not None:
+        chan_w, chan_d = channels
+        chan_has = (chan_w > 0) & (chan_d > 0)
+        chan_h_bf = np.where(chan_has, chan_w * chan_d / dx, 0.0)
+        chan_bed = np.asarray(ds["bed"].values, dtype=np.float64)
+
     for i in range(n_frames):
         arr = np.ascontiguousarray(ds[field].isel(time=i).values, dtype="<f4")
         payload = _write_field(
             arr, out_dir, layout, field=field, stem=f"f{i:04d}_{field}", tiled=tiled
         )
+
+        if channels is not None:
+            # Only below bank full does `render_eta` depart from `eta_from_h`, and it
+            # departs upward -- so the residual is the drawn surface minus the true one
+            # over wet in-channel cells, and it is one-sided by construction.
+            in_bank = chan_has & (arr >= h_dry) & (arr <= chan_h_bf)
+            if in_bank.any():
+                gap = (
+                    render_eta(arr, chan_bed, chan_w, chan_d, dx)
+                    - eta_from_h(arr, chan_bed, chan_w, chan_d, dx)
+                )[in_bank]
+                worst = float(gap.max())
+                if worst > chan_offset["offset"]:
+                    chan_offset = {
+                        "offset": worst,
+                        "cells": int(in_bank.sum()),
+                        "frame": i,
+                    }
 
         fmin, fmax = float(arr.min()), float(arr.max())
         global_max = max(global_max, fmax)
@@ -263,7 +412,7 @@ def export_frames(
     global_stats["max"] = global_max  # true max (percentile sampling never clips it)
 
     manifest = {
-        "dx": float(ds.attrs.get("dx", 1.0)),
+        "dx": dx,
         "crs": str(ds.attrs.get("crs", "")),
         "scheme": str(ds.attrs.get("scheme", "")),
         "coarsen": int(ds.attrs.get("coarsen", 1)),
@@ -276,8 +425,12 @@ def export_frames(
         "global": {field: global_stats},
         "frames": frames,
     }
-    static = _export_bed(ds, out_dir, layout, tiled)
+    static = _export_static(ds, out_dir, layout, tiled, channels)
     if static is not None:
+        if channels is not None:
+            # What the viewer draws over a river, and where that drawing is knowingly
+            # an approximation -- beside the geometry it is derived from, not in a log.
+            static["channel"] = _channel_note(channels, chan_offset, dx)
         manifest["static"] = static
     morphology = _morphology_note(ds, n_frames - 1)
     if morphology is not None:
