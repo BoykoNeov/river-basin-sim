@@ -761,6 +761,12 @@ sediment.
 
    - The **raw** peak Courant is 46 425, set by a *single* wetting-front cell — of
      1414 cells with nonzero celerity, exactly **one** sits below `h_col/d50 = 10`.
+
+     > **Re-measured 2026-08-17: the raw peak on this scenario is now 39 271, and up
+     > to 14 cells sit below `h_col/d50 = 10` rather than one.** The scheduler
+     > equal-steps and point-source compensation passes changed the step sequence, and
+     > a field maximum over a wetting front is the least reproducible statistic in the
+     > run. **Quote 39 271.** The in-regime figure below reproduces exactly (19.38).
    - The peak over cells the law applies to is still **19.4** (≥ 35) and steadily 8–16
      across the run, so the splitting is coarse even where the transport is real.
      Reaching Courant < 1 needs ~45 s, which §4 measures at a 14 mm depth ripple —
@@ -779,6 +785,19 @@ sediment.
    the warning (nothing else catches a genuinely unresolved bed wave, and the Courant-3.30
    fixture shows the celerity gate sails through one), and check the bed against a longer
    interval rather than trusting the number.
+
+   > **Closed 2026-08-17** (`morph-courant-diagnostic.md`), and this step's conclusion
+   > — keep the warning, check a longer interval — survived the pass intact. What the
+   > pass added is that **every filtered version of the number was measured and is
+   > worse**: weighting by where the bed moved leaves the peak unchanged (the guard
+   > cell moves bed), and a share-based trigger is *anti-correlated* with badness,
+   > reading 0.012 on a rain sheet moving 1.9e9 m³ against 0.495 on this well-formed
+   > demo. So the trigger and `MORPH_COURANT_GATE = 1.0` stand, and the run now prints
+   > the breakdown (`courant_in_regime`, `courant_cells`, `over_courant_share`, …)
+   > instead of leaving the reader to re-derive it. **The step-9 note below that a
+   > regime-aware version would move the Courant-3.30 fixture is wrong** — that fixture
+   > is at `h/d50 = 187` with zero guard cells, and its raw, bed-weighted and in-regime
+   > peaks are numerically identical.
 
    The comparison's own confound is named rather than hidden: halving `interval_s`
    halves the sync cadence too, so part of the 0.9% is the clamp artefact and not the
@@ -979,13 +998,17 @@ sediment.
    clean mosaic/channel regression. Dropping the rain turned out to be forced rather
    than tidy: see step 9.
 2. **`interval_s = 900` stays**, and the prediction in this bullet was wrong. Reach-scale
-   numbers did *not* land far under 1 — the demo runs at a raw peak of 46 425 and still
-   **19.4** over cells inside the law's range. The default survives because the bed was
+   numbers did *not* land far under 1 — the demo runs at a raw peak of 46 425 (**39 271**
+   since the 2026-08-17 scheduler and point-source passes) and still **19.4** over cells
+   inside the law's range. The default survives because the bed was
    asked directly instead: halving the interval changes gross bed volume by 0.9% and the
    channel-cell field by 4.1% rms (correlation 0.9992). The lesson is about the
    diagnostic, not the default — the morphological Courant number overstates the
    splitting error by more than an order of magnitude on this scenario, and a reach with
-   a wetting front will always have a cell that sets an alarming peak.
+   a wetting front will always have a cell that sets an alarming peak. **Addressed
+   2026-08-17**: the run now prints the in-regime peak and the over-gate cell count
+   beside it, so this is legible from the output rather than from this document
+   (`morph-courant-diagnostic.md`).
 3. **Viewer deferral confirmed**, as §1.7 has it: `bed_change` travels in the store and
    the frames export is unchanged (49 frames × 4 tiles + the `static` bed = 200 files,
    manifest coherent, `morphology` series recorded). No viewer leg was run, the same

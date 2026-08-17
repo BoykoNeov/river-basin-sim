@@ -15,6 +15,40 @@ A faithful research/education sandbox validated against benchmarks — **not a
 regulatory-certification tool**. State that honestly anywhere it matters.
 
 ## Status
+- **Morphological Courant diagnostic: done (2026-08-17).** The last finding carried out
+  of M7, and **the finding was wrong twice over** — which is most of what the pass
+  produced. The warning fires on `reach_alluvial` at **39 271** (not M7's 46 425; the
+  scheduler and point-source passes moved it) while halving `interval_s` changes the bed
+  0.9%. The carried item said a regime-aware filter *"would silently change what the
+  Courant-3.30 fixture asserts"*: **false** — that fixture runs at `h/d50 = 187`, minimum
+  **130** over transporting cells, **zero** cells below 10, and its raw, bed-weighted and
+  in-regime peaks are *numerically identical* on both arms. The real blocker was always
+  `_sediment_bowl` at `h/d50 = 0.5`, which the roadmap never named. **And filtering was
+  the wrong fix regardless.** Four instrumented runs: a share-based trigger cannot quiet
+  the demo (**0.495** of gross |Δz| in over-gate cells, peak 0.883); weighting the peak by
+  where the bed moved leaves it at **39 271, unchanged to every digit**, because the guard
+  cell *does* move bed; and the rain-sheet arm — the configuration `reach_alluvial` drops
+  rain to avoid, moving **1.9e9 m³** in a regime shallower than one grain — reads
+  **0.012**, an order of magnitude *below* the well-formed demo. **Every threshold that
+  quiets the demo also quiets that**, because a cell can move a great deal of bed and read
+  celerity zero (the flood that moved it has passed). So **the trigger and
+  `MORPH_COURANT_GATE = 1.0` are unchanged**, deliberately and after measurement. What
+  shipped is the breakdown: `courant_moving` / `courant_in_regime` / `over_courant_share`
+  / `courant_cells` / `live_cells` on every `BedChangeRecord` and in `.zattrs` (additive,
+  §7.2), computed by `sediment.courant_summary`, and a warning that reads *"39 271 peak,
+  19.38 over cells the law applies to, up to 578 of 1414 over the gate carrying up to 88%
+  of an activation's bed change"*. `MORPH_REGIME_FLOOR = 35.0` moves from validation into
+  `solver/core/sediment.py` — **the one new constant, and nothing branches on it**; the
+  moment something does, M7 step 8's objection returns. Verified as a pure observer:
+  `reach_alluvial` on CUDA **byte-identical** before and after in every array, `courant`
+  unmoved to every digit, `.zattrs` additive only. The `.copy()` on the `dz_cum` snapshot
+  is load-bearing and **CPU-only** (`warp.array.numpy()` copies on CUDA, lends a view on
+  CPU); its gate was checked by re-introducing the bug — one test fails, nothing else
+  notices. Suite run against the changed code *before* any test was added: **358 green,
+  zero failures**; **358 → 368** with the new ones. Carried onward in writing: `c_b` is a
+  **rigid-lid, fixed-discharge upper bound**, the celerity fixture enforces the
+  slenderness that validates it and a real basin does not — so the demo stays loud where
+  its transport is real. See `docs/plans/morph-courant-diagnostic.md`.
 - **Point-source compensation: done (2026-08-17).** The second of M7's two carried
   findings, and the last bare float32 `h += rate*dt` in the repo. Each `[[inflow]]`
   entry now carries its own Kahan compensation term through `sources.kahan_add`
@@ -110,11 +144,12 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   here, twenty times looser than the mass figures, so an unlabelled bed number invites
   a false "did not reproduce". **333 → 336 tests green.** **Two carried findings, both loud:**
   ~~the scheduler's sync-point `Δt` clamp degrades LI with *no gate able to see it*~~
-  (**fixed 2026-08-17**, see the scheduler pass above), and the morphological
+  (**fixed 2026-08-17**, see the scheduler pass above), and ~~the morphological
   Courant diagnostic overstates the splitting error by more than an order of magnitude
-  on a reach with a wetting front (peak 46 425 set by one cell of 1414; 19.4 even
-  in-range; yet halving `interval_s` moves the bed 0.9%). See
-  `docs/plans/M7-morphology.md`.
+  on a reach with a wetting front~~ (**addressed 2026-08-17**, see the diagnostic pass
+  above — the peak is now **39 271** on this demo, it still overstates, and the run now
+  *says* 19.38 over the cells the law applies to instead of leaving the reader to find
+  out). See `docs/plans/M7-morphology.md`.
 - **M6 — Reach: done (signed off on GPU + Godot, 2026-08-09).** Reach is bought by **choosing the
   resolution** and putting the lost river back, not by nesting grids. Three pieces:
   **`solver/io/mosaic.py`** makes the domain the whole **tile mosaic** (`[grid] tiles`
@@ -467,6 +502,28 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   a single 40 m cell that is a 34 m instantaneous column. Deliver over a *reach* (the
   `outlet` box), and sanity-check `Q · interval_s / (area · cells)` before believing a
   release-driven result.
+- **A warning that overstates is fixed by explaining it, not by filtering it — and the
+  obvious filter here points the wrong way. (2026-08-17.)** The morphological Courant
+  number is a **field maximum of a one-sided bound**, so on any run that advances a
+  wetting front it reports the wet/dry guard, not the reach: `reach_alluvial` peaks at
+  **39 271** while the peak over cells the transport law applies to is **19.38** and
+  halving `interval_s` moves the bed 0.9%. The tempting fixes were measured and all
+  three failed. Weighting the peak by *where the bed moved* changes it by nothing (the
+  guard cell moves bed — 39 271 either way). A share-based trigger cannot go quiet
+  (0.495 of gross |Δz| sits in over-gate cells). And the share is **anti-correlated
+  with badness**: the rain-sheet configuration that moves **1.9e9 m³** in a regime
+  shallower than one grain reads **0.012**, *below* the well-formed demo, because a
+  cell can move a great deal of bed and read celerity zero — `celerity_field` samples
+  at the activation instant and the flood that moved the bed has already passed. **So
+  every threshold that quiets the demo also quiets the worst run in the repo.** The
+  trigger and `MORPH_COURANT_GATE = 1.0` therefore stand, and the run prints the
+  breakdown instead (`courant_moving` / `courant_in_regime` / `over_courant_share` /
+  `courant_cells` / `live_cells`, `sediment.courant_summary`). Two things to carry:
+  **a "peak" that is a field max over a divergent law is a guard reading, so give it a
+  denominator before believing it**; and when a diagnostic is loud on the good run,
+  check what your proposed filter says about the *bad* run before shipping it. Related
+  and still true: **do not shorten `interval_s` on this warning's say-so** — check the
+  bed against a *longer* interval first. See `docs/plans/morph-courant-diagnostic.md`.
 - **A distributed source is an accumulator, and float32 accumulators need
   compensating.** A rain-on-grid run adds `rate*dt` to every cell, every step: at reach
   scale that used to drift a *closed* domain past the gate with nothing wrong in the

@@ -66,9 +66,30 @@ Detailed per-milestone plans live alongside this file as `M<n>-*.md`.
    fixture's mass residual reads as noise (0.8× / 2.8× / 7.0×) — so the gates are on
    accumulation, not on a stepped run's mass balance. See
    `point-source-compensation.md`.
-3. **The morphological Courant diagnostic overstates the error, and cannot be filtered
-   without moving a load-bearing gate.** On the M7 demo it peaks at 46 425 (one wetting-
-   front cell of 1414) and still reads 19.4 over in-range cells, while halving the
-   interval changes the bed by 0.9%. Making it regime-aware would silently change what
-   the Courant-3.30 fixture asserts — the only evidence that the Courant and celerity
-   gates are not substitutes — so it wants its own commit and its own before/after.
+3. ~~**The morphological Courant diagnostic overstates the error, and cannot be filtered
+   without moving a load-bearing gate.**~~ **Done 2026-08-17** — and the finding as
+   carried was wrong twice over, which is most of what the pass produced.
+   **The stated blocker was false.** Making the diagnostic regime-aware would *not*
+   have changed what the Courant-3.30 fixture asserts: that fixture runs at
+   `h/d50 = 187`, its minimum over transporting cells is 130, it has zero cells below
+   10, and its raw, bed-weighted and in-regime peaks are numerically **identical** on
+   both arms. The real blocker was always `_sediment_bowl` at `h/d50 = 0.5`, which this
+   item never named.
+   **And filtering was the wrong fix anyway.** Measured across four runs: a share-based
+   trigger cannot quiet the demo (0.495 gross-weighted), weighting the peak by where
+   the bed moved leaves it at 39 271 unchanged (the guard cell moves bed), and —
+   decisively — the *rain-sheet* configuration that transports 1.9e9 m³ in a regime
+   shallower than one grain reads a share of **0.012**, an order of magnitude *below*
+   the well-formed demo. **Every threshold that quiets the demo also quiets that.** So
+   `MORPH_COURANT_GATE` and the trigger are **unchanged**; what shipped is the
+   breakdown beside the peak (`courant_moving`, `courant_in_regime`,
+   `over_courant_share`, `courant_cells`, `live_cells`, all additive in `.zattrs`) and
+   a warning that reads *"39 271 peak, 19.38 over the cells the law applies to, up to
+   578 of 1414 over the gate"*. Verified as a pure observer: `reach_alluvial` on CUDA
+   **byte-identical** before and after in every array, with `courant` unmoved to every
+   digit. **358 → 368 tests green.** The headline is **39 271**, not the 46 425 this
+   item carried — the scheduler and point-source passes moved it. Carried onward, in
+   writing rather than vaguely: `c_b` is a **rigid-lid, fixed-discharge upper bound**,
+   the celerity fixture *enforces* the slenderness that makes it valid and a real basin
+   does not, so the demo stays over the gate where its transport is real. See
+   `morph-courant-diagnostic.md`.

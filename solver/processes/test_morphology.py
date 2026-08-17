@@ -361,6 +361,88 @@ def test_the_celerity_diagnostic_takes_the_larger_of_its_two_components():
     assert (both[0] == only_fp[0]).all(), "off-channel rows are untouched by either"
 
 
+def test_the_per_activation_bed_change_is_a_copy_and_not_the_array_warp_lends_back():
+    """The one bug in this pass that would announce itself as success.
+
+    ``advance`` snapshots ``dz_cum`` before the Exner launch so it can difference the
+    bed change *this* activation applied. On the CPU backend ``warp.array.numpy()``
+    returns a **view** of the array's own storage, so a snapshot taken without
+    ``.copy()`` is rewritten by the launch, differences to zero everywhere, and every
+    companion diagnostic then reports that no bed moved near the gate -- which is
+    exactly the reading a reader of this pass is hoping for.
+
+    So the gate is stated on the aliased failure directly rather than on a tolerance:
+    on an activation that moved bed, at least one cell must register as having moved.
+    Measured the same way on the M7 demo through an external observer, the differenced
+    field reproduced the record's own ``applied_m3`` to 1.4e-12 m^3.
+    """
+    st, morph = _armed()
+    _run(st, 30)
+    rec = morph.advance(60.0, 60.0)
+
+    # Gross, not net: bedload cannot cross a boundary face, so a closed reach's signed
+    # `applied_m3` is structurally ~zero however much bed it moved -- the same argument
+    # that makes the sediment ledger's scale the *gross* displaced volume.
+    assert np.abs(st.sediment.dz_cum.numpy()).max() > 0.0, "the fixture moved no bed at all"
+    assert rec.courant > 0.0, "... and it must be transporting, or every peak is zero"
+    assert rec.courant_moving > 0.0, "the snapshot aliased dz_cum: no cell registered as moved"
+    assert rec.live_cells > 0
+
+
+def test_the_companion_reductions_are_bounded_by_the_number_they_accompany():
+    """They are the same field reduced over subsets, so nothing can exceed the peak.
+
+    Cheap, and it is the invariant that catches a mask applied to the wrong array or
+    an interval scaled twice -- either of which would otherwise look like a plausible
+    number in the ``.zattrs`` and be read as physics.
+    """
+    st, morph = _armed()
+    _run(st, 30)
+    rec = morph.advance(60.0, 60.0)
+
+    assert 0.0 <= rec.courant_moving <= rec.courant
+    assert 0.0 <= rec.courant_in_regime <= rec.courant
+    assert 0.0 <= rec.over_courant_share <= 1.0
+    assert 0 <= rec.courant_cells <= rec.live_cells <= st.grid.shape[0] * st.grid.shape[1]
+    # ... and every one of them travels into the store, since `.zattrs` is where a
+    # finished run's morphology history is read from (§7.2, additive).
+    assert set(morph.series[-1]) >= {
+        "courant",
+        "courant_moving",
+        "courant_in_regime",
+        "over_courant_share",
+        "courant_cells",
+        "live_cells",
+    }
+    assert morph.series[-1]["courant"] == rec.courant
+
+
+def test_the_run_level_breakdown_reads_the_peaks_and_not_the_last_activation():
+    """The warning line quotes maxima over the run, the way ``peak_courant`` does.
+
+    Mixing a peak with a snapshot in one sentence is a small lie that is very hard to
+    spot in output, so the two are pinned to move together.
+    """
+    st, morph = _armed()
+    for _ in range(3):
+        _run(st, 20)
+        morph.advance(60.0, 60.0)
+
+    # **The fixture must discriminate, or the rest of this test is decoration.** If
+    # every activation reported the same figures, "the maximum is in the string" would
+    # pass whether the implementation read the peaks or the last record. It does not:
+    # this closed reach drains, so the three activations read 84, 42 and 0 live cells
+    # and the peak is the *first* one. Asserted rather than assumed, because a future
+    # change to `_state`/`_run` could quietly flatten it.
+    assert len({r.live_cells for r in morph.records}) > 1, "the fixture stopped varying"
+    assert max(r.live_cells for r in morph.records) != morph.records[-1].live_cells
+
+    assert morph.peak_courant == max(r.courant for r in morph.records)
+    line = morph.courant_breakdown()
+    assert f"{max(r.courant_in_regime for r in morph.records):.2f}" in line
+    assert f"of {max(r.live_cells for r in morph.records)} cells" in line
+
+
 def test_it_advances_on_the_scheduler_like_any_other_slow_process():
     st, morph = _armed()
     proc = morph.as_slow_process()

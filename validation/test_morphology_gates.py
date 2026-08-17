@@ -40,7 +40,12 @@ from solver.core.channels import arm_channels
 from solver.core.grid import H_DRY
 from solver.core.local_inertial import compute_dt, step
 from solver.core.massbalance import MASS_GATE, SEDIMENT_GATE, MassLedger, SedimentLedger
-from solver.core.sediment import SHIELDS_CRITICAL, arm_sediment, shields_from_flow
+from solver.core.sediment import (
+    MORPH_REGIME_FLOOR,
+    SHIELDS_CRITICAL,
+    arm_sediment,
+    shields_from_flow,
+)
 from solver.core.state import State
 from solver.io.config import Inflow
 from solver.processes.inflow import InflowInjector
@@ -214,7 +219,12 @@ def test_the_gate_scenarios_transport_inside_the_laws_range():
 # as the only variable.
 
 _DEMO_D50 = 0.008  # m, the demo's grain size
-_REGIME_FLOOR = 35.0  # h_col/d50; the lowest relative submergence the step-8 gates run at
+# h_col/d50; the lowest relative submergence the step-8 gates run at. It used to be
+# defined here. It now lives beside the transport law it qualifies
+# (`solver.core.sediment.MORPH_REGIME_FLOOR`), because the Courant diagnostic reports
+# an in-regime peak alongside its field maximum -- one constant, one definition, and
+# still nothing in the solver *branches* on it.
+_REGIME_FLOOR = MORPH_REGIME_FLOOR
 
 
 def _channel_reach(ny: int = 48, nx: int = 9, dx: float = 100.0):

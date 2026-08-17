@@ -441,6 +441,7 @@ def run_simulation(
                 f"  bed courant   : {morphology.peak_courant:.2f} peak  "
                 "(> 1 is a splitting artefact)"
             )
+            print(f"                  {morphology.courant_breakdown()}")
     if ledger.max_rel_error >= MASS_GATE:
         print(f"  WARNING: mass-balance gate exceeded ({ledger.max_rel_error:.2e})")
     if sed_ledger is not None and sed_ledger.max_rel_error >= SEDIMENT_GATE:
@@ -464,10 +465,20 @@ def run_simulation(
             f"  WARNING: morphological Courant {morphology.peak_courant:.2f} exceeds "
             f"{MORPH_COURANT_GATE:.0f} -- the bed wave crosses more than a cell per "
             f"activation, so the bed change is a splitting artefact. [sediment] "
-            f"interval_s is {scenario.sediment_interval_s:g} s; check the bed against a "
-            f"longer interval before shortening this one, since the peak is a field "
-            f"maximum and a single cell at the wet/dry guard can set it -- check where "
-            f"the bed change actually is before acting."
+            f"interval_s is {scenario.sediment_interval_s:g} s. In context: "
+            f"{morphology.courant_breakdown()}."
+        )
+        # The remedy, kept separate from the number so it survives being skimmed. It
+        # says "check a longer interval" rather than "shorten this one" because the
+        # peak is a **field maximum of a one-sided bound** and overstates by orders of
+        # magnitude on any run with a wetting front: measured on the M7 demo, 39 271
+        # peak against 19.4 over the cells the law applies to, while halving
+        # `interval_s` moved the bed 0.9%. The breakdown above is what makes that
+        # judgeable from the output instead of by re-running.
+        print(
+            "           the peak is a field maximum, so a single cell at the wet/dry "
+            "guard can set it; check the bed against a *longer* interval before "
+            "shortening this one, and see docs/plans/morph-courant-diagnostic.md."
         )
     return ledger
 

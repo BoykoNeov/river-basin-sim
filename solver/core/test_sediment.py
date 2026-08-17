@@ -25,6 +25,8 @@ import warp as wp
 from solver.core.friction import manning_denominator, manning_denominator_radius
 from solver.core.grid import GRAVITY, H_DRY
 from solver.core.sediment import (
+    MORPH_COURANT_GATE,
+    MORPH_REGIME_FLOOR,
     MPM_COEFFICIENT,
     SHIELDS_CRITICAL,
     SUBMERGED_SG,
@@ -35,7 +37,9 @@ from solver.core.sediment import (
     arm_sediment,
     bed_celerity,
     capacity_from_flow,
+    celerity_field,
     clear_transport_integral,
+    courant_summary,
     exner_update,
     face_capacity,
     kinematic_shear,
@@ -43,6 +47,7 @@ from solver.core.sediment import (
     rebuild_bed,
     shields_from_flow,
     shields_number,
+    submergence_field,
 )
 from solver.core.state import State
 
@@ -811,3 +816,138 @@ def test_clearing_the_integral_keeps_the_compensation_debt_through_the_state():
     assert (sed.qs_int_x.numpy() == 0.0).all()
     assert (sed.qs_int_y.numpy() == 0.0).all()
     assert (sed.qs_comp_x.numpy() == np.float32(1e-9)).all()
+
+
+# --- the Courant summary: one number reduced four ways -------------------------
+#
+# What is under test here is the **reduction**, not the law: `bed_celerity` has its
+# own finite-difference check above, and `celerity_field` is exercised by every
+# morphology scenario. These build a reach whose cells are deliberately in different
+# regimes and then ask which cells each figure listened to.
+
+
+def _two_speed_reach(dx: float = 50.0, d50: float = 0.008):
+    """A 1x3 reach: one deep in-regime cell, one guard cell, one dead cell.
+
+    Cell 0 is 1 m deep on 8 mm grain -- 125 diameters, comfortably inside MPM's
+    range. Cell 1 is 2 mm deep, which is above ``H_DRY`` and so counts as wet, but
+    is a quarter of one grain diameter: the wetting-front cell every dry-start
+    scenario has, where ``tau/rho ~ q^2/h^(7/3)`` diverges and the celerity with it.
+    Cell 2 is dry. The point of the fixture is that cell 1 is **hotter by orders of
+    magnitude** while describing no bedload transport anyone should quote.
+    """
+    st = State.from_bed(np.zeros((1, 3), np.float32), dx=dx, manning=0.03, device=DEV)
+    arm_sediment(st, d50, 0.4)
+    st.h.assign(np.array([[1.0, 0.002, 0.0]], np.float32))
+    # qx is face-shaped (ny, nx+1); a cell's centred discharge is the mean of its two
+    # bounding faces, so a pair of equal faces gives that cell exactly that q.
+    st.qx.assign(np.array([[2.0, 2.0, 0.2, 0.2]], np.float32))
+    return st
+
+
+def test_the_guard_cell_is_the_field_maximum_and_the_reach_is_two_orders_below_it():
+    """The premise of the whole diagnostic pass, as arithmetic rather than prose."""
+    st = _two_speed_reach()
+    cel = celerity_field(st)
+    sub = submergence_field(st)
+
+    assert cel[0, 2] == 0.0, "a dry cell has no bed wave"
+    assert sub[0, 0] > MORPH_REGIME_FLOOR > sub[0, 1], "the fixture is not in two regimes"
+    assert cel[0, 1] > 1e5 * cel[0, 0], "the guard cell should dominate by orders"
+    assert float(cel.max()) == cel[0, 1]
+
+
+def test_the_peak_ignores_where_the_bed_moved_and_the_companions_do_not():
+    """Arm one: the bed moves *only* in the cell the law applies to.
+
+    ``courant`` still reports the guard cell, because it is a field maximum and that
+    is what it has always meant. ``courant_moving`` and ``courant_in_regime`` both
+    fall to the reach's own number -- for different reasons, which arm three separates
+    -- and no bed change sits in an over-gate cell, so the share is exactly zero.
+    """
+    st = _two_speed_reach()
+    dz = np.array([[1e-3, 0.0, 0.0]])  # scour in the deep cell only
+    cs = courant_summary(st, dz, 900.0)
+    cour = celerity_field(st) * 900.0 / 50.0
+
+    assert cs.courant == pytest.approx(cour[0, 1]), "the peak is still the field maximum"
+    assert cs.courant_moving == pytest.approx(cour[0, 0])
+    assert cs.courant_in_regime == pytest.approx(cour[0, 0])
+    assert cs.over_courant_share == 0.0
+    assert cs.courant_cells == 1 and cs.live_cells == 2
+    # ... and the reach's own number is under the gate, so this activation's bed
+    # change is resolved even though the headline reads six figures.
+    assert cs.courant_in_regime < MORPH_COURANT_GATE < cs.courant
+
+
+def test_bed_change_in_the_hot_cell_is_not_filtered_out_by_weighting():
+    """Arm two, and the arm that refutes the tempting fix.
+
+    Weighting by "where the bed moved" is only a filter while the hot cell moves no
+    bed. It usually does -- measured over the M7 demo's 96 activations, the peak
+    restricted to cells that moved is **39 271.12**, the same number to every digit as
+    the unrestricted peak. So ``courant_moving`` is recorded as an honest companion,
+    not as a fix, and this test is what stops it being sold as one.
+    """
+    st = _two_speed_reach()
+    dz = np.array([[0.0, 1e-3, 0.0]])  # this time the guard cell is what moved
+    cs = courant_summary(st, dz, 900.0)
+
+    assert cs.courant_moving == cs.courant, "weighting cannot drop a hot cell that moves bed"
+    assert cs.over_courant_share == pytest.approx(1.0)
+    # The regime figure is unmoved between the two arms: it does not care where the
+    # bed went, only which cells the transport law describes. That independence is
+    # why the two companions are not redundant.
+    assert cs.courant_in_regime == pytest.approx(
+        courant_summary(st, np.array([[1e-3, 0.0, 0.0]]), 900.0).courant_in_regime
+    )
+
+
+def test_the_in_regime_peak_can_be_over_the_gate_too_which_is_the_demo_s_condition():
+    """Arm three: the filter is not a way of making the warning go away.
+
+    Stretch the interval and the deep cell crosses the gate on its own merits. This
+    is `reach_alluvial`'s actual condition -- peak 39 271, in-regime peak 19.4, and
+    **both** over a gate of 1 -- and it is why the run still warns on ``courant``
+    after this pass rather than on any filtered version of it.
+    """
+    st = _two_speed_reach()
+    dz = np.array([[1e-3, 0.0, 0.0]])
+    cs = courant_summary(st, dz, 90_000.0)
+
+    assert cs.courant_in_regime > MORPH_COURANT_GATE
+    assert cs.courant_cells == 2 and cs.live_cells == 2
+    assert cs.over_courant_share == pytest.approx(1.0)
+
+
+def test_an_activation_that_moved_no_bed_reports_no_share_rather_than_dividing_by_zero():
+    """Gross zero is the ordinary case before the first grain moves, not an error."""
+    st = _two_speed_reach()
+    cs = courant_summary(st, np.zeros((1, 3)), 900.0)
+
+    assert cs.over_courant_share == 0.0
+    assert cs.courant_moving == 0.0  # nothing moved, so there is nothing to reduce over
+    assert cs.courant > 0.0 and cs.courant_cells == 1
+
+
+def test_the_summary_reports_courant_exactly_as_the_gated_number_was_computed():
+    """The one figure with assertions on it must not shift by a ULP (plan §2.1).
+
+    Three tests read ``courant`` straight out of the record or ``.zattrs``, one of
+    them as a *lower* bound. This asserts the identity the implementation relies on:
+    the headline is still ``morphological_courant`` applied to the field maximum, not
+    the maximum of a pre-scaled field.
+    """
+    st = _two_speed_reach()
+    cs = courant_summary(st, np.zeros((1, 3)), 137.0)
+    celerity = float(celerity_field(st).max())
+
+    assert cs.celerity_m_s == celerity
+    assert cs.courant == morphological_courant(celerity, 137.0, 50.0)
+
+
+def test_a_state_with_no_sediment_says_so_rather_than_reporting_zeros():
+    """A regime figure off an unarmed state would be a quiet zero, not an answer."""
+    st = State.from_bed(np.zeros((1, 3), np.float32), dx=50.0, device=DEV)
+    with pytest.raises(SedimentError, match="arm_sediment"):
+        submergence_field(st)

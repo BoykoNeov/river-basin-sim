@@ -64,9 +64,8 @@ import warp as wp
 from solver.core.local_inertial import compute_eta, compute_eta_channels
 from solver.core.sediment import (
     SedimentError,
-    celerity_field,
+    courant_summary,
     exner_update,
-    morphological_courant,
     rebuild_bed,
 )
 from solver.core.state import State
@@ -131,6 +130,15 @@ class BedChangeRecord:
     dz_max_m: float
     celerity_m_s: float  # fastest bed wave anywhere in the domain, at this instant
     courant: float  # ... as cells crossed per interval; > 1 is a splitting artefact
+    # The same Courant number reduced three more ways, because one field maximum of a
+    # one-sided bound cannot describe a reach (:class:`~solver.core.sediment.CourantSummary`).
+    # Companions, never substitutes: `courant` above is unchanged and is still what
+    # the run warns on and what the validation suite asserts.
+    courant_moving: float  # peak over cells that carried bed change this activation
+    courant_in_regime: float  # peak over cells the transport law actually applies to
+    over_courant_share: float  # fraction of this activation's gross |dz| over the gate
+    courant_cells: int  # cells over the gate ...
+    live_cells: int  # ... out of the cells transporting at all
 
     def as_dict(self) -> dict:
         return {
@@ -143,6 +151,11 @@ class BedChangeRecord:
             "dz_max_m": self.dz_max_m,
             "celerity_m_s": self.celerity_m_s,
             "courant": self.courant,
+            "courant_moving": self.courant_moving,
+            "courant_in_regime": self.courant_in_regime,
+            "over_courant_share": self.over_courant_share,
+            "courant_cells": self.courant_cells,
+            "live_cells": self.live_cells,
         }
 
 
@@ -178,6 +191,11 @@ class MorphologyProcess:
         self.name = name
         self.records: list[BedChangeRecord] = []
         self._peak_courant = 0.0
+        self._peak_moving = 0.0
+        self._peak_in_regime = 0.0
+        self._peak_over_share = 0.0
+        self._peak_courant_cells = 0
+        self._peak_live_cells = 0
 
         shape = state.grid.shape
         if (dz_lo is None) != (dz_hi is None):
@@ -230,7 +248,15 @@ class MorphologyProcess:
                 "mass balance -- so it would not show up as an error anywhere else"
             )
         st, sed, g = self.state, self.sediment, self.state.grid
-        before = float(sed.dz_cum.numpy().sum())
+        # **The .copy() is load-bearing**, and it fails in the direction of the answer
+        # a reader is hoping for. On the CPU backend `warp.array.numpy()` hands back a
+        # view of the array's own storage, so without it this snapshot would be
+        # rewritten by the Exner launch below, difference to zero everywhere, and make
+        # every companion diagnostic read "no bed moved anywhere near the gate".
+        # Gated in `solver/test_morphology.py` by requiring the differenced field to
+        # reproduce `applied_m3`, which is computed independently just below.
+        prev_dz = sed.dz_cum.numpy().copy()
+        before = float(prev_dz.sum())
 
         wp.launch(
             exner_update,
@@ -252,9 +278,15 @@ class MorphologyProcess:
         solid = g.cell_area * (1.0 - sed.porosity)
         dz = sed.dz_cum.numpy()
         cumulative = float(dz.sum())
-        celerity = float(celerity_field(st).max())
-        courant = morphological_courant(celerity, dt_slow, g.dx)
-        self._peak_courant = max(self._peak_courant, courant)
+        # `dz - prev_dz` is what this activation applied, which is what the companion
+        # reductions weight by; the cumulative field is what the record reports.
+        cs = courant_summary(st, dz - prev_dz, dt_slow)
+        self._peak_courant = max(self._peak_courant, cs.courant)
+        self._peak_moving = max(self._peak_moving, cs.courant_moving)
+        self._peak_in_regime = max(self._peak_in_regime, cs.courant_in_regime)
+        self._peak_over_share = max(self._peak_over_share, cs.over_courant_share)
+        self._peak_courant_cells = max(self._peak_courant_cells, cs.courant_cells)
+        self._peak_live_cells = max(self._peak_live_cells, cs.live_cells)
         rec = BedChangeRecord(
             time=float(t),
             interval_s=float(dt_slow),
@@ -263,8 +295,13 @@ class MorphologyProcess:
             banked_m3=float(sed.dz_unapplied.numpy().sum()) * solid,
             dz_min_m=float(dz.min()),
             dz_max_m=float(dz.max()),
-            celerity_m_s=celerity,
-            courant=courant,
+            celerity_m_s=cs.celerity_m_s,
+            courant=cs.courant,
+            courant_moving=cs.courant_moving,
+            courant_in_regime=cs.courant_in_regime,
+            over_courant_share=cs.over_courant_share,
+            courant_cells=cs.courant_cells,
+            live_cells=cs.live_cells,
         )
         self.records.append(rec)
         return rec
@@ -292,8 +329,31 @@ class MorphologyProcess:
         rather than a result -- the analogue of M5's *"54,000 m^3 into one 40 m cell
         is a 34 m column"*. Recorded here at every activation; **gating** it against
         a scenario is M7 build step 8.
+
+        **Read it beside :meth:`courant_breakdown`.** This is a field maximum of a
+        one-sided bound, and on any run that advances a wetting front it reports the
+        wet/dry guard rather than the reach -- 39 271 against 19.4 on the M7 demo,
+        whose bed is nonetheless right to 0.9% when the interval is halved. It is
+        still what the run warns on and what the validation suite asserts,
+        deliberately and *after* measuring the alternatives
+        (``docs/plans/morph-courant-diagnostic.md`` §2.4): every filtered version of
+        this number is quieter on a run that is far worse than this one.
         """
         return self._peak_courant
+
+    def courant_breakdown(self) -> str:
+        """One line of context for :attr:`peak_courant`, for the run's own output.
+
+        Every figure in it is a maximum over activations and says so, because that is
+        what :attr:`peak_courant` is; mixing a peak with a snapshot would be its own
+        small lie.
+        """
+        return (
+            f"{self._peak_in_regime:.2f} over cells the law applies to, "
+            f"up to {self._peak_courant_cells} of {self._peak_live_cells} cells over "
+            f"the gate carrying up to {100 * self._peak_over_share:.0f}% of an "
+            f"activation's bed change"
+        )
 
     @property
     def series(self) -> list[dict]:

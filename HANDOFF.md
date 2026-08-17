@@ -579,11 +579,16 @@ capping the request by what the source holds, and sanity-check
   change accumulated in float64 and the bed rebuilt (not incremented) at each activation;
   a channel face transports through its own section. Sediment carries its own ledger, and
   because bedload cannot cross a boundary face its balance is scaled on gross displaced
-  volume rather than net. Two findings outlive it: the scheduler's sync-point `Δt` clamp
-  degrades local-inertial with no gate able to see it (mass stays at 1e-8 while the water
-  sits in the wrong places), and the morphological Courant diagnostic overstates the
-  splitting error by more than an order of magnitude on any reach with a wetting front.
-  Neither is fixed here; both are measured.*
+  volume rather than net. Two findings outlived it, and **both are now closed** (both
+  2026-08-17): the scheduler's sync-point `Δt` clamp degraded local-inertial with no gate
+  able to see it — fixed by filling each span with equal steps — and the morphological
+  Courant diagnostic overstated the splitting error by more than an order of magnitude on
+  any reach with a wetting front. The second closed as a **diagnostic** change, not a
+  physics one: the number is a field maximum of a rigid-lid upper bound, every filtered
+  alternative was measured to be quieter on a *worse* run than on the demo, so the gate
+  and the trigger stand and the run reports the breakdown beside the peak. The
+  overstatement itself is a property of the analytical reference and is carried in
+  writing.*
 
 ---
 

@@ -829,6 +829,57 @@ def morphological_courant(celerity: float, interval_s: float, dx: float) -> floa
     return float(celerity) * float(interval_s) / float(dx)
 
 
+# How many grain diameters deep the flow must be before MPM is being read inside its
+# range. Not a gate and not a guard: **nothing branches on it** -- it selects which
+# cells a *reported* number is reduced over (`courant_summary`), and no kernel, no
+# clamp and no assertion in the solver reads it. That restriction is the whole reason
+# it can exist here at all. M7 build step 8 refused a relative-submergence guard
+# because `solver/test_run.py::_sediment_bowl` transports at `h/d50 = 0.5`, so a guard
+# would have held several tests green for a second, unrelated reason. A number that is
+# printed cannot hold anything green. The moment something branches on this constant,
+# that objection returns in full and `_sediment_bowl`'s docstring states the remedy.
+#
+# 35 is the lowest relative submergence the M7 step-8 gates run at; it came from
+# `validation/test_morphology_gates.py`, which now imports it from here rather than
+# keeping a second copy.
+MORPH_REGIME_FLOOR = 35.0
+
+
+def column_depth_field(state) -> np.ndarray:
+    """Host copy of the M6 storage curve: the depth the transport law actually sees.
+
+    A sub-grid channel stands its cell's water ``dx/w`` deeper than the cell mean, so
+    reading a channel cell's regime off ``h`` calls a 1.6 m river a 0.11 m sheet. The
+    device-side truth is :mod:`solver.core.channels`; this is the same curve host-side,
+    written once and used by both :func:`celerity_field` and
+    :func:`submergence_field` so the two cannot drift apart.
+    """
+    g = state.grid
+    h = state.h.numpy().astype(np.float64)
+    chan = state.channels
+    if chan is None:
+        return h
+    w = chan.w.numpy().astype(np.float64)
+    d = chan.d.numpy().astype(np.float64)
+    has = (w > 0.0) & (d > 0.0)
+    w_safe = np.where(has, w, 1.0)
+    h_bf = w_safe * d / g.dx
+    return np.where(has, np.where(h <= h_bf, h * g.dx / w_safe, d + (h - h_bf)), h)
+
+
+def submergence_field(state) -> np.ndarray:
+    """Per-cell relative submergence ``h_col / d50`` -- how many grains deep the flow is.
+
+    Zero where there is no grain size, which is also how :func:`celerity_field` treats
+    those cells, so the two masks agree.
+    """
+    sed = state.sediment
+    if sed is None:
+        raise SedimentError("submergence_field requires arm_sediment(); nothing is armed")
+    d50 = sed.d50.numpy().astype(np.float64)
+    return np.where(d50 > 0.0, column_depth_field(state) / np.where(d50 > 0.0, d50, 1.0), 0.0)
+
+
 def celerity_field(state) -> np.ndarray:
     """Per-cell bed-wave celerity (m/s) from the flow the state is carrying *now*.
 
@@ -885,8 +936,7 @@ def celerity_field(state) -> np.ndarray:
     w_safe = np.where(has, w, 1.0)
     # The M6 storage curve, host-side (solver.core.channels.column_depth): below bank
     # full the cell's water is all in the channel and stands dx/w deeper than the mean.
-    h_bf = w_safe * d / g.dx
-    h_col = np.where(h <= h_bf, h * g.dx / w_safe, d + (h - h_bf))
+    h_col = column_depth_field(state)
     q_ch = centred(chan.qx_ch.numpy().astype(np.float64), chan.qy_ch.numpy().astype(np.float64))
     wet_ch = has & (h_col >= H_DRY) & grain_ok & (q_ch > 0.0)
     c_ch = bed_celerity(
@@ -904,3 +954,89 @@ def celerity_field(state) -> np.ndarray:
     # hard select would report exactly zero for a channel cell whose channel happens
     # to be still, which for a warning diagnostic is the wrong way to be wrong.
     return np.maximum(np.where(has & wet_ch, c_ch, 0.0), c_fp)
+
+
+@dataclass(frozen=True)
+class CourantSummary:
+    """The morphological Courant number, reduced four ways over one activation.
+
+    Why four. ``courant`` alone is a **field maximum of a one-sided bound**, and on
+    every shipped scenario it reports the wet/dry guard rather than the reach: MPM's
+    shear diverges as ``h -> H_DRY``, a dry-start run always advances a wetting front,
+    and so there is always a cell whose celerity is enormous and whose flow no bedload
+    law describes. Measured on ``scenarios/reach_alluvial.toml``: peak **39 271**,
+    against **19.4** over the 1414 cells at ``h_col/d50 >= MORPH_REGIME_FLOOR``, while
+    halving ``interval_s`` moves the bed 0.9%. One number cannot say that; four can.
+
+    **None of them is a gate and none of them is filtered for one.** The trigger in
+    :mod:`solver.run` still fires on ``courant``, unchanged, and
+    ``MORPH_COURANT_GATE`` is still 1.0 -- see ``docs/plans/morph-courant-diagnostic.md``
+    §2.4 for the measurement that closed the alternative. In short: a share-based
+    trigger is *anti-correlated* with badness, because a cell can move a great deal of
+    bed and read celerity zero (the flood that moved it has already passed), so the
+    worst configuration in the repo -- a rain sheet transporting 1.9e9 m3 in a regime
+    shallower than one grain -- reads a **lower** share than the well-formed demo.
+    Every threshold that would quiet the demo also quiets that.
+    """
+
+    celerity_m_s: float  # fastest bed wave anywhere, at the activation instant
+    courant: float  # ... as cells crossed per interval. The gated number; unchanged.
+    courant_moving: float  # peak over cells that carried bed change this activation
+    courant_in_regime: float  # peak over cells the transport law applies to
+    over_courant_share: float  # fraction of this activation's gross |dz| over the gate
+    courant_cells: int  # how many cells are over the gate -- "one cell" reads as one
+    live_cells: int  # ... out of how many are transporting at all
+
+    def as_dict(self) -> dict:
+        return {
+            "celerity_m_s": self.celerity_m_s,
+            "courant": self.courant,
+            "courant_moving": self.courant_moving,
+            "courant_in_regime": self.courant_in_regime,
+            "over_courant_share": self.over_courant_share,
+            "courant_cells": self.courant_cells,
+            "live_cells": self.live_cells,
+        }
+
+
+def courant_summary(state, dz: np.ndarray, interval_s: float) -> CourantSummary:
+    """Reduce this activation's celerity field against the bed change it applied.
+
+    ``dz`` is the bed change **this activation** applied (metres, signed), not the
+    cumulative field -- the caller differences ``dz_cum`` around the Exner launch, and
+    must hand over a copy rather than the array ``warp`` lends it (see
+    :meth:`solver.processes.morphology.MorphologyProcess.advance`).
+
+    Pure host numpy over a few field copies, called once per *activation* (900 s of
+    simulated time by default), and deliberately not a kernel: nothing in the physics
+    reads any of it.
+
+    ``courant`` is computed exactly as it was before this function existed --
+    ``morphological_courant(celerity_field(state).max(), ...)`` -- so the number three
+    assertions read straight out of the record is byte-identical.
+    """
+    g = state.grid
+    cel = celerity_field(state)
+    celerity = float(cel.max())
+    courant = morphological_courant(celerity, interval_s, g.dx)
+    # Elementwise, for the filtered reductions only. Monotone in `cel`, so its maximum
+    # *is* `courant`; the line above is kept as the definition anyway, because the one
+    # number with assertions on it should not depend on that argument being right.
+    cour = cel * float(interval_s) / float(g.dx)
+
+    absdz = np.abs(np.asarray(dz, dtype=np.float64))
+    gross = float(absdz.sum())
+    live = cel > 0.0
+    moved = absdz > 0.0
+    in_regime = live & (submergence_field(state) >= MORPH_REGIME_FLOOR)
+    over = cour >= MORPH_COURANT_GATE  # the run's own trigger semantics, not `>`
+
+    return CourantSummary(
+        celerity_m_s=celerity,
+        courant=courant,
+        courant_moving=float(cour[moved].max()) if moved.any() else 0.0,
+        courant_in_regime=float(cour[in_regime].max()) if in_regime.any() else 0.0,
+        over_courant_share=float(absdz[over].sum() / gross) if gross > 0.0 else 0.0,
+        courant_cells=int(over.sum()),
+        live_cells=int(live.sum()),
+    )

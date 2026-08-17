@@ -295,6 +295,8 @@ learns to skip the line.
   the trigger — with **no test re-homed either**. The scheduler pass set the standard:
   run the changed code against the untouched suite *first*. Here the bar is higher
   than it was when this plan was written: **any failure at all is a real one.**
+  Run that way: **358 green, zero failures**, before a single test was added.
+  Then **358 → 368** with the new ones.
 - `test_an_interval_that_moves_the_bed_a_cell_per_activation_is_caught` still asserts
   exactly what it asserted, on an unmoved `courant` value. This is the fixture that
   proves the Courant gate and the celerity gate are not substitutes — it is the one
@@ -303,6 +305,68 @@ learns to skip the line.
 **The numbers table** is §1.3, produced before any code changed. What the after-run
 must show is that the shipped helper reproduces those columns from inside the solver
 — same four runs, same figures — and that the `courant` column did not move.
+
+### 4.1 What the after-run showed
+
+**Bit-for-bit, `reach_alluvial` on CUDA, before against after:**
+
+| array | verdict |
+|---|---|
+| `bed`, `bed_change`, `depth`, `u`, `v`, `time`, `channel_width`, `channel_depth` | **identical**, byte for byte |
+
+`.zattrs`: no key added or removed at the top level; every pre-existing key of every
+one of the 96 `morphology` records **unmoved**; five keys added, which is what §7.2
+means by additive. `courant` peak **39 271.11710132237** before and after — every
+digit. Mass **2.66e-07**, sediment **4.21e-17**, bed **168 557.3 m³**, all unchanged.
+
+The one attribute that differs is `provenance.source_toml`, and it differs because
+the two runs were invoked with an absolute and a relative `--config` path. Nothing to
+do with the change; recorded here rather than filtered out of the comparison script,
+because a comparison that quietly drops the one thing that differed is not a
+comparison.
+
+**The shipped helper reproduces the external observer exactly** — peak 39 271.12,
+in-regime peak 19.38, up to 578 of 1414 cells over the gate, max share 0.883.
+
+**CPU**: the byte comparison above is CUDA-only, because the step-1 baseline store is
+a CUDA run. On CPU the run reproduces its recorded figures instead. That is the
+weaker claim and is stated as such — but note the trap in §2.3 is a **CPU-only**
+failure mode (`warp.array.numpy()` copies on CUDA and lends a view on CPU), so the
+test that gates it, `test_the_per_activation_bed_change_is_a_copy_and_not_the_array_warp_lends_back`,
+runs on the backend where it can actually fire. Verified by re-introducing the bug:
+that test fails with *"the snapshot aliased dz_cum"* and nothing else in the suite
+notices — which is exactly why it exists.
+
+---
+
+## 4.2 What a reader of the demo now sees
+
+Before — one number, and it is the wrong one:
+
+```
+  bed courant   : 39271.12 peak  (> 1 is a splitting artefact)
+  WARNING: morphological Courant 39271.12 exceeds 1 -- ... check where the bed
+  change actually is before acting.
+```
+
+After — the same trigger, on the same number, with the reach beside the guard:
+
+```
+  bed courant   : 39271.12 peak  (> 1 is a splitting artefact)
+                  19.38 over cells the law applies to, up to 578 of 1414 cells
+                  over the gate carrying up to 88% of an activation's bed change
+  WARNING: morphological Courant 39271.12 exceeds 1 -- ... In context: 19.38 over
+  cells the law applies to, up to 578 of 1414 cells over the gate carrying up to
+  88% of an activation's bed change.
+           the peak is a field maximum, so a single cell at the wet/dry guard can
+           set it; check the bed against a *longer* interval before shortening
+           this one, and see docs/plans/morph-courant-diagnostic.md.
+```
+
+The old message *told* the reader to go and check where the bed change was. It now
+says. And the 88% is the honest half of the story: this reach really is over the gate
+where its transport is, which is §1.2, and is why the remedy line points at a longer
+interval rather than a shorter one.
 
 ---
 
