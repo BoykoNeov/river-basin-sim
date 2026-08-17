@@ -100,12 +100,15 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   `scenarios/reach_alluvial.toml` — the M6 basin flood-driven instead of storm-driven —
   moves **167 043 m³** of bed with peak scour/fill **−228/+257 mm**, mass **9.22e-8 CPU /
   5.53e-8 CUDA**, sediment **5.5e-17 / 4.1e-17**, the two backends agreeing to 1.05e-4 in
-  volume and 0.990 mm in the field. Since the scheduler pass: bed **168 563 m³** (+0.9%,
-  inside the interval-halving sensitivity) and mass **5.45e-7 CPU / 4.79e-7 CUDA** — a
+  volume and 0.990 mm in the field. Since the scheduler pass: bed **168 563 m³ CUDA /
+  168 911 m³ CPU** (+0.9%, inside the interval-halving sensitivity) and mass
+  **5.45e-7 CPU / 4.79e-7 CUDA** — a
   systematic ~9×, and the reason point-source compensation is now a carried item (see
   the gotcha below). Since point-source compensation that mass roughly halves on both
-  backends, **2.14e-7 CPU / 2.66e-7 CUDA**, with the bed at **169 999 m³** (CPU) and
-  sediment **5.19e-17**. **333 → 336 tests green.** **Two carried findings, both loud:**
+  backends, **2.14e-7 CPU / 2.66e-7 CUDA**, with the bed at **170 000 m³ (CPU)** and
+  sediment **5.19e-17**. Quote bed volumes with their backend: the two agree to ~2e-3
+  here, twenty times looser than the mass figures, so an unlabelled bed number invites
+  a false "did not reproduce". **333 → 336 tests green.** **Two carried findings, both loud:**
   ~~the scheduler's sync-point `Δt` clamp degrades LI with *no gate able to see it*~~
   (**fixed 2026-08-17**, see the scheduler pass above), and the morphological
   Courant diagnostic overstates the splitting error by more than an order of magnitude
@@ -145,8 +148,9 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   2232 channel cells, mass **7.21e-8** on CPU / **1.60e-7** on the 5090 (was 2.79e-7 /
   3.08e-7 before the precision pass; **6.07e-8 / 5.95e-8** since the scheduler pass;
   **6.10e-8 / 6.00e-8** since point-source compensation — marginally *worse* on both
-  backends, which is the noise floor, not a regression: its inflow lands on floodplain
-  and rain is what wets this run). **234 tests green.** M6's loud carried finding — the
+  backends, which is the noise floor, not a regression; the measured argument for that
+  is the sign flip on `reservoir_release`, and the likely reason it lands here is that
+  this run's inflow is on floodplain and rain is what wets it). **234 tests green.** M6's loud carried finding — the
   same demo at `coarsen = 4` exceeding the gate — **is fixed**: see the precision pass
   below. See `docs/plans/M6-reach.md`.
 - **Precision pass — compensated areal sources: done (2026-08-09).** The first of M6's two

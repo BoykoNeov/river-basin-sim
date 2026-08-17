@@ -190,10 +190,19 @@ compensation swapped. Scenarios with no `[[inflow]]` construct no injector at al
 | `reach_alluvial` (M7) | CUDA | 4.79e-07 | **2.66e-07** |
 | `reach_alluvial` (M7) | CPU | 5.45e-07 | **2.14e-07** |
 
-**Every "uncompensated" arm reproduces its recorded figure exactly** — 1.84e-08,
+**Every "uncompensated" arm reproduces its recorded *mass* figure exactly** — 1.84e-08,
 1.51e-07, 2.38e-07, 1.30e-07, 5.95e-08, 6.07e-08, 4.79e-07, 5.45e-07 are the numbers
 `CLAUDE.md` carried from the scheduler pass, to the digit. Nothing else in the tree or the data drifted,
 so the deltas are the injector's and only the injector's.
+
+One number in this batch looks like an exception and is not. `reach_alluvial`'s
+uncompensated **bed volume** on CPU reads 168 911 m³ against the 168 563 m³ `CLAUDE.md`
+carried — 2.1e-3 apart, twenty times looser than anything in the table above. That
+recorded figure is the **CUDA** one: it comes from `scheduler-equal-steps.md` §8.5,
+whose A/B table pairs it with the 4.79e-07 mass residual that `CLAUDE.md` labels CUDA,
+and the two backends only ever agreed to ~1e-4 in bed volume against ~1e-9 in mass.
+Both are labelled with their backend now. The reproduces-exactly claim is about the
+mass column, which is the column this pass moves.
 
 ### 4.1 Two scenarios got marginally worse, and that is the noise, not a regression
 

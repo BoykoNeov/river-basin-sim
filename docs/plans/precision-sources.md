@@ -81,6 +81,21 @@ scenarios carrying no rain at all — `reservoir_release.toml` among them, whose
 figures were signed off the same day. If point-source compensation is worth having,
 it is a separate change with its own re-measurement.
 
+> **Resolved 2026-08-17 — and the ~1.3% was the part that did not survive.** Point
+> sources are compensated now (`solver/processes/inflow.py`, per-entry Kahan through
+> `sources.kahan_add`). The last paragraph held: it was a separate change with its own
+> re-measurement. The *evidence* did not. That 1.3% was measured on a **rain-driven**
+> run, where an areal source over every cell swamps four point cells, and it does not
+> transfer to a flood-driven one: on `reach_alluvial`, which has no rain at all, a
+> float64 probe around each injection launch found the uncompensated add putting
+> **+1.215 m³** more into the field than the ledger banked, against **−0.000093 m³**
+> compensated. The lesson for this doc is narrower than "we were wrong": **a percentage
+> attribution is only valid on the run it was measured on**, and the other terms in the
+> denominator were the thing that changed. The arming decision here still stands —
+> inflow's compensation is owned by the injector rather than by `State.h_comp`, exactly
+> so that no rain-free scenario moves onto a different areal-source path.
+> See `point-source-compensation.md`.
+
 **The compensated kernel keeps launching at `rain == 0`.** Once the storm stops it
 runs with a zero increment, which repays the outstanding compensation into `h`
 instead of stranding it. That matters: the outstanding debt is bounded by half an
@@ -184,7 +199,9 @@ writing → done`, 13 frames, no Windows file-handoff race), at 2.59e-08.
   reach-demo case. Reaching below it means compensating continuity, which is a much
   larger change to the hot kernel of both schemes and is not justified by anything
   measured yet.
-- **Point sources.** See §2.
+- ~~**Point sources.** See §2.~~ **Done 2026-08-17** — and it took the total residual
+  on `reach_alluvial` from 4.79e-07 to 2.66e-07 and no further, which is how the
+  flux-divergence floor above was confirmed to be the rest. See §2's resolution note.
 - **The `η = h + z` conditioning problem.** A different float32 hazard with a
   different fix (`[grid] datum`, M5) — a centimetre sheet on a bed at altitude loses
   `h` inside the sum. Compensation does not help there and the datum shift is still
