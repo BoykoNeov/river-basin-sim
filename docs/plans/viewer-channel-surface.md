@@ -134,10 +134,17 @@ bank rather than in a trench that is not there.
   `RB_CAM_AT` override in `_fit_camera`, deliberately not committed). Before/after differ
   on **0.29 %** of pixels in the river view and **0.05 %** at whole-basin altitude, and
   the changed pixels trace the river margins and nothing else: the fix is where the
-  channel is, the render is otherwise untouched, and no z-fighting speckle appeared along
-  the bank. A 1–3 m offset over a 76.8 km scene is nearly invisible from the default
+  channel is, the render is otherwise untouched.
+  A 1–3 m offset over a 76.8 km scene is nearly invisible from the default
   camera, which is why this survived M6 and M7 — "no symptom" meant no instrument again.
   The transect in §1 is what makes it legible.
+- **`bank_bias` at the camera the viewer actually opens at.** In-bank water is now drawn
+  *coplanar* with the terrain, and the default `reach_basin` camera runs `near = 100`,
+  `far = 307200` — a 3000:1 clip ratio, which is where 5 cm might not clear. Tested on the
+  basin-altitude pair rather than assumed: of the 463 changed pixels **93 %** have a
+  changed 8-neighbour (mean 2.30) and they trace the river's course as a connected line
+  across the frame. Z-fighting scatters isolated pixels over the whole coplanar area; this
+  does not, and the flooded plain either side is untouched.
 - **Full loop `--rblaunch` green** end to end on the demo, `mass_max_rel_err=2.30e-08` —
   the scheduler pass's figure, unchanged, and the Windows `os.replace` handoff race did
   not fire with two more static files in the export.
