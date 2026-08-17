@@ -57,12 +57,25 @@ network from **27** rook-connected pieces into **64**, because the trunk those
 tributaries hung from is no longer a channel. Off by default -- the cutoff is a choice
 and this module will not make it silently.
 
-*A D8 network can dead-end inside the domain.* The conditioning leaves 95 cells in this
-raster with no flow direction (pysheds' ``-2`` outlet / ``-1`` nodata / ``0`` pit), and
-the largest of them carries **1262 km²** onto a 292-cell flat at 530.5 m in the middle
-of the M0 window. Accumulation restarts at 1 below it, so the derived river simply stops
-there. :func:`drainage_check` finds those components and :func:`route_report` answers
-whether a scenario's inflow and outflow cells are in the same piece of river.
+*A D8 network can dead-end inside the domain.* The conditioning leaves cells with no
+flow direction at all -- pysheds writes ``-1`` for a **flat** it could not resolve,
+``-2`` for a **pit**, and ``0`` for nodata (its ``flowdir(..., flats=-1, pits=-2)``
+defaults; the codes are easy to get backwards and were, in this module, until the full
+mosaic was measured). Across the whole conditioned raster there are 14 482 such cells,
+of which **100 are interior and in valid data**: 91 pits and 9 flats. The largest
+carries **1262.5 km²** and sits at ``[1052, 1125]`` at 530.5 m. Accumulation restarts
+at 1 below it, so the derived river simply stops there, and **39.1 % of the domain's
+valid cells drain to one of those 100** rather than out of the raster.
+
+They are **artefacts of the conditioning chain, not closed basins in the terrain**: on
+the *raw* bed all 100 have a lower neighbour, and on the filled surface 91 are
+single-cell pits whose rim stands as little as 1 mm above them. Nor are they cheaply
+fixable -- pysheds' own ``fill_pits`` (which raises those 91 cells by up to 1.28 m)
+takes the stranded share to 23.6 %, and a further ``resolve_flats`` pass to 20.1 %, so
+iterating the primitives converges slowly and not to zero.
+
+:func:`drainage_check` finds those components and :func:`route_report` answers whether
+a scenario's inflow and outflow cells are in the same piece of river.
 
 CLI::
 
@@ -302,6 +315,35 @@ def connectivity_report(width: np.ndarray) -> dict:
     }
 
 
+def isolation_cause(connectivity: dict, uncut: dict | None) -> str:
+    """Why does this network fail the 4-connectivity gate: ``"clean"``, ``"cutoff"``, ``"d8"``?
+
+    Two entirely different things break the gate and they need different words. The D8
+    defect (:func:`rook_connect`'s reason for existing) is a *bug* -- a river with a wall
+    across it that nothing else can see. The ``max_area_km2`` cutoff shatters the network
+    too, but that is its **known, chosen price** (a tributary joined to the trunk is cut
+    loose when the trunk stops being a channel), and reporting it in the D8 defect's words
+    sends the reader hunting for a connectivity bug that is not there.
+
+    :func:`rook_connect` must run *before* the cutoff -- it needs the uncut network to
+    know what the through-river is -- so the two cannot simply be reordered. The
+    attribution is therefore **measured**, not assumed: ``uncut`` is the connectivity of
+    the same network with the cutoff not applied, and if that one satisfies the gate then
+    the cutoff is what broke it. Measured on the full mosaic at ``coarsen = 4``: cutoff
+    off is 163 components 4-connected against 163 8-connected with 0 isolated cells, and
+    cutoff on is 458 against 456 with 9 isolated.
+    """
+
+    def broken(rep: dict) -> bool:
+        return bool(rep["isolated_interior"] or rep["components_4"] > rep["components_8"])
+
+    if not broken(connectivity):
+        return "clean"
+    if uncut is None:
+        return "d8"
+    return "d8" if broken(uncut) else "cutoff"
+
+
 def subgrid_cutoff_km2(
     run_dx: float,
     *,
@@ -338,9 +380,10 @@ def trace_downstream(
     Returns ``{"start", "end", "steps", "reason", "code", "path"}``. ``reason`` is one
     of ``left_domain`` (the path leaves the array -- the ordinary, healthy ending for a
     windowed domain), ``reached_stop`` (entered a cell of the ``stop`` mask),
-    ``no_direction`` (the raster has no D8 code here -- pysheds writes ``-2`` for an
-    outlet, ``-1`` for nodata and ``0`` for an unresolved pit, and ``code`` carries
-    which), ``loop`` or ``max_steps``.
+    ``no_direction`` (the raster has no D8 code here -- pysheds writes ``-1`` for a
+    **flat** it could not resolve, ``-2`` for a **pit** and ``0`` for nodata, per its
+    ``flowdir(..., flats=-1, pits=-2)`` defaults, and ``code`` carries which),
+    ``loop`` or ``max_steps``.
 
     **What a trace does and does not prove.** The direction raster comes from the
     *filled* elevation, while ``pipeline.tile`` writes the *raw* bed into the tiles the
@@ -349,7 +392,8 @@ def trace_downstream(
     conditioning found a way out from here; whether water actually reaches the outlet is
     a run-time gate (plan §6) and nothing here can stand in for it. What a trace *can*
     settle is the negative: a path ending ``no_direction`` well inside the window is a
-    stretch of river with nowhere to go, and there are 95 such cells in this raster.
+    stretch of river with nowhere to go, and there are 100 such cells in valid data in
+    this raster (91 pits, 9 flats) draining 39.1 % of it.
     """
     fdir = np.asarray(flowdir)
     ny, nx = fdir.shape
@@ -547,9 +591,15 @@ def drainage_check(
 
     A bounding-box touch is not this test and must not be mistaken for it: on the real
     DEM's M0 tile all 27 pieces reach the window edge somewhere, while the second-largest
-    of them (924 cells, 1262 km²) drains to an unresolved flat in the middle of the
+    of them (924 cells, 1262 km²) drains to a single-cell pit in the middle of the
     domain. Sprawling to the edge through a tributary says nothing about where the water
     goes.
+
+    **Scale matters to what this finds.** The same census on the whole 3991x3283 mosaic
+    reads 154 of 458 pieces sealed (114 939 of 298 147 channel cells, 38.6 %) with the
+    §4 cutoff on, and 23 of 163 (123 469 of 316 070) with it off -- against 2 of 29
+    (14.5 %) on the single M0 tile. A one-tile census understates this badly, because a
+    window that happens to miss the pits looks clean.
     """
     mask = np.asarray(width) > 0.0
     area = np.asarray(area_km2, dtype=np.float64)
@@ -729,6 +779,16 @@ def channel_fields(
 
     width, depth, clipped = hydraulic_geometry(area, dx=run_dx, max_area_km2=max_area, **coeffs)
 
+    # With a cutoff set, the network shatters and some cells are left isolated -- the
+    # cutoff's known price, not the D8 defect. Measure the same network *without* the
+    # cutoff so the attribution is a comparison rather than an assumption
+    # (:func:`isolation_cause`); the mask is otherwise identical, so this isolates the
+    # one variable.
+    uncut_connectivity = None
+    if max_area is not None:
+        uncut_width, _, _ = hydraulic_geometry(area, dx=run_dx, max_area_km2=None, **coeffs)
+        uncut_connectivity = connectivity_report(uncut_width)
+
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     width.astype("<f4").tofile(out / "channel_width.r32")
@@ -765,6 +825,10 @@ def channel_fields(
         # The fields are authored at the tile resolution and the solver block-maxes them
         # to its own; quoting only the authored figure invites a "did not reproduce".
         "connectivity_at_run_dx": connectivity_report(_block_max(width, int(coarsen))),
+        # Only present when a cutoff is set: the same network without it, so a broken
+        # connectivity gate can be attributed to the cutoff rather than to the D8 defect.
+        "connectivity_without_cutoff": uncut_connectivity,
+        "isolation_cause": isolation_cause(connectivity_report(width), uncut_connectivity),
         "drainage": drainage_check(width, area, fdir, dirmap=dirmap),
     }
     if inlets or outlets:
@@ -872,13 +936,28 @@ def main(argv: list[str] | None = None) -> None:
                 f" block-max at coarsen {rec['coarsen']}): {run['components_4']} vs"
                 f" {run['components_8']}, {run['isolated_interior']} isolated"
             )
-    if con["isolated_interior"] or con["components_4"] > con["components_8"]:
+    cause = rec["isolation_cause"]
+    if cause == "d8":
         print(
             f"  WARNING: {con['isolated_interior']} interior channel cells have no 4-connected"
             f" neighbour and the network is {con['components_4']} rook-connected fragments"
             f" against {con['components_8']} under 8-connectivity. The solver has no diagonal"
             " face, so this network fills rather than conveys -- and the mass gate cannot"
             " see it."
+        )
+    elif cause == "cutoff":
+        # Not the D8 defect: the same network without the cutoff satisfies the gate, so
+        # saying "this network fills rather than conveys" would send the reader hunting
+        # for a bug that is not there.
+        unc = rec["connectivity_without_cutoff"]
+        print(
+            f"  cutoff cost : {con['components_4']} pieces (4-connected) vs"
+            f" {con['components_8']} (8-connected) and {con['isolated_interior']} isolated"
+            f" cells -- against {unc['components_4']}/{unc['components_8']} and"
+            f" {unc['isolated_interior']} for the same network WITHOUT the cutoff. This is"
+            " the cutoff's price, not the D8 defect: tributaries joined through the trunk"
+            " are cut loose when the trunk stops being a channel. Read the flow paths, not"
+            " the component count."
         )
     cut = rec["coefficients"]["max_area_km2"]
     if cut is not None:

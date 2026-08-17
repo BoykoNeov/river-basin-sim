@@ -16,6 +16,15 @@ Two elevation surfaces come out, and the distinction is deliberate:
   derive a continuous, pit-free flow network (direction + accumulation). High
   accumulation traces the river/drainage network.
 
+**``filled_elevation.tif`` is a diagnostic surface, not a reproducible input.**
+``resolve_flats`` works in **float64** and separates a flat by a sub-millimetre
+gradient; :func:`write_outputs` casts it to float32 on the way out, which destroys
+exactly that gradient. Re-deriving flow directions from the written file therefore does
+**not** reproduce ``flow_direction.tif``: on this raster it yields **376 345** cells
+flagged as unresolved flats against the shipped **14 096**, a 27x difference. Derive
+directions in memory from :func:`condition_array`, or re-run the conditioning; do not
+round-trip the GeoTIFF and expect the same network.
+
 The conditioning backend here is pysheds (see ``pipeline/_compat.py`` for the
 NumPy-2.x shim it needs). The public entry point ``condition_dem`` returns a
 plain ``ConditionedDEM`` dataclass and writes plain GeoTIFFs + JSON, so the
@@ -179,7 +188,14 @@ def _write_geotiff(path: Path, data: np.ndarray, transform: rasterio.Affine, crs
 
 
 def write_outputs(cond: ConditionedDEM, out_dir: str | Path) -> dict[str, str]:
-    """Write the conditioned rasters + a metadata JSON. Returns the file map."""
+    """Write the conditioned rasters + a metadata JSON. Returns the file map.
+
+    Note that ``filled_elevation`` is float32 here while ``resolve_flats`` produced
+    float64, so the written raster cannot reproduce ``flow_direction`` (see the module
+    docstring). Promoting it would rewrite ``data/dem/conditioned`` and with it every
+    figure in the repo derived from this network, so the file stays as it is and the
+    limitation is documented instead.
+    """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     transform = rasterio.Affine(*cond.transform)

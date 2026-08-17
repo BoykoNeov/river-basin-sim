@@ -26,6 +26,7 @@ from pipeline.channels import (
     drainage_check,
     hydraulic_geometry,
     isolated_cells,
+    isolation_cause,
     rook_connect,
     route_report,
     subgrid_cutoff_km2,
@@ -290,8 +291,15 @@ def test_the_cutoff_cannot_orphan_a_cell_inserted_for_connectivity():
     on a bigger river of its own — it takes ``max(own, through)``, so it can be dropped
     while both ends of the diagonal step stay, and the wall comes back. It is a
     hillslope cell by construction, so this is rare rather than impossible, which is
-    why the per-run 4-vs-8 component check is what actually verifies it (it read
-    69 vs 69, 0 isolated, on the real derivation).
+    why the per-run 4-vs-8 component check is what actually verifies it.
+
+    **It is rare and it is not impossible, and the full mosaic proves both halves.** On
+    the single M0 tile the real derivation read 69 vs 69 with 0 isolated cells; on the
+    whole 3991x3283 mosaic it reads 458 vs 456 with **9** isolated of 298 147 channel
+    cells, against 163 vs 163 and 0 isolated for the same network with the cutoff off.
+    So the ordering is still right and the exception above does fire -- which is why the
+    cause is now reported as a measured comparison (:func:`isolation_cause`) instead of
+    being read as the D8 defect.
     """
     area, fdir = _diagonal_river(n=16)
     fixed, inserted = rook_connect(area, fdir, min_area_km2=1.0)
@@ -302,6 +310,62 @@ def test_the_cutoff_cannot_orphan_a_cell_inserted_for_connectivity():
     assert isolated_cells(mask, interior_only=True) == 0
     rep = connectivity_report(w)
     assert rep["components_4"] == rep["components_8"]
+
+
+def test_a_shattered_network_is_blamed_on_the_cutoff_only_when_the_uncut_one_is_clean():
+    """The two causes need different words, and the difference must be measured.
+
+    A broken 4-connectivity gate means "this river has a wall across it and no other
+    gate can see it" when it comes from the D8 defect, and "the trunk these tributaries
+    hung from is floodplain by choice" when it comes from the cutoff. Reporting the
+    second in the first's words sends the reader hunting for a bug that is not there.
+    """
+    clean = {"isolated_interior": 0, "components_4": 3, "components_8": 3}
+    broken = {"isolated_interior": 4, "components_4": 9, "components_8": 6}
+
+    # Gate satisfied: nothing to attribute, cutoff or not.
+    assert isolation_cause(clean, None) == "clean"
+    assert isolation_cause(clean, broken) == "clean"
+
+    # No cutoff was applied, so there is no comparison and the D8 defect is the cause.
+    assert isolation_cause(broken, None) == "d8"
+
+    # The same network without the cutoff is clean -> the cutoff did it.
+    assert isolation_cause(broken, clean) == "cutoff"
+
+    # It was already broken before the cutoff -> the cutoff is not the story.
+    assert isolation_cause(broken, broken) == "d8"
+
+
+def test_the_cause_of_a_shattered_network_is_read_off_the_real_geometry():
+    """End to end on the fixture, not on hand-written dicts.
+
+    This builds the exception the test above names: a corner that sits on a bigger river
+    of its own takes ``max(own, through)``, so a cutoff can drop it while both ends of
+    the diagonal step survive -- and the wall it was inserted to remove comes back. The
+    staircase is clean before the cutoff, so the attribution must name the cutoff and not
+    the connectivity fix that ran first.
+
+    Note the discriminating detail: merely *cutting* a network in two leaves both halves
+    4-connected and the gate reads clean. What fires the gate is a step left bridged only
+    diagonally, which is the D8 defect's own signature arriving by a different route.
+    """
+    area, fdir = _diagonal_river(n=16)
+    # Give one corner cell a river of its own, larger than the cutoff will allow.
+    area[8, 7] = 500.0
+    fixed, inserted = rook_connect(area, fdir, min_area_km2=1.0)
+    assert inserted > 0
+    assert fixed[8, 7] == 500.0  # max(own, through) kept its own, bigger area
+
+    uncut, _, _ = hydraulic_geometry(fixed, dx=1000.0, min_area_km2=1.0)
+    uncut_rep = connectivity_report(uncut)
+    assert isolation_cause(uncut_rep, None) == "clean"
+
+    cut, _, _ = hydraulic_geometry(fixed, dx=1000.0, min_area_km2=1.0, max_area_km2=100.0)
+    cut_rep = connectivity_report(cut)
+    assert cut[8, 7] == 0.0  # the corner is gone, both ends of its step remain
+    assert cut_rep["components_4"] > cut_rep["components_8"]
+    assert isolation_cause(cut_rep, uncut_rep) == "cutoff"
 
 
 # --- which piece is this cell in, and where does that piece drain? -----------
