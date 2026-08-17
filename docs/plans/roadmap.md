@@ -60,6 +60,18 @@ and complete (61 components, zero isolated cells, holds through coarsening), but
 the inserted corner cell is given **the through-path's width**: on its own accumulation it
 is a 3.6 % aperture, a pinhole rather than a wall. See `real-dem-reach.md` §2.
 
+Two more things are settled since (2026-08-17, `real-dem-reach.md` §5.2). **What counts as
+a river is now a recorded choice**: `--max-area-km2 auto` drops the rivers wider than a
+cell — 198.1 km² at this run's resolution — so the clip count goes from 2740 cells to
+**0** and the main stem is resolved on the grid instead of pretending to be sub-grid. It
+costs the network's spine: 29 pieces become **69**, and two thirds of the chosen
+inlet-to-outlet route stops being channel. And the second defect of the same family as
+the first: **14.5 %** of this window's channel cells sit on pieces that drain to a **dead
+end inside the domain** — 95 cells of the conditioned raster have no D8 direction, and the
+largest swallows **1262 km²** onto an unresolved flat. Water put there ponds, and the mass
+gate cannot see that either. A bounding-box touch is not a drainage test: all 27 pieces
+reach the window edge, including that one.
+
 **Carried out of M7.** Two, both measured and both deliberately unshipped.
 
 1. ~~**The sync-point `Δt` clamp degrades local-inertial, and no gate can see it.**~~

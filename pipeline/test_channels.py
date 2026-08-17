@@ -19,12 +19,17 @@ import pytest
 from pipeline.channels import (
     DEFAULT_DIRMAP,
     DIRMAP_OFFSETS,
+    component_labels,
     components,
     connectivity_report,
     d8_offsets,
+    drainage_check,
     hydraulic_geometry,
     isolated_cells,
     rook_connect,
+    route_report,
+    subgrid_cutoff_km2,
+    trace_downstream,
 )
 
 SE = 2  # DEFAULT_DIRMAP's south-east code; (dr, dc) = (1, 1)
@@ -221,3 +226,197 @@ def test_a_clipped_width_survives_the_float32_cast_as_still_within_the_cell():
     assert float(w[0, 0]) <= dx
     # Still the cell width to any tolerance that matters -- this is not a haircut.
     assert float(w[0, 0]) == pytest.approx(dx, rel=1e-6)
+
+
+# --- the cutoff: what counts as a river at this resolution -------------------
+
+
+def test_the_subgrid_cutoff_is_the_area_whose_channel_is_exactly_one_cell_wide():
+    """It inverts the width law, so it moves with the run resolution and the coefficients.
+
+    198.1 km² at the real DEM's ``coarsen = 4`` cell and 12.4 km² at its native 28.15 m
+    -- the same terrain, a different answer to "what is a river here", which is why the
+    number has to be recorded rather than assumed.
+    """
+    dx = 28.14637886394598
+    assert subgrid_cutoff_km2(dx * 4) == pytest.approx(198.1, abs=0.05)
+    assert subgrid_cutoff_km2(dx) == pytest.approx(12.4, abs=0.05)
+
+    cut = subgrid_cutoff_km2(200.0)
+    at_cut, _, _ = hydraulic_geometry(np.array([[cut, cut * 0.5]]), dx=200.0, min_area_km2=1.0)
+    assert float(at_cut[0, 0]) == pytest.approx(200.0, rel=1e-6)  # exactly one cell
+    assert float(at_cut[0, 1]) < 200.0
+
+
+def test_the_cutoff_drops_exactly_the_rivers_that_would_have_been_clipped():
+    """Above the cutoff the model is not sub-grid, it is "the river is one cell across".
+
+    The cells the cutoff removes are precisely the ones the clip was flattening, and
+    every cell below it is untouched -- so this changes what is carried, not how it is
+    sized. Measured on the real DEM's M0 tile at ``coarsen = 4``: 2740 clipped cells
+    become 0, and 2740 cells leave the channel mask.
+    """
+    area = np.array([[1.0, 25.0, 400.0, 2500.0]])  # w = 8, 40, 160, 400 m
+    cut = subgrid_cutoff_km2(200.0)
+
+    plain, d_plain, n_plain = hydraulic_geometry(area, dx=200.0, min_area_km2=1.0)
+    cutd, d_cut, n_cut = hydraulic_geometry(area, dx=200.0, min_area_km2=1.0, max_area_km2=cut)
+
+    assert n_plain == 1 and n_cut == 0  # nothing is clipped once the big river is gone
+    assert float(cutd.max()) <= 200.0
+    assert cutd[0, 3] == 0.0 and d_cut[0, 3] == 0.0  # dropped, in both fields
+    np.testing.assert_array_equal(cutd[0, :3], plain[0, :3])  # and nothing else moved
+    np.testing.assert_array_equal(d_cut[0, :3], d_plain[0, :3])
+
+
+def test_no_cutoff_is_the_default_and_leaves_the_field_bit_for_bit():
+    """The cutoff is a modelling choice; every figure recorded before it assumed none."""
+    area, fdir = _diagonal_river()
+    fixed, _ = rook_connect(area, fdir, min_area_km2=1.0)
+    a = hydraulic_geometry(fixed, dx=50.0, min_area_km2=1.0)
+    b = hydraulic_geometry(fixed, dx=50.0, min_area_km2=1.0, max_area_km2=None)
+
+    np.testing.assert_array_equal(a[0], b[0])
+    np.testing.assert_array_equal(a[1], b[1])
+    assert a[2] == b[2]
+
+
+def test_the_cutoff_cannot_orphan_a_cell_inserted_for_connectivity():
+    """It is applied *after* :func:`rook_connect`, and that ordering is load-bearing.
+
+    An inserted corner inherits ``min(area_upstream, area_downstream)`` = the upstream
+    end's area, so whenever the upstream cell survives the cutoff its corner does too:
+    trimming the trunk cannot leave a corner cell stranded beside a dropped river.
+    """
+    area, fdir = _diagonal_river(n=16)
+    fixed, inserted = rook_connect(area, fdir, min_area_km2=1.0)
+    assert inserted > 0
+
+    w, _, _ = hydraulic_geometry(fixed, dx=1000.0, min_area_km2=1.0, max_area_km2=8.5)
+    mask = w > 0
+    assert isolated_cells(mask, interior_only=True) == 0
+    rep = connectivity_report(w)
+    assert rep["components_4"] == rep["components_8"]
+
+
+# --- which piece is this cell in, and where does that piece drain? -----------
+
+
+def _two_rivers() -> tuple[np.ndarray, np.ndarray]:
+    """Two channels: one leaves the window, one dead-ends at an unresolved flat.
+
+    The sealed one is shaped like the real DEM's second-largest piece: it *reaches* the
+    window edge (its tributary starts on row 0) while draining to an interior cell the
+    conditioning left with no flow direction. A bounding-box touch says nothing about
+    where the water goes.
+    """
+    area = np.zeros((12, 12))
+    fdir = np.zeros((12, 12), dtype=np.int64)
+
+    # Sealed: a tributary down column 2 from the border, then east along row 9.
+    for i in range(10):
+        area[i, 2] = i + 1.0
+        fdir[i, 2] = 4  # S
+    for j in range(2, 10):
+        area[9, j] = 10.0 + (j - 2)
+        fdir[9, j] = 1  # E
+    fdir[9, 9] = -2  # pysheds' "no direction here" -- the flat
+
+    # Draining: east along row 3 and out of the window.
+    for j in range(5, 12):
+        area[3, j] = float(j - 4)
+        fdir[3, j] = 1  # E
+    return area, fdir
+
+
+def test_component_labels_agree_with_the_counts_they_summarise():
+    area, fdir = _two_rivers()
+    w, _, _ = hydraulic_geometry(area, dx=1000.0, min_area_km2=1.0)
+    labels, sizes = component_labels(w > 0)
+
+    n, largest = components(w > 0)
+    assert (n, largest) == (int(sizes.size), int(sizes.max())) == (2, 17)
+    assert int((labels >= 0).sum()) == int(sizes.sum()) == int((w > 0).sum())
+    assert labels[0, 2] == labels[9, 9] and labels[0, 2] != labels[3, 11]
+    assert labels[0, 0] == -1  # off the mask
+
+
+def test_a_flow_path_that_leaves_the_window_is_the_healthy_ending():
+    _, fdir = _two_rivers()
+    tr = trace_downstream(fdir, (3, 5))
+
+    assert tr["reason"] == "left_domain"
+    assert tr["steps"] == 7 and tr["end"] == [3, 12]
+
+
+def test_a_flow_path_that_dead_ends_inside_the_domain_is_found():
+    """95 cells of the real raster have no D8 code; the largest swallows 1262 km²."""
+    _, fdir = _two_rivers()
+    tr = trace_downstream(fdir, (0, 2))
+
+    assert tr["reason"] == "no_direction"
+    assert tr["code"] == -2
+    assert tr["end"] == [9, 9]
+
+
+def test_a_trace_stops_at_the_outlet_it_was_given_and_a_loop_terminates():
+    _, fdir = _two_rivers()
+    stop = np.zeros((12, 12), dtype=bool)
+    stop[9, 5] = True
+    tr = trace_downstream(fdir, (0, 2), stop=stop)
+    assert tr["reason"] == "reached_stop" and tr["end"] == [9, 5]
+
+    ring = np.zeros((4, 4), dtype=np.int64)
+    ring[1, 1], ring[1, 2] = 1, 16  # E then W: two cells pointing at each other
+    assert trace_downstream(ring, (1, 1))["reason"] == "loop"
+
+
+def test_a_piece_that_reaches_the_window_edge_can_still_be_sealed():
+    """The discriminating field is where the piece's *outlet* is, not its bounding box.
+
+    On the real DEM's M0 tile all 27 pieces touch the edge, and the second largest of
+    them (924 cells, 1262 km²) drains to a flat in the middle of the domain.
+    """
+    area, fdir = _two_rivers()
+    w, _, _ = hydraulic_geometry(area, dx=1000.0, min_area_km2=1.0)
+    rep = drainage_check(w, area, fdir)
+
+    assert rep["components"] == 2
+    assert rep["sealed_components"] == 1 and rep["sealed_cells"] == 17
+    sealed = rep["sealed"][0]
+    assert sealed["outlet"] == [9, 9] and sealed["outlet_on_edge"] is False
+    assert sealed["reason"] == "no_direction" and sealed["code"] == -2
+    # ...and that same piece does reach the border, which is why the bbox test fails.
+    labels, _ = component_labels(w > 0)
+    assert bool((labels[0, :] == labels[9, 9]).any())
+
+
+def test_an_inlet_off_the_channel_is_reported():
+    """``reach_basin`` injects at ``[4, 768]``, two cells off the meander, unnoticed
+    for two milestones because rain wet the channel anyway."""
+    area, fdir = _two_rivers()
+    w, _, _ = hydraulic_geometry(area, dx=1000.0, min_area_km2=1.0)
+    rep = route_report(w, fdir, [(5, 5)], [(3, 11)])
+
+    assert rep["inlets"][0]["in_channel"] is False
+    assert rep["inlets"][0]["component"] is None
+    assert rep["same_component"] is None  # not a question that has an answer here
+    assert any("not a channel cell" in m for m in rep["warnings"])
+
+
+def test_an_inlet_and_an_outlet_in_different_pieces_are_reported():
+    area, fdir = _two_rivers()
+    w, _, _ = hydraulic_geometry(area, dx=1000.0, min_area_km2=1.0)
+
+    apart = route_report(w, fdir, [(0, 2)], [(3, 11)])
+    assert apart["same_component"] is False
+    assert any("different pieces" in m for m in apart["warnings"])
+    # ...and the inlet's own river dead-ends inside the domain, which is the reason.
+    assert apart["inlets"][0]["route"]["dead_end_inside"] is True
+    assert any("nowhere to go" in m for m in apart["warnings"])
+
+    together = route_report(w, fdir, [(3, 6)], [(3, 11)])
+    assert together["same_component"] is True
+    assert together["warnings"] == []
+    assert together["inlets"][0]["route"]["reason"] == "reached_stop"
+    assert together["inlets"][0]["route"]["channel_steps"] == 6

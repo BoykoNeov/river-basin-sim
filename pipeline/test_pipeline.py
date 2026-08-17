@@ -217,3 +217,61 @@ def test_channel_fields_threads_coarsen_and_connectivity_through(tmp_path):
 
     with pytest.raises(ValueError):
         channel_fields(cond_dir, tiles_dir, tmp_path / "bad", coarsen=0)
+
+
+def test_channel_fields_records_the_cutoff_the_drainage_and_the_route(tmp_path):
+    """What was chosen and where the water goes travel with the fields, not in a head.
+
+    The cutoff is a modelling decision (plan §4) and the route is the check no gate in
+    the solver makes, so both belong in ``channels.json`` beside the coefficients.
+    """
+    from pipeline.channels import channel_fields
+
+    src = tmp_path / "dem.tif"
+    cond_dir = tmp_path / "conditioned"
+    tiles_dir = tmp_path / "tiles"
+    _write_geographic_dem(src, n=64)
+    condition_dem(src, cond_dir, dst_crs="EPSG:32617")
+    tile_dem(cond_dir, tiles_dir, size=32)
+
+    plain = channel_fields(cond_dir, tiles_dir, tmp_path / "p", min_area_km2=0.0)
+    cut = channel_fields(
+        cond_dir,
+        tiles_dir,
+        tmp_path / "c",
+        min_area_km2=0.0,
+        max_area_km2="auto",
+        inlets=[(8, 8)],
+        outlets=[(24, 24)],
+    )
+
+    # "auto" is the area whose channel is exactly one cell, and it is written down.
+    assert cut["coefficients"]["max_area_km2"] == pytest.approx(cut["subgrid_cutoff_km2"])
+    assert plain["coefficients"]["max_area_km2"] is None
+    assert cut["width_clipped_to_run_dx"] == 0
+    assert cut["width_max_m"] <= cut["run_dx_m"]
+
+    # This DEM's cells are 1015 m wide, so nothing here is ever clipped and "auto"
+    # removes nothing -- an explicit cutoff is what makes the plumbing measurable.
+    assert plain["width_clipped_to_run_dx"] == 0 and cut["cells_above_max_area"] == 0
+    small = channel_fields(
+        cond_dir, tiles_dir, tmp_path / "s", min_area_km2=0.0, max_area_km2=100.0
+    )
+    assert small["coefficients"]["max_area_km2"] == 100.0
+    assert 0 < small["channel_cells"] < plain["channel_cells"]
+    assert small["cells_above_max_area"] == plain["channel_cells"] - small["channel_cells"]
+
+    assert set(cut["drainage"]) >= {"components", "sealed_components", "sealed_cells", "largest"}
+    assert "route" not in plain  # only when someone asks where the water goes
+    assert [e["cell"] for e in cut["route"]["inlets"]] == [[8, 8]]
+    assert set(cut["route"]["inlets"][0]) >= {"in_channel", "component", "route"}
+    assert cut["route"]["inlets"][0]["route"]["reason"] in {
+        "left_domain",
+        "reached_stop",
+        "no_direction",
+        "loop",
+        "max_steps",
+    }
+
+    with pytest.raises(ValueError):
+        channel_fields(cond_dir, tiles_dir, tmp_path / "bad", max_area_km2="biggest")

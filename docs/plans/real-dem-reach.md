@@ -1,6 +1,6 @@
 # Real DEM, end to end — the reach machinery on terrain that was not built to suit it
 
-**Status: steps 1–2 done, 2026-08-17; steps 3–7 planned.** Not a milestone. M0–M7 are signed off and every carried
+**Status: steps 1–2 done and the §4 cutoff chosen, 2026-08-17; steps 3–7 planned.** Not a milestone. M0–M7 are signed off and every carried
 item is closed; this is the first thing chosen after the roadmap ran out. It is the one
 path the repo has never walked: **every reach-scale run in the repo is synthetic.**
 `scripts/make_reach_demo.py` builds the basin, the river and the channel fields that
@@ -205,6 +205,13 @@ grid like any other terrain, and only the tributaries are carried sub-grid.** Th
 defensible model — it is what the resolution can support — but it is not what the
 synthetic demos show, and the difference should not be discovered by a reader.
 
+**Chosen and measured in §5.2.1** (`--max-area-km2 auto`), where the second consequence
+turns up: the tributaries were connected *through* the trunk, so dropping it shatters the
+network — on the M0 tile 29 pieces become 69, and two thirds of the inlet-to-outlet route
+stops being channel. The road not taken is a coarser run: this window's biggest river
+needs `dx ≥ 289 m` to be genuinely sub-grid, which is `coarsen = 11` and an 85² grid of
+340 m cells on 14 % slopes. Not built, and not close.
+
 **Why the synthetic demos never hit this.** `make_reach_demo.py` calls the same
 `hydraulic_geometry`, with `WIDTH_COEF = 1.5` against the module's own humid-temperate
 default of **8.0** — 5.3× narrower — on a basin whose drainage area is authored to grow
@@ -244,7 +251,10 @@ Each step is independently checkable, and the first two are the substance.
    shift (mean bed 747 m; float32 `η = h + z` has 6.1e-5 m of resolution there),
    local-inertial, an inflow hydrograph **split across several consecutive channel cells
    and verified to be in the channel**, open outflow at the basin mouth. No sediment in
-   the first run.
+   the first run. The verification is `--inlet` / `--outlet` on `pipeline.channels`
+   (§5.2.3), and it has two jobs: the inflow cells must be in the channel, and they must
+   be on a piece that drains out of the domain rather than into one of the conditioning's
+   dead ends — 14.5 % of this window's channel cells are on pieces that do not.
 5. **Run it, on both backends.** Mass gate < 1e-6 is necessary and not sufficient — a
    dammed river passes it. The discriminating check is that water actually reaches the
    outlet.
@@ -304,12 +314,125 @@ passes the 50 m tile `dx` while `reach_basin` runs at 100 m), but its widths top
 26 m so nothing is clipped at either resolution and every recorded demo figure is
 unaffected. Left alone deliberately rather than fixed and re-measured.
 
+## 5.2 The §4 cutoff, chosen — and the piece of river that goes nowhere (2026-08-17)
+
+Two things were left after §5.1, and one of them turned out to be a question with no
+answer as asked.
+
+### 5.2.1 The cutoff is now a parameter, and it is written down
+
+`subgrid_cutoff_km2(run_dx)` inverts the width law — `(dx / a_w)^(1/b_w)`, **198.1 km²**
+at the coarsen-4 cell and 12.4 km² at the native one — and `--max-area-km2 auto` drops
+the rivers above it from the channel mask. On the M0 tile at `coarsen = 4`:
+
+| | channel cells | clipped to the cell | widest | pieces (4-conn) | largest piece |
+|---|---|---|---|---|---|
+| carried, clipped (the old default) | 25 962 | **2740** | 112.59 m = **1.000 dx** | 29 | 19 934 |
+| cutoff `A ≤ 198.1 km²` | 23 222 | **0** | 108.97 m = 0.968 dx | **69** | 5220 |
+
+The cells it drops are *exactly* the ones the clip was flattening — 2740 either way,
+which is the invariant `pipeline/test_pipeline.py` gates — so this changes what is
+carried, not how it is sized.
+
+**The price is the shatter, and it is bigger than a component count suggests.** 29 → 69
+pieces authored, 27 → 64 as the solver runs them after its own block-max coarsening, and
+the largest piece falls from 19 934 cells to 5220. The reason is not subtle: those
+tributaries were connected *through the trunk*, and the trunk is now floodplain. Measured
+on the route actually chosen below, which is the form that matters: the flow path from
+the inlet to the outlet is 396 cells either way, and **397 of 397 were channel before the
+cutoff against 123 of 396 after it**. The water is put into a sub-grid channel and then
+travels two thirds of the way to the outlet as ordinary on-grid flow.
+
+That is the right trade at this resolution and it should still be said out loud. A
+1262 km² river is 289 m wide — 2.6 cells at 112.59 m — so it does not need a sub-grid
+model and cannot have one; carrying it clipped meant "the river is exactly one cell
+across" on 2740 cells, precisely where the flood is. **Default off**: the cutoff is a
+modelling choice, every figure recorded before this was measured without it, and the
+module will not make the choice silently. The `NOTE` that fires on a nonzero clip count
+used to point the wrong way — it said to *raise* `--min-area-km2`, which drops small
+tributaries, keeps the trunk, and does not move the clip count by one cell.
+
+### 5.2.2 The pruning cutoff cannot sever a river, and something else did
+
+The 27 pieces invited the reading that some are one river cut in half where the
+"too small to be a river" threshold pruned a link. **That cannot happen.** Flow
+accumulation is monotone downstream, so once a cell is at or above `min_area` every cell
+downstream of it is too: the derived mask is downstream-closed, and no choice of
+`min_area` can open a gap in the middle of a flow path. Corner insertion is not needed
+there because there was never a break there.
+
+What actually breaks a piece off is the window edge — and one thing nobody had looked
+for. The conditioned raster has **95 cells with no D8 direction at all** (pysheds writes
+`-2` for a resolved outlet, `-1` for nodata, `0` for a pit), and the largest of them
+carries **1262.5 km²**. It sits at field cell **[796, 869]**, in the middle of the M0
+window, on a **292-cell flat at 530.5 m** (0.23 km², a 1.5 km reach SRTM renders as a
+level water surface) that the fill left unresolved. Flow accumulation restarts at 1 below
+it, so the derived river simply stops:
+
+| | pieces | drain to a dead end **inside** the domain | cells stranded |
+|---|---|---|---|
+| carried, clipped | 29 | **2** | 3769 of 25 962 (**14.5 %**) |
+| cutoff `A ≤ 198.1 km²` | 69 | **7** | 3459 |
+
+The largest stranded piece is **3697 cells** — the whole south-east quarter of the
+window's network — and water put into it ponds. This is the §2 defect's twin: mass is
+conserved perfectly in a domain that fills instead of conveying, so **no gate in the repo
+can see it**, and it survives every fix §2 made because it is a property of the terrain
+conditioning, not of the mask. The cutoff neither causes nor cures it; it only re-cuts
+the same stranded terrain into more pieces.
+
+**A bounding-box touch is not a drainage test**, and believing it was would have hidden
+this. All 27 pieces reach the window edge somewhere — including the stranded one, whose
+tributaries run up to row 0. `drainage_check` traces the D8 path from each piece's own
+**highest-accumulation cell** instead, and calls a piece sealed when that path dead-ends
+away from the border.
+
+**What a trace does and does not prove.** The direction raster comes from the *filled*
+elevation while `pipeline.tile` writes the *raw* bed into the tiles the solver steps on,
+so a trace is a statement about the derived network's routing, not a prediction about the
+shallow-water run. Its negative is the useful half: a path ending with no direction well
+inside the window is a stretch of river with nowhere to go. "Water reaches the outlet"
+stays a run-time gate (§6) and nothing here stands in for it.
+
+### 5.2.3 The route, checked
+
+`route_report` answers three separate questions about a scenario's cells, given in the
+field's own pre-coarsen coordinates — the same ones `[[inflow]] cell` uses. Is the inlet
+in the channel at all (nothing else in this repo checks that, which is how `reach_basin`
+came to inject onto floodplain two cells off its meander for two milestones); are inlet
+and outlet in the same rook-connected piece (meaningful only with the main stem carried
+as a channel — with the cutoff set the trunk between them is floodplain *by choice*); and
+does the flow path from the inlet dead-end inside the domain.
+
+The pair chosen for step 4, on `data/fields/smoky` (M0 tile, `coarsen = 4`, cutoff on):
+
+- **inlet** — four consecutive flow-path cells `[266,327] [265,327] [264,327] [263,327]`,
+  each 176.4 km² and 106.3 m wide: the largest river still carried sub-grid, and a run of
+  four because a single-cell point source digs its own crater (M7 measured 83 % of a
+  run's bed change under one).
+- **outlet** — `[0, 172]`, where the trunk leaves the north edge, 396 cells downstream.
+- Both are on the piece that drains out of the domain, and the stranded south-east
+  quarter is avoided. Without the cutoff the same pair is in one piece of channel
+  (19 934 cells); with it the outlet is floodplain, which the CLI says in those words
+  rather than reporting an unanswered question as a failure.
+
+The census, the cutoff and the route are all written into `channels.json` beside the
+coefficients. **387 → 400 tests green** — the connectivity, cutoff, trace and route gates
+in `pipeline/test_channels.py` (pure numpy, no geo extra, because they gate defects
+nothing else can see), the `channel_fields` plumbing in `pipeline/test_pipeline.py`.
+
 ## 6. Gates
 
 - Every cell of the derived channel mask has a 4-connected neighbour in the mask, and the
   mask's 4-connected component count equals its 8-connected one (step 1's test).
 - Clip count is reported against the run resolution (step 2's test).
-- Water reaches the outlet — the check the mass gate cannot make.
+- The cutoff that decides what counts as a river is recorded in `channels.json`, and with
+  it set nothing is clipped to its cell (§5.2.1's test).
+- The scenario's inflow cells are in the channel, and on a piece whose flow path leaves
+  the domain rather than dead-ending inside it (§5.2.3). Both are properties of the
+  fields, checkable before a step is taken.
+- Water reaches the outlet — the check the mass gate cannot make, and the one no
+  property of the fields can stand in for.
 - Global mass balance < 1e-6 on both backends, quoted with the backend.
 - `--rbverify` green, plus a screenshot at river level.
 

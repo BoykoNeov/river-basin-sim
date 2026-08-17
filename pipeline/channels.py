@@ -43,10 +43,32 @@ sizing it normally leaves a **3.6 %** aperture -- a pinhole instead of a wall. S
 cell's channel width stops being a pure function of its own drainage area and becomes
 the width of the river passing through it.
 
+**And connectivity is not conveyance.** Two further things decide whether a derived
+network can carry water from where it is put in to where it is meant to leave, and
+neither is visible in the width field:
+
+*A channel wider than its cell is not sub-grid, and clipping it to the cell is a
+modelling decision, not a rounding.* :func:`subgrid_cutoff_km2` gives the drainage area
+at which ``w = dx``; passing it as ``max_area_km2`` drops the rivers above it from the
+channel mask so the main stem is resolved on the grid like any other terrain. That is
+plan §4's choice and it has a price, measured on the real DEM's M0 tile at
+``coarsen = 4``: it takes the clip count from 2740 cells to **0**, and it shatters the
+network from **27** rook-connected pieces into **64**, because the trunk those
+tributaries hung from is no longer a channel. Off by default -- the cutoff is a choice
+and this module will not make it silently.
+
+*A D8 network can dead-end inside the domain.* The conditioning leaves 95 cells in this
+raster with no flow direction (pysheds' ``-2`` outlet / ``-1`` nodata / ``0`` pit), and
+the largest of them carries **1262 km²** onto a 292-cell flat at 530.5 m in the middle
+of the M0 window. Accumulation restarts at 1 below it, so the derived river simply stops
+there. :func:`drainage_check` finds those components and :func:`route_report` answers
+whether a scenario's inflow and outflow cells are in the same piece of river.
+
 CLI::
 
     uv run python -m pipeline.channels --src data/dem/conditioned \\
-        --tiles data/tiles/demo --out data/fields/demo --coarsen 4
+        --tiles data/tiles/demo --out data/fields/smoky --coarsen 4 \\
+        --max-area-km2 auto --inlet 266,327 --outlet 0,172
 """
 
 from __future__ import annotations
@@ -184,17 +206,18 @@ def isolated_cells(mask: np.ndarray, *, interior_only: bool = False) -> int:
     return int(np.count_nonzero(bad))
 
 
-def components(mask: np.ndarray, *, diagonal: bool = False) -> tuple[int, int]:
-    """``(n_components, largest)`` for a boolean mask, 4- or 8-connected.
+def component_labels(mask: np.ndarray, *, diagonal: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """``(labels, sizes)`` for a boolean mask -- ``labels`` is ``-1`` off the mask.
 
     Union-find over the mask's edges -- numpy only, because ``scipy`` is not a
     declared dependency of this project (it arrives transitively with the geo extra
-    and must not be relied on).
+    and must not be relied on). Label ids are arbitrary but stable for a given mask;
+    ``sizes[k]`` is the cell count of label ``k``.
     """
     mask = np.asarray(mask, dtype=bool)
     n = int(mask.sum())
     if n == 0:
-        return 0, 0
+        return np.full(mask.shape, -1, dtype=np.int64), np.zeros(0, dtype=np.int64)
     idx = np.full(mask.shape, -1, dtype=np.int64)
     idx[mask] = np.arange(n)
 
@@ -228,7 +251,17 @@ def components(mask: np.ndarray, *, diagonal: bool = False) -> tuple[int, int]:
                 parent[rb] = ra
 
     roots = np.fromiter((find(i) for i in range(n)), dtype=np.int64, count=n)
-    counts = np.unique(roots, return_counts=True)[1]
+    _, inverse, counts = np.unique(roots, return_inverse=True, return_counts=True)
+    labels = np.full(mask.shape, -1, dtype=np.int64)
+    labels[mask] = inverse
+    return labels, counts
+
+
+def components(mask: np.ndarray, *, diagonal: bool = False) -> tuple[int, int]:
+    """``(n_components, largest)`` for a boolean mask, 4- or 8-connected."""
+    _, counts = component_labels(mask, diagonal=diagonal)
+    if counts.size == 0:
+        return 0, 0
     return int(counts.size), int(counts.max())
 
 
@@ -254,6 +287,286 @@ def connectivity_report(width: np.ndarray) -> dict:
     }
 
 
+def subgrid_cutoff_km2(
+    run_dx: float,
+    *,
+    width_coef: float = DEFAULT_WIDTH_COEF,
+    width_exp: float = DEFAULT_WIDTH_EXP,
+) -> float:
+    """The drainage area whose channel is exactly one cell wide: ``(dx / a_w)^(1/b_w)``.
+
+    Above this the hydraulic geometry asks for a channel wider than the cell carrying
+    it, which is not a sub-grid feature at all -- :func:`hydraulic_geometry` clips it to
+    ``dx`` and the model quietly degenerates to "the river is one cell across", precisely
+    where the flood is. Pass this as ``max_area_km2`` to drop those rivers from the
+    channel mask instead and let the main stem be ordinary on-grid terrain.
+
+    It is a function of the **run** resolution and of the width coefficients, so it moves
+    when either does: 198.1 km² at the real DEM's ``coarsen = 4`` cell (112.59 m) under
+    the humid-temperate defaults, 12.4 km² at the native 28.15 m.
+    """
+    if float(run_dx) <= 0.0:
+        raise ValueError(f"run_dx must be > 0, got {run_dx}")
+    return float((float(run_dx) / float(width_coef)) ** (1.0 / float(width_exp)))
+
+
+def trace_downstream(
+    flowdir: np.ndarray,
+    cell: tuple[int, int],
+    *,
+    dirmap: tuple[int, ...] | list[int] = DEFAULT_DIRMAP,
+    stop: np.ndarray | None = None,
+    max_steps: int = 1_000_000,
+) -> dict:
+    """Walk the D8 flow path downstream from ``cell`` and say how it ends.
+
+    Returns ``{"start", "end", "steps", "reason", "code", "path"}``. ``reason`` is one
+    of ``left_domain`` (the path leaves the array -- the ordinary, healthy ending for a
+    windowed domain), ``reached_stop`` (entered a cell of the ``stop`` mask),
+    ``no_direction`` (the raster has no D8 code here -- pysheds writes ``-2`` for an
+    outlet, ``-1`` for nodata and ``0`` for an unresolved pit, and ``code`` carries
+    which), ``loop`` or ``max_steps``.
+
+    **What a trace does and does not prove.** The direction raster comes from the
+    *filled* elevation, while ``pipeline.tile`` writes the *raw* bed into the tiles the
+    solver steps on -- so this is a check on the derived network's routing, not a
+    prediction about the shallow-water run. A path that leaves the domain says the
+    conditioning found a way out from here; whether water actually reaches the outlet is
+    a run-time gate (plan §6) and nothing here can stand in for it. What a trace *can*
+    settle is the negative: a path ending ``no_direction`` well inside the window is a
+    stretch of river with nowhere to go, and there are 95 such cells in this raster.
+    """
+    fdir = np.asarray(flowdir)
+    ny, nx = fdir.shape
+    r, c = int(cell[0]), int(cell[1])
+    if not (0 <= r < ny and 0 <= c < nx):
+        raise ValueError(f"cell {(r, c)} is outside the {ny}x{nx} grid")
+    offsets = d8_offsets(dirmap)
+    stop_mask = None if stop is None else np.asarray(stop, dtype=bool)
+    path: list[tuple[int, int]] = [(r, c)]
+    if stop_mask is not None and stop_mask[r, c]:
+        return {
+            "start": [r, c],
+            "end": [r, c],
+            "steps": 0,
+            "reason": "reached_stop",
+            "code": None,
+            "path": path,
+        }
+    seen = {(r, c)}
+    for step in range(1, int(max_steps) + 1):
+        code = int(fdir[r, c])
+        if code not in offsets:
+            return {
+                "start": list(path[0]),
+                "end": [r, c],
+                "steps": step - 1,
+                "reason": "no_direction",
+                "code": code,
+                "path": path,
+            }
+        dr, dc = offsets[code]
+        r, c = r + dr, c + dc
+        if not (0 <= r < ny and 0 <= c < nx):
+            return {
+                "start": list(path[0]),
+                "end": [r, c],
+                "steps": step,
+                "reason": "left_domain",
+                "code": None,
+                "path": path,
+            }
+        path.append((r, c))
+        if stop_mask is not None and stop_mask[r, c]:
+            return {
+                "start": list(path[0]),
+                "end": [r, c],
+                "steps": step,
+                "reason": "reached_stop",
+                "code": None,
+                "path": path,
+            }
+        if (r, c) in seen:
+            return {
+                "start": list(path[0]),
+                "end": [r, c],
+                "steps": step,
+                "reason": "loop",
+                "code": None,
+                "path": path,
+            }
+        seen.add((r, c))
+    return {
+        "start": list(path[0]),
+        "end": [r, c],
+        "steps": int(max_steps),
+        "reason": "max_steps",
+        "code": None,
+        "path": path,
+    }
+
+
+def _on_border(cell: tuple[int, int] | list[int], shape: tuple[int, int]) -> bool:
+    r, c = int(cell[0]), int(cell[1])
+    return r <= 0 or c <= 0 or r >= shape[0] - 1 or c >= shape[1] - 1
+
+
+def route_report(
+    width: np.ndarray,
+    flowdir: np.ndarray,
+    inlets: list[tuple[int, int]] | tuple = (),
+    outlets: list[tuple[int, int]] | tuple = (),
+    *,
+    dirmap: tuple[int, ...] | list[int] = DEFAULT_DIRMAP,
+) -> dict:
+    """Is a scenario's water put in somewhere it can get out of?
+
+    Cells are ``(row, col)`` in **field coordinates** -- the assembled, pre-coarsen
+    domain, which is the same coordinate system a scenario's ``[[inflow]] cell`` uses
+    (``solver.io.coarsen`` maps them by ``i // k``).
+
+    It answers three separate claims, and they are separate on purpose:
+
+    1. **Is the inlet in the channel at all?** Nothing else in this repo checks this. The
+       shipped ``reach_basin`` scenario injects at ``[4, 768]``, which is floodplain two
+       cells off the meander, and it went unnoticed for two milestones because rain wet
+       the channel anyway.
+    2. **Are inlet and outlet in the same rook-connected piece of channel?** Meaningful
+       only when the main stem is *carried* as a channel: with ``max_area_km2`` set the
+       trunk is deliberately floodplain, the network is a set of tributary stubs hanging
+       off it, and a shared component is neither expected nor required. ``None`` when a
+       cell is not in the channel to begin with.
+    3. **Does the flow path from the inlet dead-end inside the domain?** See
+       :func:`trace_downstream` for what that does and does not prove.
+    """
+    w = np.asarray(width)
+    mask = w > 0.0
+    labels, sizes = component_labels(mask, diagonal=False)
+    shape = (int(mask.shape[0]), int(mask.shape[1]))
+
+    def describe(cell) -> dict:
+        r, c = int(cell[0]), int(cell[1])
+        if not (0 <= r < shape[0] and 0 <= c < shape[1]):
+            raise ValueError(f"cell {(r, c)} is outside the {shape[0]}x{shape[1]} field")
+        lab = int(labels[r, c])
+        return {
+            "cell": [r, c],
+            "in_channel": bool(mask[r, c]),
+            "width_m": float(w[r, c]),
+            "component": lab if lab >= 0 else None,
+            "component_cells": int(sizes[lab]) if lab >= 0 else 0,
+        }
+
+    ins = [describe(c) for c in inlets]
+    outs = [describe(c) for c in outlets]
+    stop = None
+    if outs:
+        stop = np.zeros(shape, dtype=bool)
+        for o in outs:
+            stop[o["cell"][0], o["cell"][1]] = True
+
+    warnings: list[str] = []
+    for entry in ins:
+        tr = trace_downstream(flowdir, entry["cell"], dirmap=dirmap, stop=stop)
+        cells = np.array(tr["path"], dtype=np.int64)
+        entry["route"] = {
+            "reason": tr["reason"],
+            "code": tr["code"],
+            "steps": tr["steps"],
+            "end": tr["end"],
+            "channel_steps": int(mask[cells[:, 0], cells[:, 1]].sum()),
+            "dead_end_inside": bool(
+                tr["reason"] in ("no_direction", "loop") and not _on_border(tr["end"], shape)
+            ),
+        }
+        if not entry["in_channel"]:
+            warnings.append(
+                f"inlet {entry['cell']} is not a channel cell -- the discharge lands on"
+                " floodplain, which is a modelling choice, not an error, but it is"
+                " usually not the one intended"
+            )
+        if entry["route"]["dead_end_inside"]:
+            warnings.append(
+                f"the flow path from inlet {entry['cell']} ends at {tr['end']} after"
+                f" {tr['steps']} cells with no D8 direction (code {tr['code']}) and that"
+                " cell is not on the domain edge -- this stretch of river has nowhere to"
+                " go in the derived network"
+            )
+
+    same = None
+    labs = [e["component"] for e in ins + outs]
+    if labs and all(x is not None for x in labs):
+        same = len(set(labs)) == 1
+        if not same:
+            warnings.append(
+                f"inlet and outlet are in different pieces of channel {sorted(set(labs))}"
+                " -- with the main stem carried as a channel that is a sealed stretch;"
+                " with max_area_km2 set it is expected, because the trunk between them is"
+                " floodplain by choice"
+            )
+    return {
+        "inlets": ins,
+        "outlets": outs,
+        "same_component": same,
+        "warnings": warnings,
+    }
+
+
+def drainage_check(
+    width: np.ndarray,
+    area_km2: np.ndarray,
+    flowdir: np.ndarray,
+    *,
+    dirmap: tuple[int, ...] | list[int] = DEFAULT_DIRMAP,
+    report_max: int = 10,
+) -> dict:
+    """Which pieces of the derived network drain out of the domain, and which do not.
+
+    For each rook-connected component, the flow path is traced from its
+    highest-accumulation cell -- the piece's own outlet. A component is **sealed** when
+    that path dead-ends inside the window (``no_direction`` or ``loop`` away from the
+    border) rather than leaving it.
+
+    A bounding-box touch is not this test and must not be mistaken for it: on the real
+    DEM's M0 tile all 27 pieces reach the window edge somewhere, while the second-largest
+    of them (924 cells, 1262 km²) drains to an unresolved flat in the middle of the
+    domain. Sprawling to the edge through a tributary says nothing about where the water
+    goes.
+    """
+    mask = np.asarray(width) > 0.0
+    area = np.asarray(area_km2, dtype=np.float64)
+    labels, sizes = component_labels(mask, diagonal=False)
+    shape = (int(mask.shape[0]), int(mask.shape[1]))
+    sealed: list[dict] = []
+    largest: dict | None = None
+    for lab in range(int(sizes.size)):
+        sel = labels == lab
+        pos = np.unravel_index(int(np.argmax(np.where(sel, area, -np.inf))), shape)
+        tr = trace_downstream(flowdir, pos, dirmap=dirmap)
+        entry = {
+            "component": lab,
+            "cells": int(sizes[lab]),
+            "outlet": [int(pos[0]), int(pos[1])],
+            "outlet_area_km2": float(area[pos]),
+            "outlet_on_edge": _on_border(pos, shape),
+            "reason": tr["reason"],
+            "code": tr["code"],
+            "steps": tr["steps"],
+        }
+        if tr["reason"] in ("no_direction", "loop") and not _on_border(tr["end"], shape):
+            sealed.append(entry)
+        if largest is None or entry["cells"] > largest["cells"]:
+            largest = entry
+    sealed.sort(key=lambda e: -e["cells"])
+    return {
+        "components": int(sizes.size),
+        "sealed_components": len(sealed),
+        "sealed_cells": int(sum(e["cells"] for e in sealed)),
+        "largest": largest,
+        "sealed": sealed[: int(report_max)],
+    }
+
+
 def hydraulic_geometry(
     area_km2: np.ndarray,
     *,
@@ -263,6 +576,7 @@ def hydraulic_geometry(
     depth_coef: float = DEFAULT_DEPTH_COEF,
     depth_exp: float = DEFAULT_DEPTH_EXP,
     min_area_km2: float = DEFAULT_MIN_AREA_KM2,
+    max_area_km2: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """Channel ``(width, depth, n_clipped)`` fields from upstream drainage area.
 
@@ -279,9 +593,18 @@ def hydraulic_geometry(
     understates the river -- by up to 10.5x on the real DEM at ``coarsen = 4`` -- and
     reports the clip count against the wrong denominator (30 % where the run's own
     figure is 5.4 %). :func:`channel_fields` takes ``coarsen`` for this reason.
+
+    ``max_area_km2`` is the other end of the same argument: a cell whose river is
+    *wider* than ``dx`` is not sub-grid, so carrying it clipped is a degenerate model
+    rather than an approximate one. Setting the cutoff to :func:`subgrid_cutoff_km2`
+    drops those cells from the mask -- the main stem then travels as ordinary on-grid
+    flow and only the tributaries are sub-grid. ``None`` (the default) keeps them and
+    clips, which is what every figure recorded before 2026-08-17 was measured under.
     """
     area = np.asarray(area_km2, dtype=np.float64)
     river = area >= float(min_area_km2)
+    if max_area_km2 is not None:
+        river &= area <= float(max_area_km2)
     width = np.where(river, width_coef * np.power(np.maximum(area, 0.0), width_exp), 0.0)
     depth = np.where(river, depth_coef * np.power(np.maximum(area, 0.0), depth_exp), 0.0)
     clipped = int(np.count_nonzero(width > dx))
@@ -329,6 +652,9 @@ def channel_fields(
     *,
     coarsen: int = 1,
     connect: bool = True,
+    max_area_km2: float | str | None = None,
+    inlets: list[tuple[int, int]] | tuple = (),
+    outlets: list[tuple[int, int]] | tuple = (),
     **coeffs: float,
 ) -> dict:
     """Write ``channel_width.r32`` / ``channel_depth.r32`` for a tile mosaic.
@@ -341,6 +667,14 @@ def channel_fields(
     the resolution the run steps at, ``coarsen * dx``, not the tile resolution.
     ``connect`` applies :func:`rook_connect` first -- leave it on unless you are
     deliberately reproducing the unconnected network, which does not convey.
+
+    ``max_area_km2`` drops rivers too big to be sub-grid at the run resolution;
+    ``"auto"`` resolves it to :func:`subgrid_cutoff_km2` from the coefficients actually
+    in use, and ``None`` (the default) carries them clipped to the cell. ``inlets`` /
+    ``outlets`` are ``(row, col)`` cells in this field's coordinates -- the same ones a
+    scenario's ``[[inflow]]`` uses -- and their :func:`route_report` is written into
+    ``channels.json`` beside the geometry, because where the water goes in is part of
+    what these fields mean.
     """
     from pipeline.tile import read_conditioned  # local: needs rasterio (geo extra)
 
@@ -355,13 +689,27 @@ def channel_fields(
     area = area_km2_from_accumulation(acc[r0:r1, c0:c1], dx)
 
     min_area = float(coeffs.get("min_area_km2", DEFAULT_MIN_AREA_KM2))
+    dirmap = tuple(meta.get("dirmap") or DEFAULT_DIRMAP)
+    fdir = _read_flowdir(cond_dir)[r0:r1, c0:c1]
     inserted = 0
     if connect:
-        dirmap = meta.get("dirmap") or DEFAULT_DIRMAP
-        fdir = _read_flowdir(cond_dir)[r0:r1, c0:c1]
         area, inserted = rook_connect(area, fdir, dirmap=dirmap, min_area_km2=min_area)
 
-    width, depth, clipped = hydraulic_geometry(area, dx=run_dx, **coeffs)
+    if isinstance(max_area_km2, str):
+        if max_area_km2 != "auto":
+            raise ValueError(f"max_area_km2 must be a number, 'auto' or None, got {max_area_km2!r}")
+        max_area = subgrid_cutoff_km2(
+            run_dx,
+            width_coef=coeffs.get("width_coef", DEFAULT_WIDTH_COEF),
+            width_exp=coeffs.get("width_exp", DEFAULT_WIDTH_EXP),
+        )
+    else:
+        max_area = None if max_area_km2 is None else float(max_area_km2)
+    above = 0
+    if max_area is not None:
+        above = int(np.count_nonzero((area >= min_area) & (area > max_area)))
+
+    width, depth, clipped = hydraulic_geometry(area, dx=run_dx, max_area_km2=max_area, **coeffs)
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -380,16 +728,26 @@ def channel_fields(
             "depth_coef": coeffs.get("depth_coef", DEFAULT_DEPTH_COEF),
             "depth_exp": coeffs.get("depth_exp", DEFAULT_DEPTH_EXP),
             "min_area_km2": min_area,
+            "max_area_km2": max_area,
         },
         "note": "downstream hydraulic geometry -- REGIONAL CALIBRATION INPUTS, not constants",
         "channel_cells": int(np.count_nonzero(width)),
         "width_clipped_to_run_dx": clipped,
         "width_max_m": float(width.max()),
         "depth_max_m": float(depth.max()),
+        "subgrid_cutoff_km2": subgrid_cutoff_km2(
+            run_dx,
+            width_coef=coeffs.get("width_coef", DEFAULT_WIDTH_COEF),
+            width_exp=coeffs.get("width_exp", DEFAULT_WIDTH_EXP),
+        ),
+        "cells_above_max_area": above,
         "rook_connected": bool(connect),
         "cells_inserted_for_connectivity": inserted,
         "connectivity": connectivity_report(width),
+        "drainage": drainage_check(width, area, fdir, dirmap=dirmap),
     }
+    if inlets or outlets:
+        record["route"] = route_report(width, fdir, inlets, outlets, dirmap=dirmap)
     (out / "channels.json").write_text(json.dumps(record, indent=2))
     return record
 
@@ -412,6 +770,29 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="skip the 4-connectivity fix -- the derived network then does not convey, "
         "and no gate in this repo will say so (see the module docstring)",
     )
+    p.add_argument(
+        "--max-area-km2",
+        default=None,
+        help="drop rivers above this drainage area from the channel mask -- they are "
+        "wider than a cell, so carrying them is a degenerate model, and the main stem "
+        "travels on the grid instead. 'auto' uses the area whose channel is exactly one "
+        "cell wide at the run resolution (default: keep them, clipped to the cell)",
+    )
+    p.add_argument(
+        "--inlet",
+        action="append",
+        default=[],
+        metavar="ROW,COL",
+        help="a cell water is put into (a scenario's [[inflow]] cell, in this field's "
+        "pre-coarsen coordinates); repeatable. Reported in channels.json",
+    )
+    p.add_argument(
+        "--outlet",
+        action="append",
+        default=[],
+        metavar="ROW,COL",
+        help="a cell water is meant to leave by; repeatable",
+    )
     p.add_argument("--width-coef", type=float, default=DEFAULT_WIDTH_COEF)
     p.add_argument("--width-exp", type=float, default=DEFAULT_WIDTH_EXP)
     p.add_argument("--depth-coef", type=float, default=DEFAULT_DEPTH_COEF)
@@ -420,14 +801,28 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _parse_cell(text: str) -> tuple[int, int]:
+    """``"row,col"`` -> ``(row, col)``."""
+    parts = text.replace("(", "").replace(")", "").split(",")
+    if len(parts) != 2:
+        raise ValueError(f"expected ROW,COL, got {text!r}")
+    return int(parts[0]), int(parts[1])
+
+
 def main(argv: list[str] | None = None) -> None:
     a = _parse_args(argv)
+    max_area: float | str | None = a.max_area_km2
+    if isinstance(max_area, str) and max_area != "auto":
+        max_area = float(max_area)
     rec = channel_fields(
         a.src,
         a.tiles,
         a.out,
         coarsen=a.coarsen,
         connect=not a.no_connect,
+        max_area_km2=max_area,
+        inlets=[_parse_cell(t) for t in a.inlet],
+        outlets=[_parse_cell(t) for t in a.outlet],
         width_coef=a.width_coef,
         width_exp=a.width_exp,
         depth_coef=a.depth_coef,
@@ -457,12 +852,59 @@ def main(argv: list[str] | None = None) -> None:
             " face, so this network fills rather than conveys -- and the mass gate cannot"
             " see it."
         )
+    cut = rec["coefficients"]["max_area_km2"]
+    if cut is not None:
+        print(
+            f"  cutoff      : A <= {cut:.1f} km2 ({rec['cells_above_max_area']} cells above it"
+            " are floodplain, not channel -- the main stem is resolved on the grid)"
+        )
     if rec["width_clipped_to_run_dx"]:
         print(
             f"  NOTE: {rec['width_clipped_to_run_dx']} cells had a channel wider than the run's"
-            f" {rec['run_dx_m']:.1f} m cell and were clipped -- the grid is coarse for this"
-            " river. Raise --min-area-km2 to leave the main stem on the grid instead."
+            f" {rec['run_dx_m']:.1f} m cell and were clipped to it -- there the model is not"
+            " sub-grid at all, it is 'the river is one cell across', and that is where the"
+            f" flood is. Pass --max-area-km2 auto (= {rec['subgrid_cutoff_km2']:.1f} km2 here)"
+            " to leave the main stem on the grid instead."
         )
+    dr = rec["drainage"]
+    if dr["sealed_components"]:
+        worst = dr["sealed"][0]
+        print(
+            f"  WARNING: {dr['sealed_components']} of {dr['components']} pieces of channel"
+            f" ({dr['sealed_cells']} cells) drain to a dead end inside the domain. The"
+            f" largest is {worst['cells']} cells ending at {worst['outlet']} with"
+            f" {worst['outlet_area_km2']:.1f} km2 upstream and no D8 direction (code"
+            f" {worst['code']}) -- water put in there ponds, and the mass gate cannot see it."
+        )
+    route = rec.get("route")
+    if route:
+        for e in route["inlets"]:
+            r = e["route"]
+            print(
+                f"  inlet {e['cell']}: {'channel' if e['in_channel'] else 'FLOODPLAIN'}"
+                f" w={e['width_m']:.1f} m, piece {e['component']} ({e['component_cells']} cells);"
+                f" flow path {r['reason']} after {r['steps']} cells, {r['channel_steps']} of them"
+                " channel"
+            )
+        for e in route["outlets"]:
+            print(
+                f"  outlet {e['cell']}: {'channel' if e['in_channel'] else 'floodplain'},"
+                f" piece {e['component']} ({e['component_cells']} cells)"
+            )
+        same = route["same_component"]
+        if same is True:
+            print("  route       : inlet and outlet are in the same piece of channel")
+        elif same is False:
+            print("  route       : inlet and outlet are in DIFFERENT pieces of channel")
+        elif cut is not None:
+            print(
+                "  route       : not a channel-to-channel route -- with a cutoff set the main"
+                " stem is floodplain on purpose, so read the flow path above instead"
+            )
+        else:
+            print("  route       : one of the cells is not in the channel (see the warning)")
+    for msg in route["warnings"] if route else []:
+        print(f"  WARNING: {msg}")
     print("  coefficients are regional calibration inputs; see channels.json")
 
 

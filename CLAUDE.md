@@ -15,6 +15,41 @@ A faithful research/education sandbox validated against benchmarks — **not a
 regulatory-certification tool**. State that honestly anywhere it matters.
 
 ## Status
+- **Real DEM channel fields — the derived river connects, and now it also drains
+  somewhere (2026-08-17).** Not a milestone; the first thing past the roadmap. `M0–M7`
+  are all validated on **synthetic** basins, and `pipeline/channels.py` — the module that
+  derives channel geometry from real flow accumulation — had never been run. Three
+  defects, each invisible to every gate in the repo because **mass is conserved just as
+  well in a domain that fills as in one that conveys**. (1) A D8 path steps diagonally
+  **48 %** of the time and the solver has no diagonal face, so the derived network was
+  **19 008 rook-connected fragments** where the same mask is 61 pieces under
+  8-connectivity — a chain of pools. `rook_connect` carries the channel through a corner
+  cell at each diagonal step **and gives it the through-river's width** (on its own
+  drainage area it is a 3.6 % aperture — a pinhole, not a channel); the 4-connected
+  component count then equals the 8-connected one at every resolution. (2) The width clip
+  was taken at the **tile** resolution while the run steps at `coarsen · dx`, understating
+  the main stem by up to **10.5×**. (3) **What counts as a river was nobody's choice.**
+  `subgrid_cutoff_km2` inverts the width law — **198.1 km²** at the coarsen-4 cell — and
+  `--max-area-km2 auto` drops the rivers wider than a cell: clip **2740 → 0 cells**,
+  widest channel 0.968 dx, main stem resolved on the grid like any other terrain. **Its
+  price is the spine**: those tributaries were connected *through* the trunk, so the
+  network shatters **29 → 69** pieces (27 → 64 as the solver runs it) and the chosen
+  inlet-to-outlet route goes from **397 of 397** channel cells to **123 of 396**. Default
+  **off** — it is a modelling choice and every earlier figure was measured without it.
+  **And the finding the pass was not looking for:** 95 cells of the conditioned raster
+  have **no D8 direction** (pysheds `-2`/`-1`/`0`), and the largest swallows **1262.5 km²**
+  at field cell `[796, 869]` onto a **292-cell flat at 530.5 m** that the fill left
+  unresolved — accumulation restarts at 1 below it. **2 of 29 pieces, 3769 of 25 962
+  channel cells (14.5 %), drain to a dead end inside the domain**, and water put there
+  ponds. `drainage_check` finds them; `route_report` answers whether a scenario's inflow
+  cells are in the channel and on a piece that gets out (`--inlet` / `--outlet`, recorded
+  in `channels.json`). **374 → 400 tests green** across both passes (the connectivity
+  gates run in a bare `uv run pytest`; the `channel_fields` plumbing needs
+  `uv sync --extra geo`). Two things measured and *not* true: the
+  min-area cutoff **cannot** sever a river (accumulation is monotone downstream, so the
+  mask is downstream-closed), and a **bounding-box touch is not a drainage test** — all 27
+  pieces reach the window edge, including the stranded one. See
+  `docs/plans/real-dem-reach.md` §5.1–§5.2.
 - **Viewer channel surface: done (2026-08-17).** The last carried item in the repo, and
   **the fix it specified was not renderable** — which is most of what the pass produced.
   The shader lifted every cell as `bed + depth` (M1's relation), so on the M6 demo the
@@ -455,8 +490,13 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   channels. Generate its synthetic basin + channel fields first with
   `uv run python scripts/make_reach_demo.py`. For a real DEM, derive the channel fields
   from the M0 flow accumulation: `uv run python -m pipeline.channels --src <conditioned>
-  --tiles <tiles> --out <fields>` (its hydraulic-geometry coefficients are **regional
-  calibration inputs**, recorded beside the fields).
+  --tiles <tiles> --out <fields> --coarsen <k> --max-area-km2 auto --inlet r,c --outlet r,c`
+  (its hydraulic-geometry coefficients are **regional calibration inputs**, recorded
+  beside the fields). `--coarsen` must match the scenario's `[grid] coarsen` or the river
+  is clipped at the wrong resolution; `--max-area-km2 auto` is the choice to leave the
+  main stem on the grid (§5.2.1, default off); `--inlet`/`--outlet` check the cells a
+  scenario will use *before* a run. The real-DEM fields live at `data/fields/smoky`
+  (M0 tile, `coarsen = 4`) — read its `channels.json`, especially the `drainage` census.
 - M5 scenario: `scenarios/reservoir_release.toml` — a dam with a `target_stage` release
   rule on the slow clock, a tidal `fixed_stage` southern edge, and inflow hydrographs
   filling the reservoir. Generate its synthetic valley tile first with
@@ -698,6 +738,35 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   a channel band that steps sideways faster than it is wide has a wall across it and
   nothing in the depth field says so. Check connectivity when authoring channel geometry
   (`scripts/make_reach_demo.py::check_continuity` exists because the first demo did this).
+  A **derived** network fails this by construction — a D8 path is 8-connected and the
+  solver's faces are not — so `pipeline.channels` rook-connects it and reports
+  `components_4` against `components_8`.
+- **A connected network is not a draining one, and a bounding box is not a drainage test.
+  (2026-08-17.)** The conditioning leaves cells with **no D8 direction** (pysheds writes
+  `-2` for a resolved outlet, `-1` for nodata, `0` for a pit) — 95 of them in this raster,
+  the largest swallowing **1262.5 km²** onto a 292-cell flat SRTM renders level.
+  Accumulation restarts at 1 below it, so the derived river stops dead in the middle of the
+  domain: **14.5 %** of the M0 window's channel cells are on pieces that drain nowhere, and
+  water put there ponds while the mass gate reads clean. `drainage_check` traces from each
+  piece's **highest-accumulation** cell, because every one of the 27 pieces *reaches* the
+  window edge — the stranded one included, through its tributaries. Two further things
+  measured and **not** true: the min-area cutoff **cannot** sever a river (flow
+  accumulation is monotone downstream, so the mask is downstream-closed and there is no
+  pruned link to repair), and a trace on the *filled* raster is not a claim about the run,
+  because the tiles carry the **raw** bed — "water reaches the outlet" stays a run-time
+  gate. Check a scenario's cells with `pipeline.channels --inlet r,c --outlet r,c` before
+  running: nothing in the solver checks that an `[[inflow]]` cell is in the river, or that
+  the river it is in gets out.
+- **What counts as a river is a choice with a price, so make it explicitly.** Above
+  `subgrid_cutoff_km2(run_dx)` the hydraulic geometry asks for a channel wider than its
+  cell, and clipping it means the model degenerates to "the river is one cell across"
+  exactly where the flood is (2740 cells on the M0 tile at `coarsen = 4`).
+  `--max-area-km2 auto` drops those rivers so the main stem is ordinary on-grid terrain —
+  and **shatters the network**, 29 pieces to 69, because the tributaries hung off that
+  trunk; on the chosen route, 397 of 397 channel cells become 123 of 396. Default off, and
+  recorded in `channels.json` when on. The old `NOTE` told you to *raise* `--min-area-km2`,
+  which drops small tributaries, keeps the trunk and moves the clip count by nothing —
+  a hint pointing the wrong way is worse than none.
 - **Never keep depth non-negative with a bare `max(h, 0)`.** It invents mass and
   silently breaks the ledger and any boundary banking (M4 measured ~6.5e-2 on a full
   drain, five orders over the gate). Both schemes use a **donor-cell β mass-flux
