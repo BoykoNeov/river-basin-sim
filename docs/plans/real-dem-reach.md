@@ -1,6 +1,11 @@
 # Real DEM, end to end — the reach machinery on terrain that was not built to suit it
 
-**Status: steps 1–2 done and the §4 cutoff chosen, 2026-08-17; steps 3–7 planned.** Not a milestone. M0–M7 are signed off and every carried
+**Status: steps 1–5 done, 2026-08-17; steps 6–7 blocked on a defect step 5 found.** The
+mosaic is cut, the fields are derived and the scenario ran — and it **does not convey**:
+`coarsen`'s block-mean bed aggregation is volume-preserving but not *descent*-preserving,
+so at 112.59 m the chosen river climbs 1.17× as much as it descends and 4.19 M m³ ponds
+five cells below the inlet with the mass gate reading clean. See §5.3. Not a milestone.
+M0–M7 are signed off and every carried
 item is closed; this is the first thing chosen after the roadmap ran out. It is the one
 path the repo has never walked: **every reach-scale run in the repo is synthetic.**
 `scripts/make_reach_demo.py` builds the basin, the river and the channel fields that
@@ -434,10 +439,167 @@ coefficients. **387 → 401 tests green** — the connectivity, cutoff, trace an
 in `pipeline/test_channels.py` (pure numpy, no geo extra, because they gate defects
 nothing else can see), the `channel_fields` plumbing in `pipeline/test_pipeline.py`.
 
+## 5.3 Steps 3–5 on the full mosaic — the run that does not convey (2026-08-17)
+
+The mosaic was cut, the fields were derived, the scenario was authored and it was run.
+**Every gate §6 listed passed except the one that matters, and the reason is a design
+choice M6 shipped, not anything in §2–§5.2.** This section is the finding; step 6
+(viewer) and step 7 (final write-up) are not done, because what they would show is a
+still pond.
+
+### 5.3.1 The mosaic itself was uneventful, which is worth one paragraph
+
+`pipeline.tile --src data/dem/conditioned --out data/tiles/smoky` writes **16 tiles**,
+ragged edges of 919 rows and 211 cols, and the two bounding-box formulas
+(`channels._mosaic_window`, `mosaic._bbox`) are byte-identical, so the shapes agree by
+construction: **3991 × 3283, origin (0, 0), zero gap cells, 16/16 tiles used**, i.e.
+997 × 820 = **817 540 cells** at `coarsen = 4`. The ragged-edge handling the mosaic
+loader documents worked first time on real data. That was the whole of step 3's risk as
+written, and it was not where the trouble was.
+
+### 5.3.2 Three things the repo had written down were wrong
+
+Found while reading the census, and all three are now corrected in the code:
+
+**The pysheds codes were backwards.** `flowdir(..., flats=-1, pits=-2)`, verified from
+the installed signature, with nodata at `0`. So **`-1` is an unresolved flat, `-2` is a
+pit**, where this plan, `pipeline/channels.py` and CLAUDE.md all said "`-2` outlet, `-1`
+nodata, `0` pit". All three assignments were wrong.
+
+**The "292-cell flat at 530.5 m" is a single-cell pit.** Measured 8-connected on the
+filled surface it is **1 cell**, its rim stands **1 mm** above it, and `fill_pits` raises
+those cells by up to **1.28 m**. More usefully: on the **raw** bed *all 100* interior
+no-direction cells have a lower neighbour, so they are **artefacts of the conditioning
+chain, not closed basins in the terrain** — a different and more actionable claim than
+the one recorded. They are also not cheaply fixable: `fill_pits` takes the stranded share
+**39.1 % → 23.6 %**, a further `resolve_flats` pass to **20.1 %**. Iterating the
+primitives converges slowly and not to zero, so this is documented, not fixed, and
+`data/dem/conditioned` is deliberately **not** re-run — every recorded figure in the repo
+depends on it.
+
+**A one-tile census understated the strandings by 2.7×.** 39.1 % of the domain's valid
+cells drain to one of 100 interior dead ends, against §5.2.2's **14.5 %** from the single
+M0 tile. A window that happens to miss the pits looks clean.
+
+Also recorded: **`filled_elevation.tif` is a diagnostic surface, not a reproducible
+input.** `resolve_flats` works in float64 and separates a flat by a sub-millimetre
+gradient that `write_outputs` casts to float32. Re-deriving directions from the written
+file yields **376 345** flats against the shipped **14 096** — 27×. It cost an invalid
+experiment here before it was noticed.
+
+### 5.3.3 The connectivity warning was blaming the cutoff's price on the D8 defect
+
+With the cutoff on the mosaic reads **458** components 4-connected against **456**
+8-connected with **9** isolated cells, and the CLI printed §2's words: *"this network
+fills rather than conveys — and the mass gate cannot see it."* The same network with the
+cutoff **off** reads **163 / 163, 0 isolated**. So the gate breaks because the cutoff cut
+tributaries loose from a trunk that is floodplain *by choice*, exactly as §5.2.1
+predicted — and a reader was being sent after a bug that is not there.
+
+`rook_connect` cannot simply run after the cutoff: it needs the uncut network to know
+what the through-river is. So the fix is in the reporting. `isolation_cause` decides by
+**measuring** the same network without the cutoff (`connectivity_without_cutoff`, now in
+`channels.json`) rather than assuming, and the D8 text still fires when it is true.
+
+### 5.3.4 The run: 4.19 M m³ in, 0.000 m³ out
+
+`scenarios/smoky_reach.toml` — whole mosaic, `coarsen = 4`, datum auto, no rain, a
+120 m³/s flood wave split across four cells verified in-channel and on a draining piece,
+open boundaries. 12 h, 25 frames, CUDA.
+
+| | |
+|---|---|
+| mass balance | **6.35e-07** (gate 1e-6) — *passes* |
+| inflow_cum | 4 190 400 m³ |
+| **outflow_cum** | **0.000 m³** |
+| ledger residual | 2.2 m³ |
+| wet cells (>1 mm) | **56** of 817 540 |
+| deepest cell | 12.88 m, five cells below the inlet |
+| water at the outlet | **none, at any frame** |
+
+**The mass gate passed a run that moved nothing**, which is precisely what §6 anticipated
+("necessary and not sufficient — a dammed river passes it"). The residual is a near-static
+pond over 43 200 s at a 747 m datum, i.e. the conditioning gauge CLAUDE.md describes; it
+will need re-measuring on a run that conveys and should not be tuned against this one.
+
+### 5.3.5 The cause: block-mean coarsening is volume-preserving, not descent-preserving
+
+M6 aggregates the bed by block **mean** because that conserves floodplain storage. On the
+synthetic demo the valley is deliberately wider than a cell, so the mean is nearly
+harmless. **A real mountain river valley is narrower than a 112.59 m cell and meanders
+inside the block**, so the mean replaces the valley floor with an average of floor and
+valley wall — and the river stops running downhill. Ascent summed along the chosen route,
+on the bed the solver steps:
+
+| bed aggregation | run `dx` | net drop | ascent | uphill steps | worst rise |
+|---|---|---|---|---|---|
+| raw | 28.15 m | 267.3 m | **0.00 m** | 0 / 337 | 0.00 m |
+| block mean, `k=2` | 56.29 m | 267.3 m | **143.04 m** | 61 / 227 | 7.27 m |
+| block mean, `k=4` | 112.59 m | 269.9 m | **314.92 m** | 49 / 118 | 23.42 m |
+| block min, `k=2` | 56.29 m | 267.3 m | 0.00 m | 0 / 227 | 0.00 m |
+| block min, `k=4` | 112.59 m | 267.3 m | 0.00 m | 0 / 118 | 0.00 m |
+
+At the resolution the plan chose, **the river climbs 1.17× as much as it descends**.
+
+**It is not one valley.** Over 23 independently sampled routes (20–200 km² headwaters,
+≥ 50 cells long), block mean:
+
+| | mean ascent | median | worst | uphill-step share | routes with zero ascent |
+|---|---|---|---|---|---|
+| `k=1` | 0.0 m | 0.0 | 0.0 | 0.0 % | 14 of 23 |
+| `k=2` | 154.3 m | 56.5 | 518.1 | 23.9 % | 0 of 23 |
+| `k=4` | 431.1 m | 122.2 | 1544.1 | 38.6 % | 0 of 23 |
+
+and on the 21 routes whose drop at that resolution is still ≥ 10 m, ascent exceeds drop
+on **9 of 21** at `k=2` and **18 of 21** at `k=4` (median ratio 0.92 and 2.10). At `k=4`,
+**2 of 23 routes end higher than they start**. Two reporting notes, both learned the hard
+way: a ratio against a non-positive drop is not a number (unguarded it printed 9.8e10, so
+it is now `None`), and the `k=1` row reads "0.0 mean ascent" while only 14 of 23 routes
+are *exactly* zero — the residue is real and expected, because the path comes from the
+**filled** raster while the elevation is read on the **raw** bed, so a filled pit shows as
+a small rise.
+
+**Block min preserves the descent exactly** at every resolution — and is not the fix.
+It lowers the whole terrain and destroys the floodplain-storage property that made mean
+the choice. The better shape is probably to carry the thalweg in the sub-grid channel
+invert `z − d`, which already exists and is already sub-grid; that is design work with
+its own validation and it is **not** attempted here.
+
+### 5.3.6 The synthetic sign-offs stand, and this was checked rather than assumed
+
+`reach_basin` and `reach_alluvial` run the synthetic basin at `coarsen = 2`. Measured on
+its analytic centreline: ascent **7.87 m** against a **115.01 m** drop — a ratio of
+**0.068**, against the real DEM's median **0.92** at the same `k`. So the effect exists in
+kind wherever block mean is used, is **≈14× smaller in ratio terms** on terrain built
+wide and smooth, and never comes close to preventing conveyance. M6 and M7 are not in
+question.
+
+### 5.3.7 What this changes about the gates
+
+The route check *passed* and was not enough. In-channel, 4-connected, drains out of the
+domain — all three are properties of the **filled** D8 raster, and the solver integrates
+the **coarsened raw bed**. `descent_report` is the missing pre-flight: it walks the flow
+path on the block-mean bed at the run's `coarsen` and reports ascent, uphill steps, worst
+rise and net drop. `pipeline.channels --inlet` now runs it and warns, so this costs a
+second instead of a 12-hour run.
+
+One trap inside the fix, caught by its own output: the conditioned raster keeps nodata as
+a **-32768 sentinel**, and `pipeline.tile` replaces it per tile with that tile's minimum.
+A flow path never enters nodata, which makes it look safe — but a *block mean around* a
+path cell does, and the first version read a **33 508 m** "net drop" on a route that falls
+268 m. `fill_tile_nodata` reproduces the tiler's fill first.
+
+**401 → 409 tests green.**
+
 ## 6. Gates
 
 - Every cell of the derived channel mask has a 4-connected neighbour in the mask, and the
-  mask's 4-connected component count equals its 8-connected one (step 1's test).
+  mask's 4-connected component count equals its 8-connected one (step 1's test). **When a
+  cutoff is set this can legitimately fail** — attribute it with `isolation_cause` before
+  reading it as the D8 defect (§5.3.3).
+- **The route runs downhill on the bed the solver steps, at the run's `coarsen`**
+  (§5.3.5, `descent_report`). Not implied by any of the network checks, and the one that
+  would have caught the failed run before it started.
 - Clip count is reported against the run resolution (step 2's test).
 - The cutoff that decides what counts as a river is recorded in `channels.json`, and with
   it set nothing is clipped to its cell (§5.2.1's test).

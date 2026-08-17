@@ -23,7 +23,9 @@ from pipeline.channels import (
     components,
     connectivity_report,
     d8_offsets,
+    descent_report,
     drainage_check,
+    fill_tile_nodata,
     hydraulic_geometry,
     isolated_cells,
     isolation_cause,
@@ -511,3 +513,131 @@ def test_same_piece_is_a_question_about_a_pair_and_needs_both_cells():
 
     # An outlet off the channel leaves the pair unanswerable rather than answered.
     assert route_report(w, fdir, [(3, 6)], [(5, 5)])["same_component"] is None
+
+
+# --- does the route run downhill on the surface the solver steps? -------------
+
+
+def _valley(ny: int = 28, nx: int = 28) -> tuple[np.ndarray, list[tuple[int, int]]]:
+    """A narrow valley descending south, meandering across block boundaries.
+
+    The real DEM's failure in miniature, and the geometry has to be right or it does
+    not reproduce. The valley floor is a **single cell** per row, 60 m below its own
+    hillside, and the hillside descends only 0.2 m per row. The block mean is therefore
+    dominated by the walls, and what makes it non-monotone is that the number of floor
+    cells falling inside a block **varies** -- so the meander's period must not divide
+    the block size. A first attempt swung the floor +-1 cell every other row: every
+    4x4 block then held exactly two floor cells, the means descended monotonically, and
+    nothing was measured. Period 7 against a block of 4 is the fix.
+    """
+    bed = np.zeros((ny, nx))
+    path: list[tuple[int, int]] = []
+    for r in range(ny):
+        bed[r, :] = 200.0 - 0.2 * r
+        col = nx // 2 + int(round(2.0 * np.sin(2.0 * np.pi * r / 7.0)))
+        bed[r, col] = 140.0 - 0.2 * r
+        path.append((r, col))
+    return bed, path
+
+
+def _valley_path(ny: int = 28, nx: int = 28) -> list[tuple[int, int]]:
+    return _valley(ny, nx)[1]
+
+
+def test_a_path_that_descends_at_full_resolution_is_reported_as_descending():
+    """The baseline: on the raw bed the valley floor only goes down."""
+    bed, path = _valley()
+    rep = descent_report(bed, path, coarsen=1)
+    assert rep["ascent_m"] == 0.0
+    assert rep["up_steps"] == 0
+    assert rep["net_drop_m"] == pytest.approx(0.2 * 27)
+    assert rep["ascent_over_drop"] == 0.0
+
+
+def test_block_mean_coarsening_can_take_the_descent_out_of_a_valley():
+    """The finding, in miniature: volume-preserving is not descent-preserving.
+
+    Nothing about the *network* changed -- same path, same cells, same drainage. Only
+    the surface the solver would integrate did, and the river stopped running downhill.
+    This is invisible to the connectivity, drainage and route checks, all of which are
+    properties of the filled D8 raster rather than of the bed.
+    """
+    bed, path = _valley()
+    coarse = descent_report(bed, path, coarsen=4)
+    assert coarse["ascent_m"] > 0.0
+    assert coarse["up_steps"] > 0
+    assert coarse["worst_rise_m"] > 0.0
+    # And it is worse than at full resolution, which is the comparison that matters.
+    assert coarse["ascent_m"] > descent_report(bed, path, coarsen=1)["ascent_m"]
+
+
+def test_a_ratio_against_a_non_positive_drop_is_refused_rather_than_printed():
+    """A coarsened route can end *higher* than it started (2 of 23 real ones did).
+
+    Dividing by that denominator produced 9.8e10 in the survey before it was guarded,
+    which is a number that would have gone into a table and meant nothing.
+    """
+    flat = np.zeros((8, 8))
+    rep = descent_report(flat, [(r, 0) for r in range(8)], coarsen=1)
+    assert rep["net_drop_m"] == 0.0
+    assert rep["ascent_over_drop"] is None
+
+    uphill = np.arange(8, dtype=float)[:, None] * np.ones((1, 8))
+    rep = descent_report(uphill, [(r, 0) for r in range(8)], coarsen=1)
+    assert rep["net_drop_m"] < 0.0
+    assert rep["ascent_over_drop"] is None
+    assert rep["ascent_m"] > 0.0
+
+
+def test_a_route_check_without_a_bed_says_nothing_about_descent():
+    """The bed is optional, and its absence must not read as "the route is fine"."""
+    area, fdir = _two_rivers()
+    w, _, _ = hydraulic_geometry(area, dx=1000.0, min_area_km2=1.0)
+    assert "descent" not in route_report(w, fdir, [(3, 6)])["inlets"][0]
+
+    bed = np.zeros(area.shape)  # flat: no descent, but also no ascent to warn about
+    with_bed = route_report(w, fdir, [(3, 6)], bed=bed)
+    assert with_bed["inlets"][0]["descent"]["ascent_m"] == 0.0
+    assert with_bed["warnings"] == []
+
+
+def test_the_descent_check_uses_the_tilers_nodata_fill_not_the_raw_sentinel():
+    """A -32768 sentinel inside a block turns a 268 m descent into a 33 508 m one.
+
+    The conditioned raster keeps nodata as a sentinel; `pipeline.tile` replaces it per
+    tile with that tile's own minimum. A flow path never enters nodata, so this looks
+    safe and is not: the *block mean* around a path cell reaches into the wedge.
+    """
+    nodata = -32768.0
+    bed = np.full((8, 8), 100.0)
+    # A corner wedge, as a reprojection leaves: it covers the downstream block and not
+    # the upstream one, so the two block means are corrupted by different amounts. A
+    # wedge covering both equally cancels out and measures nothing.
+    bed[4:, 6:] = nodata
+    tiles = [{"row": 0, "col": 0, "height": 8, "width": 8}]
+
+    filled = fill_tile_nodata(bed, tiles, nodata)
+    assert filled.min() == 100.0
+    assert not (filled == nodata).any()
+    # The original is untouched -- the caller may still need the sentinel.
+    assert (bed == nodata).sum() == 8
+
+    path = [(r, 5) for r in range(8)]
+    raw_drop = descent_report(bed, path, coarsen=4)["net_drop_m"]
+    filled_drop = descent_report(filled, path, coarsen=4)["net_drop_m"]
+    assert abs(raw_drop) > 1000.0  # the sentinel leaking into the mean
+    assert filled_drop == pytest.approx(0.0)
+
+
+def test_a_tile_that_is_entirely_nodata_does_not_crash_the_fill():
+    """An all-nodata tile has no minimum to fill from; 0.0 matches pipeline.tile."""
+    nodata = -32768.0
+    bed = np.full((4, 8), nodata)
+    bed[:, :4] = 50.0
+    tiles = [
+        {"row": 0, "col": 0, "height": 4, "width": 4},
+        {"row": 0, "col": 4, "height": 4, "width": 4},
+    ]
+    filled = fill_tile_nodata(bed, tiles, nodata)
+    assert filled[:, :4].min() == 50.0
+    assert (filled[:, 4:] == 0.0).all()

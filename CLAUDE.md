@@ -15,6 +15,39 @@ A faithful research/education sandbox validated against benchmarks — **not a
 regulatory-certification tool**. State that honestly anywhere it matters.
 
 ## Status
+- **Real DEM end to end — the run does not convey, and `coarsen` is why (2026-08-17).**
+  Steps 3–5 of `docs/plans/real-dem-reach.md`: the mosaic is cut (**16 tiles**, ragged
+  edges, shapes agreeing by construction — 3991×3283, zero gap cells, **817 540 cells** at
+  `coarsen = 4`), the fields are derived, `scenarios/smoky_reach.toml` is authored and it
+  **ran**. It injected **4.19 M m³** over 12 h and put **0.000 m³** out of the domain:
+  **56 wet cells of 817 540**, a 12.9 m pond five cells below the inlet, and a mass
+  balance of **6.35e-07** — *inside* the gate, because mass is conserved just as well in a
+  domain that fills as in one that conveys. **The cause is M6's bed aggregation, not
+  anything in the channel machinery.** Block **mean** is volume-preserving (that is why it
+  was chosen, for floodplain storage) but **not descent-preserving**, and a mountain river
+  valley is *narrower than a 112.59 m cell*: the mean replaces the valley floor with an
+  average of floor and valley wall. The chosen route descends **267.3 m with 0.00 m of
+  ascent** on the raw 28.15 m bed, climbs **143.04 m** at `coarsen = 2` and **314.92 m** at
+  `coarsen = 4` — **1.17× its own drop**, 49 of 118 steps uphill. **Not one valley**: over
+  23 sampled routes, `k=4` puts **38.6 %** of steps uphill and, on 18 of 21 routes with a
+  real drop, more ascent than descent; 2 of 23 end *higher* than they start. Block **min**
+  preserves it exactly at every `k` and is **not** the fix — it lowers the whole terrain
+  and destroys the storage property; the better shape is the sub-grid channel invert
+  `z − d`, and that is design work not attempted here. **The synthetic sign-offs stand and
+  this was checked, not assumed**: the same measurement on the demo basin at `coarsen = 2`
+  reads **7.87 m** of ascent against a 115.01 m drop (ratio **0.068** against the real
+  DEM's median 0.92), so M6/M7 are not in question. **Three recorded facts were also
+  wrong**: pysheds' codes are `-1` flat / `-2` pit / `0` nodata (all three were recorded
+  backwards); the "292-cell flat at 530.5 m" is a **single-cell pit** whose rim stands
+  1 mm above it, and on the *raw* bed all 100 interior dead ends have a lower neighbour,
+  so they are **conditioning artefacts, not terrain**; and a one-tile census understated
+  the stranded share **2.7×** (**39.1 %** of valid cells on the mosaic against 14.5 % on
+  the M0 tile). `fill_pits` only takes 39.1 % → 23.6 % → 20.1 %, so it is documented, not
+  fixed, and `data/dem/conditioned` is deliberately **not** re-run. Also: the connectivity
+  warning was blaming the **cutoff's** known price on the D8 defect (458/456 with 9
+  isolated, against **163/163 and 0** for the same network with the cutoff off) —
+  `isolation_cause` now attributes it by *measuring* both. **401 → 409 tests green.**
+  Steps 6–7 (viewer, final write-up) are blocked: what they would show is a still pond.
 - **Real DEM channel fields — the derived river connects, and now it also drains
   somewhere (2026-08-17).** Not a milestone; the first thing past the roadmap. `M0–M7`
   are all validated on **synthetic** basins, and `pipeline/channels.py` — the module that
@@ -36,10 +69,12 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   network shatters **29 → 69** pieces (27 → 64 as the solver runs it) and the chosen
   inlet-to-outlet route goes from **397 of 397** channel cells to **123 of 396**. Default
   **off** — it is a modelling choice and every earlier figure was measured without it.
-  **And the finding the pass was not looking for:** 95 cells of the conditioned raster
-  have **no D8 direction** (pysheds `-2`/`-1`/`0`), and the largest swallows **1262.5 km²**
-  at field cell `[796, 869]` onto a **292-cell flat at 530.5 m** that the fill left
-  unresolved — accumulation restarts at 1 below it. **2 of 29 pieces, 3769 of 25 962
+  **And the finding the pass was not looking for:** 95 cells of the M0 window have
+  **no D8 direction** (pysheds `-1` flat / `-2` pit / `0` nodata — *corrected 2026-08-17,
+  this bullet originally had all three backwards*), and the largest swallows
+  **1262.5 km²** at field cell `[796, 869]`, which the same correction shows is a
+  **single-cell pit** at 530.5 m and not the "292-cell flat" recorded here —
+  accumulation restarts at 1 below it. **2 of 29 pieces, 3769 of 25 962
   channel cells (14.5 %), drain to a dead end inside the domain**, and water put there
   ponds. `drainage_check` finds them; `route_report` answers whether a scenario's inflow
   cells are in the channel and on a piece that gets out (`--inlet` / `--outlet`, recorded
@@ -495,8 +530,21 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   beside the fields). `--coarsen` must match the scenario's `[grid] coarsen` or the river
   is clipped at the wrong resolution; `--max-area-km2 auto` is the choice to leave the
   main stem on the grid (§5.2.1, default off); `--inlet`/`--outlet` check the cells a
-  scenario will use *before* a run. The real-DEM fields live at `data/fields/smoky`
-  (M0 tile, `coarsen = 4`) — read its `channels.json`, especially the `drainage` census.
+  scenario will use *before* a run — and `--inlet` now also answers whether the route runs
+  **downhill on the coarsened bed**, which the network checks cannot. The real-DEM fields
+  live at `data/fields/smoky` (M0 tile, `coarsen = 4`) and `data/fields/smoky_mosaic`
+  (all 16 tiles, `coarsen = 4`) — read their `channels.json`, especially the `drainage`
+  census and the per-inlet `descent`.
+- Real-DEM scenario: `scenarios/smoky_reach.toml` — the whole 16-tile mosaic
+  (3991×3283 @ 28.15 m) run at `coarsen = 4`. **It does not convey, deliberately**: it is
+  the reproducer for the block-mean coarsening defect (see the status bullet and the
+  gotcha). Build its inputs with
+  `uv run python -m pipeline.tile --src data/dem/conditioned --out data/tiles/smoky`,
+  then `uv run python -m pipeline.channels --src data/dem/conditioned --tiles
+  data/tiles/smoky --out data/fields/smoky_mosaic --coarsen 4 --max-area-km2 auto
+  --inlet 305,2717 --inlet 303,2716 --inlet 300,2715 --inlet 299,2714 --outlet 0,2641`,
+  and give the run its own `--out` / `--frames-dir` / `--status`. The cutoff-off
+  comparison arm is the same command without `--max-area-km2 auto`.
 - M5 scenario: `scenarios/reservoir_release.toml` — a dam with a `target_stage` release
   rule on the slow clock, a tidal `fixed_stage` southern edge, and inflow hydrographs
   filling the reservoir. Generate its synthetic valley tile first with
@@ -741,12 +789,44 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   A **derived** network fails this by construction — a D8 path is 8-connected and the
   solver's faces are not — so `pipeline.channels` rook-connects it and reports
   `components_4` against `components_8`.
+- **Coarsening the bed by block mean conserves volume and loses *downhill*. (2026-08-17.)**
+  `[grid] coarsen` aggregates the bed by block **mean** because that preserves floodplain
+  storage — and on a real DEM it can take the descent out of a river entirely. A mountain
+  valley is narrower than a 112.59 m cell and meanders inside the block, so the mean
+  averages valley floor with valley wall. Measured: the chosen route on the M0 raster
+  descends **267.3 m with zero ascent** at 28.15 m, climbs **143.04 m** at `coarsen = 2`
+  and **314.92 m** at `coarsen = 4` — more than its own 269.9 m drop. Over 23 sampled
+  routes at `k=4`: **38.6 %** of steps uphill, ascent exceeding drop on 18 of 21. The run
+  that followed put **4.19 M m³** in and **0.000 m³** out, 56 wet cells of 817 540, while
+  the **mass gate read 6.35e-07 and passed** — mass is conserved perfectly in a domain
+  that fills. **Three things to carry.** *The network checks cannot see this*: in-channel,
+  4-connected and drains-out are all properties of the **filled** D8 raster, and the
+  solver integrates the **coarsened raw bed** — two different surfaces. Use
+  `pipeline.channels --inlet` (`descent_report`, recorded as `descent` in `channels.json`)
+  as the pre-flight; it costs a second instead of a 12-hour run. *Do not reach for block
+  min*: it preserves the descent exactly at every `k` and lowers the whole terrain,
+  destroying the property mean was chosen for — the promising direction is the sub-grid
+  channel invert `z − d`, which is already sub-grid. *And check the nodata fill before
+  block-averaging anything*: the conditioned raster keeps a **-32768** sentinel that
+  `pipeline.tile` replaces per tile, a flow path never enters nodata so it looks safe, and
+  a block mean *around* a path cell reads a **33 508 m** drop on a route that falls 268 m
+  (`fill_tile_nodata`). Synthetic terrain is affected in kind but ~14× less
+  (0.068 ratio on the demo basin at `k=2`), so M6/M7 stand.
+  See `docs/plans/real-dem-reach.md` §5.3.
 - **A connected network is not a draining one, and a bounding box is not a drainage test.
   (2026-08-17.)** The conditioning leaves cells with **no D8 direction** (pysheds writes
-  `-2` for a resolved outlet, `-1` for nodata, `0` for a pit) — 95 of them in this raster,
-  the largest swallowing **1262.5 km²** onto a 292-cell flat SRTM renders level.
+  `-1` for an unresolved **flat**, `-2` for a **pit** and `0` for nodata — its
+  `flowdir(..., flats=-1, pits=-2)` defaults; this bullet had all three backwards until
+  the full mosaic was measured) — 95 of them in the M0 window, **100 interior in valid
+  data across the whole raster** (91 pits, 9 flats), the largest swallowing
+  **1262.5 km²** into a **single-cell pit** whose rim stands 1 mm above it. On the *raw*
+  bed all 100 have a lower neighbour, so these are **conditioning artefacts, not closed
+  basins**, and pysheds' own `fill_pits` only takes the stranded share 39.1 % → 23.6 %
+  → 20.1 %, so it is documented rather than fixed.
   Accumulation restarts at 1 below it, so the derived river stops dead in the middle of the
-  domain: **14.5 %** of the M0 window's channel cells are on pieces that drain nowhere, and
+  domain: **14.5 %** of the M0 window's channel cells are on pieces that drain nowhere —
+  but **39.1 %** of the *full mosaic's* valid cells do, so a one-tile census understates
+  this 2.7× — and
   water put there ponds while the mass gate reads clean. `drainage_check` traces from each
   piece's **highest-accumulation** cell, because every one of the 27 pieces *reaches* the
   window edge — the stranded one included, through its tributaries. Two further things

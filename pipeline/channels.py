@@ -293,6 +293,106 @@ def _block_max(field: np.ndarray, k: int) -> np.ndarray:
     return cropped.reshape(ny // k, k, nx // k, k).max(axis=(1, 3))
 
 
+def _block_mean(field: np.ndarray, k: int) -> np.ndarray:
+    """Block-mean a field over ``k x k``, trailing partial blocks cropped.
+
+    Mirrors :func:`solver.io.coarsen.block_reduce`'s ``"mean"`` rule, which is how the
+    solver aggregates the **bed**. Duplicated for the same reason as :func:`_block_max`.
+    """
+    if int(k) <= 1:
+        return field
+    ny, nx = field.shape
+    cropped = field[: ny - ny % k, : nx - nx % k]
+    ny, nx = cropped.shape
+    return cropped.reshape(ny // k, k, nx // k, k).mean(axis=(1, 3))
+
+
+def fill_tile_nodata(bed: np.ndarray, tiles: list[dict], nodata: float) -> np.ndarray:
+    """Reproduce :func:`pipeline.tile._write_tile`'s nodata fill on a source-raster bed.
+
+    The conditioned raster carries a ``-32768`` sentinel in the reprojection corner
+    wedges; the tiler replaces it, **per tile**, with that tile's own minimum valid
+    elevation. Anything that wants the surface the solver actually steps has to do the
+    same, and a block mean is exactly such a thing: the wedges are 3.00 % of this raster
+    but a single sentinel inside a 4x4 block drags its mean down by 8192 m. Skipping this
+    made :func:`descent_report` read a 33 508 m "net drop" on a route that falls 268 m.
+    """
+    out = np.array(bed, dtype=np.float64, copy=True)
+    for t in tiles:
+        r0, c0 = int(t["row"]), int(t["col"])
+        block = out[r0 : r0 + int(t["height"]), c0 : c0 + int(t["width"])]
+        mask = block == nodata
+        if not mask.any():
+            continue
+        valid = block[~mask]
+        block[mask] = float(valid.min()) if valid.size else 0.0
+    return out
+
+
+def descent_report(bed: np.ndarray, path: list | tuple, *, coarsen: int = 1) -> dict:
+    """Does this flow path actually run downhill on the surface the solver steps?
+
+    **The check that was missing, and it is not implied by any of the others.** A route
+    can be in the channel, 4-connected, and drain out of the domain on the D8 network,
+    and still convey nothing -- because all of those are properties of the *filled*
+    raster, while the solver integrates the **raw** bed, block-mean coarsened to the run
+    resolution. Those are different surfaces.
+
+    Block mean is volume-preserving, which is why :mod:`solver.io.coarsen` uses it for
+    floodplain storage. It is **not** descent-preserving. A mountain river valley is
+    narrower than a coarse cell and meanders inside the block, so the mean replaces the
+    valley floor with an average of floor and valley wall -- and the river stops running
+    downhill. Measured on the real DEM's chosen route: **0.00 m** of ascent on the raw
+    28.15 m bed, **143.04 m** at ``coarsen = 2``, and **314.92 m** at ``coarsen = 4``
+    over a route that descends only 269.9 m. Sampled over 23 independent routes at
+    ``coarsen = 4``: 38.6 % of steps uphill and, on 18 of 21 routes with a real drop,
+    more ascent than descent.
+
+    Returns ``{"cells", "net_drop_m", "ascent_m", "up_steps", "steps", "worst_rise_m",
+    "ascent_over_drop"}``. ``ascent_m`` is the sum of the uphill steps: zero means the
+    path descends monotonically and water put at the top can reach the bottom under
+    gravity alone. ``ascent_over_drop`` is ``None`` when the net drop is not positive --
+    a coarsened route can end *higher* than it starts (2 of those 23 did), and a ratio
+    against a non-positive denominator is not a number worth printing.
+
+    ``bed`` is in the field's own (pre-coarsen) coordinates, as ``path`` is. Cells are
+    mapped ``i // coarsen``, repeats dropped, exactly as the solver would see them.
+    """
+    surf = _block_mean(np.asarray(bed, dtype=np.float64), int(coarsen))
+    seen: set[tuple[int, int]] = set()
+    run_path: list[tuple[int, int]] = []
+    for cell in path:
+        p = (int(cell[0]) // int(coarsen), int(cell[1]) // int(coarsen))
+        if p in seen or not (0 <= p[0] < surf.shape[0] and 0 <= p[1] < surf.shape[1]):
+            continue
+        seen.add(p)
+        run_path.append(p)
+    if len(run_path) < 2:
+        return {
+            "cells": len(run_path),
+            "net_drop_m": 0.0,
+            "ascent_m": 0.0,
+            "up_steps": 0,
+            "steps": 0,
+            "worst_rise_m": 0.0,
+            "ascent_over_drop": None,
+        }
+    z = np.array([surf[p] for p in run_path], dtype=np.float64)
+    dz = np.diff(z)
+    up = dz[dz > 0.0]
+    net_drop = float(z[0] - z[-1])
+    ascent = float(up.sum())
+    return {
+        "cells": len(run_path),
+        "net_drop_m": net_drop,
+        "ascent_m": ascent,
+        "up_steps": int(up.size),
+        "steps": int(dz.size),
+        "worst_rise_m": float(up.max()) if up.size else 0.0,
+        "ascent_over_drop": (ascent / net_drop) if net_drop > 0.0 else None,
+    }
+
+
 def connectivity_report(width: np.ndarray) -> dict:
     """Diagnostics for a channel-width field: is this network able to convey?
 
@@ -477,6 +577,8 @@ def route_report(
     outlets: list[tuple[int, int]] | tuple = (),
     *,
     dirmap: tuple[int, ...] | list[int] = DEFAULT_DIRMAP,
+    bed: np.ndarray | None = None,
+    coarsen: int = 1,
 ) -> dict:
     """Is a scenario's water put in somewhere it can get out of?
 
@@ -497,6 +599,13 @@ def route_report(
        cell is not in the channel to begin with.
     3. **Does the flow path from the inlet dead-end inside the domain?** See
        :func:`trace_downstream` for what that does and does not prove.
+    4. **Does that path run downhill on the surface the solver actually steps?** Only
+       when ``bed`` is given, via :func:`descent_report`. The first three questions are
+       all about the *filled* raster's D8 network and **none of them implies this one**:
+       the real DEM's chosen route passed 1-3 and then ponded 4.19 M m³ five cells below
+       its inlet, because block-mean coarsening had left it climbing 314.92 m over a
+       269.9 m descent. Pass ``bed`` and the run's ``coarsen`` and this is answered
+       before a step is taken.
     """
     w = np.asarray(width)
     mask = w > 0.0
@@ -538,6 +647,26 @@ def route_report(
                 tr["reason"] in ("no_direction", "loop") and not _on_border(tr["end"], shape)
             ),
         }
+        if bed is not None:
+            desc = descent_report(bed, tr["path"], coarsen=coarsen)
+            entry["descent"] = desc
+            if desc["ascent_m"] > 0.0:
+                over = desc["ascent_over_drop"]
+                warnings.append(
+                    f"the flow path from inlet {entry['cell']} climbs"
+                    f" {desc['ascent_m']:.1f} m in total on the bed the solver steps"
+                    f" (coarsen {coarsen}), over {desc['up_steps']} of {desc['steps']}"
+                    f" steps, worst single rise {desc['worst_rise_m']:.2f} m, against a"
+                    f" net drop of {desc['net_drop_m']:.1f} m"
+                    + (
+                        f" -- {over:.2f}x the drop"
+                        if over is not None
+                        else " (which is not positive)"
+                    )
+                    + ". Block-mean coarsening is volume-preserving, not"
+                    " descent-preserving: water put here fills the first hollow instead"
+                    " of conveying, and the mass gate cannot see it"
+                )
         if not entry["in_channel"]:
             warnings.append(
                 f"inlet {entry['cell']} is not a channel cell -- the discharge lands on"
@@ -749,7 +878,7 @@ def channel_fields(
     if int(coarsen) < 1:
         raise ValueError(f"coarsen must be >= 1, got {coarsen}")
 
-    _, acc, meta, _ = read_conditioned(cond_dir)
+    bed, acc, meta, _ = read_conditioned(cond_dir)
     manifest = json.loads((Path(tiles_dir) / "tiles.json").read_text())
     dx = float(manifest.get("dx_m", meta["dx_m"]))
     run_dx = dx * int(coarsen)
@@ -832,7 +961,20 @@ def channel_fields(
         "drainage": drainage_check(width, area, fdir, dirmap=dirmap),
     }
     if inlets or outlets:
-        record["route"] = route_report(width, fdir, inlets, outlets, dirmap=dirmap)
+        # The descent check has to walk the surface the solver steps, which means the
+        # tiler's per-tile nodata fill applied first. A flow path never enters nodata
+        # (those cells have no direction), but a *block mean* around one does, and the
+        # sentinel is -32768 m.
+        filled_bed = fill_tile_nodata(bed, manifest["tiles"], float(meta.get("nodata", -32768.0)))
+        record["route"] = route_report(
+            width,
+            fdir,
+            inlets,
+            outlets,
+            dirmap=dirmap,
+            bed=filled_bed[r0:r1, c0:c1],
+            coarsen=int(coarsen),
+        )
     (out / "channels.json").write_text(json.dumps(record, indent=2))
     return record
 
@@ -993,6 +1135,15 @@ def main(argv: list[str] | None = None) -> None:
                 f" flow path {r['reason']} after {r['steps']} cells, {r['channel_steps']} of them"
                 " channel"
             )
+            d = e.get("descent")
+            if d:
+                over = d["ascent_over_drop"]
+                print(
+                    f"    descent   : {d['net_drop_m']:.1f} m net drop over {d['cells']}"
+                    f" run cells, {d['ascent_m']:.1f} m of it climbed back"
+                    + (f" ({over:.2f}x the drop)" if over is not None else " (net drop <= 0)")
+                    + f", {d['up_steps']}/{d['steps']} steps uphill"
+                )
         for e in route["outlets"]:
             print(
                 f"  outlet {e['cell']}: {'channel' if e['in_channel'] else 'floodplain'},"

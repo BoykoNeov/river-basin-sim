@@ -1,0 +1,131 @@
+# Real DEM, end to end (docs/plans/real-dem-reach.md step 4) -- the reach machinery
+# on terrain that was not built to suit it.
+#
+# Every other reach-scale scenario in this repo is synthetic: `make_reach_demo.py`
+# builds the basin, the river and the channel fields. This one runs the conditioned
+# SRTM N35W083 tile (UTM 17N, 28.15 m) as a 16-tile mosaic with channel geometry
+# DERIVED from real flow accumulation by `pipeline.channels`.
+#
+# ============================================================================
+# THIS RUN DOES NOT CONVEY, AND THAT IS WHY IT IS HERE.
+#
+# Run as written it injects 4.19 M m3 over 12 h and moves almost none of it: 56 wet
+# cells of 817 540, outflow_cum EXACTLY 0.000, and a 12.9 m pond five cells below the
+# inlet. The mass balance reads 6.35e-07, inside the gate -- because mass IS conserved
+# in a domain that fills instead of conveying. This scenario is kept as the reproducer
+# for that defect (plan §5.3), not as a demonstration that the path works.
+#
+# The cause is not the network and not the channels. It is `[grid] coarsen`. Block-mean
+# bed aggregation is volume-preserving but NOT descent-preserving, and a mountain river
+# valley is narrower than a 112.59 m cell: the mean replaces the valley floor with an
+# average of floor and valley wall. This route descends 269.9 m on the raw 28.15 m bed
+# with ZERO metres of ascent, and at coarsen 4 it climbs 314.9 m -- 1.17x its own drop,
+# 49 of 118 steps uphill. Water put at the top cannot reach the bottom under gravity.
+#
+# Do not "fix" this by moving the inlet. It is not local: sampled over 23 independent
+# routes, coarsen 4 puts 38.6 % of steps uphill and, on 18 of 21 routes with a real
+# drop, more ascent than descent. `pipeline.channels --inlet` now reports it before a
+# run (`descent` in channels.json), which is the check that was missing.
+# ============================================================================
+#
+# THIS IS NOT A FLOOD FORECAST FOR THE SMOKY MOUNTAINS. Read plan §1 and §7 before
+# quoting any number off it:
+#
+#   * the terrain is steep -- 60 % of cells exceed a 10 % grade at this resolution,
+#     which is outside local-inertial's regime. M1's disclaimer ("steep-cell
+#     velocities are limiter-shaped, NOT validated LI hydraulics") applies to the
+#     majority of this domain, not a tail of it;
+#   * the hydraulic-geometry coefficients are humid-temperate defaults, not a
+#     regional calibration (data/fields/smoky_mosaic/channels.json records them);
+#   * Manning's n below is a plausible forested-basin value, uncalibrated;
+#   * 39.1 % of the domain's valid cells drain to one of 100 interior dead ends the
+#     conditioning left behind (plan §5.3). Water that reaches one ponds. The route
+#     used here was checked NOT to (see [[inflow]] below).
+#
+# Prepare the inputs first (both write outside the repo's tracked tree):
+#   uv run python -m pipeline.tile --src data/dem/conditioned --out data/tiles/smoky
+#   uv run python -m pipeline.channels --src data/dem/conditioned \
+#       --tiles data/tiles/smoky --out data/fields/smoky_mosaic --coarsen 4 \
+#       --max-area-km2 auto --inlet 305,2717 --inlet 303,2716 --inlet 300,2715 \
+#       --inlet 299,2714 --outlet 0,2641
+# Then run it into its OWN output directory (every scenario otherwise lands in
+# data/results/demo.zarr and the frames export never purges):
+#   uv run python -m solver.run --config scenarios/smoky_reach.toml \
+#       --out data/results/smoky.zarr --frames-dir data/results/smoky_frames \
+#       --status data/results/smoky_status.json
+
+[meta]
+name = "smoky_reach"
+seed = 12345
+scheme = "local_inertial"        # sub-grid channels are LI-only (M6 plan §0)
+
+[grid]
+tiles_dir = "data/tiles/smoky"   # dx / crs inherit from tiles.json
+tiles = "all"                    # the whole 3991x3283 mosaic, all 16 tiles
+coarsen = 4                      # -> 997x820 @ 112.59 m = 817 540 cells
+# The basin sits at 218-2027 m (mean 747). float32 eta = h + z has 6.1e-5 m of
+# resolution up there, and a thin sheet on it is exactly the conditioning case
+# CLAUDE.md describes -- the shift is doing real work here, not insurance.
+datum = "auto"
+
+# No [rainfall] table at all, and that is deliberate: an absent table means no rain
+# (solver/io/config.py). This run is inflow-driven so the moving water stays in and
+# beside the derived river, where the channel geometry means something. A millimetric
+# rain-on-grid sheet over 60 % slopes would be a limiter study, not a reach study.
+
+[run]
+end_time = 43200.0               # 12 h -- the route is 9.3 km of flow path
+output_every = 1800.0            # 24 frames
+cfl = 0.7
+dt_max = 20.0
+
+[parameters]
+manning_n = 0.06                 # forested mountain hillslope, UNCALIBRATED
+
+# Channel geometry derived from the real flow accumulation, with the §4 cutoff on
+# (--max-area-km2 auto = 198.1 km2 here): rivers wider than a cell are dropped from
+# the mask and travel as ordinary on-grid flow, so nothing is clipped to its cell.
+# The price is that the main stem is floodplain by choice, and the route below is
+# mostly on-grid: 21 of its 331 cells are channel. That is plan §5.2.1's trade.
+[channels]
+width = "../data/fields/smoky_mosaic/channel_width.r32"
+depth = "../data/fields/smoky_mosaic/channel_depth.r32"
+manning = 0.035                  # a channel is smoother than its hillslope
+
+# A flood wave entering the largest river still carried sub-grid (194 km2, 111.4 m
+# wide, 1.31 m bank full). Cells are in assembled-domain (pre-coarsen) coordinates.
+#
+# Three things were checked before these were written down, and none is checked by
+# the solver. The first two PASSED and were not enough -- that is the lesson:
+#   * all four are IN the channel and on a flow path that leaves the domain (it
+#     reaches [0, 2641] on the north edge after 331 cells) rather than ending in one
+#     of the conditioning's dead ends -- `pipeline.channels --inlet/--outlet`;
+#   * they map to four DISTINCT run cells at coarsen 4. Four *consecutive* flow-path
+#     cells collapse onto two, and InflowInjector rejects duplicates outright;
+#   * the route runs downhill on the bed the solver steps. It DOES NOT (see the banner
+#     above). The first two questions are about the filled D8 raster; this one is about
+#     the coarsened raw bed, and nothing about the network implies it.
+# Four entries rather than one because a single-cell point source digs its own crater
+# (M7 measured 83 % of a run's bed change under one). Total peak 120 m3/s.
+[[inflow]]
+cell = [305, 2717]               # -> run (76, 679), w = 111.4 m
+hydrograph = [[0.0, 5.0], [7200.0, 30.0], [28800.0, 30.0], [43200.0, 8.0]]
+
+[[inflow]]
+cell = [303, 2716]               # -> run (75, 679), w = 111.4 m
+hydrograph = [[0.0, 5.0], [7200.0, 30.0], [28800.0, 30.0], [43200.0, 8.0]]
+
+[[inflow]]
+cell = [300, 2715]               # -> run (75, 678), w = 111.4 m
+hydrograph = [[0.0, 5.0], [7200.0, 30.0], [28800.0, 30.0], [43200.0, 8.0]]
+
+[[inflow]]
+cell = [299, 2714]               # -> run (74, 678), w = 111.4 m
+hydrograph = [[0.0, 5.0], [7200.0, 30.0], [28800.0, 30.0], [43200.0, 8.0]]
+
+# The domain is the whole reprojected DEM, so every edge is the edge of the data and
+# water arriving at one should leave rather than pile against a wall. The route's own
+# outlet is [0, 2641] on the north edge; the basin's largest river (1365 km2) leaves
+# at [241, 0] on the west.
+[boundaries]
+default = "open"
