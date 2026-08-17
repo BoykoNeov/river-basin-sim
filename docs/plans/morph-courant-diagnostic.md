@@ -330,29 +330,82 @@ in-regime peak 19.38, up to 578 of 1414 cells over the gate, max share 0.883.
 
 **CPU**: the byte comparison above is CUDA-only, because the step-1 baseline store is
 a CUDA run. On CPU the run reproduces its recorded figures instead. That is the
-weaker claim and is stated as such — but it came back stronger than "reproduces",
-and in the one place that matters:
+weaker claim and is stated as such. Every recorded CPU figure reproduces exactly:
+mass **2.14e-07**, sediment **5.19e-17**, bed **169 999.6 m³**.
 
-| | CUDA | CPU | recorded CPU baseline |
-|---|---|---|---|
-| mass max rel | 2.66e-07 | **2.14e-07** | 2.14e-07 |
-| sediment rel | 4.1e-17 | **5.19e-17** | 5.19e-17 |
-| bed moved | 168 563 m³ | **169 999.6 m³** | ~170 000 m³ |
-| Courant peak, raw | 39 271.12 | **39 256.32** | — |
-| … at `h_col/d50 ≥ 35` | 19.38 | **19.38** | — |
-| cells over gate | 578 of 1414 | **578 of 1414** | — |
-| max over-gate share | 0.88 | **0.88** | — |
+#### 4.1.1 A cross-backend finding, and the two wrong versions of it I wrote first
 
-Every recorded CPU figure reproduces exactly. The free finding is the last four rows:
-**the raw peak is backend-sensitive and the breakdown is not.** The peak differs by
-0.04 % between backends — it is a field maximum over a divergent expression evaluated
-at the wet/dry guard, so it inherits the reduction-order noise of the cell that happens
-to be thinnest — while the in-regime peak, the cell counts and the share are identical
-to every digit printed. That is the diagnostic's own argument arriving as a
-measurement: the number that overstates is the one that wobbles, and the numbers that
-give it a denominator are stable across backends. It also means the breakdown can be
-quoted without a backend label, which the raw peak and the bed volume cannot
-(CLAUDE.md's existing warning about unlabelled bed volumes applies to the peak too).
+The console output invites a comparison it cannot support, and I published the
+unsupported version before checking. Recording both the error and the correction,
+because the error is the more instructive half.
+
+**What the consoles show.** CUDA `39271.12 / 19.38 / 578 of 1414 / 88%`;
+CPU `39256.32 / 19.38 / 578 of 1414 / 88%`. From which I concluded "the raw peak is
+backend-sensitive and the breakdown is not, identical to every digit."
+
+**Wrong version 1 — the comparison was precision-limited.** The peak is printed at
+seven significant figures and differs by 3.8e-04; the in-regime peak is printed at
+four and the share at two. A 3.8e-04 relative difference on `19.38` is ±0.007 and on
+`88%` is invisible. "Identical to every digit" was a statement about the format
+strings, not about the arithmetic. The stores carry both at full precision, so the
+check costs nothing and should have been the first move.
+
+**Wrong version 2 — "reduction-order noise" is the wrong mechanism.** A maximum is
+order-invariant in IEEE arithmetic (max is associative and commutative), so reduction
+order *cannot* move a field maximum and cannot be what puts 14.8 between the two
+peaks. M5's note in `CLAUDE.md` already reasons this way about a backend delta; I
+wrote the opposite here.
+
+**What the full-precision comparison actually says** (both stores' `.zattrs`, all 96
+activations, `repr()` not `%.2f` — `M:\claud_projects\temp\morph-courant\backend_compare.py`):
+
+| | peak over run, CUDA vs CPU | per activation, max rel | median rel | bit-equal |
+|---|---|---|---|---|
+| `courant` (raw) | 39271.11710132237 / 39256.31631791563, rel **3.8e-04** | **4.8e-02** | 1.4e-04 | 8/96 |
+| `courant_moving` | same as raw | **6.4e-01** | 1.1e-04 | 2/96 |
+| `courant_in_regime` | 19.377828828597472 both, rel **0** | **7.6e-05** | 1.8e-05 | 1/96 |
+| `over_courant_share` | 0.8830785475 / 0.8830785522, rel **5.2e-09** | **2.6e-01** | 3.3e-03 | 0/96 |
+| `courant_cells` | 578 both | 5.6e-03 | 0 | 89/96 |
+| `live_cells` | 1414 both | 1.7e-03 | 0 | 89/96 |
+
+**Three corrections follow, and the headline claim does not survive intact.**
+
+**(a) Nothing here is backend-invariant.** The in-regime peak is bit-identical for one
+reason only: its argmax is **activation 0**, and activation 0 is the single bit-equal
+activation of the 96. Per activation, `courant_in_regime` agrees bitwise 1 time in 96.
+Reporting "identical to every digit" as though it were a property of the reduction
+would have planted a false invariant in `CLAUDE.md` for every future session to trust.
+
+**(b) The surviving finding is a sensitivity *ranking*, not an invariance.** Per
+activation the in-regime max is the most reproducible quantity in the record —
+worst case **7.6e-05**, against **4.8e-02** for the raw max, a factor of ~630 — and
+`courant_moving` is the least reproducible of the maxima at **6.4e-01**, which is
+consistent with §1.3's finding that it *is* the raw max on this run.
+
+**(c) The mechanism is where on the divergence curve the max is taken.** The fields
+themselves differ slightly between backends (FMA contraction, libm `pow`/`sqrt`), and
+`bed_celerity` goes as roughly **h^(−4.5)** at fixed discharge for a wide section well
+above threshold (θ ∝ h^(−7/3) ⇒ (θ/h)·√θ ∝ h^(−10/3)·h^(−7/6)). So one perturbation of
+the same size is amplified where the raw max lives — a cell at the wet/dry guard — and
+mild where the in-regime max lives. The measured 3.8e-04 on celerity implies ~8e-05 on
+depth, which is the right order for float32 fields after 24 h.
+
+**The clean evidence that it is not reduction order** is in the table's last column
+against its first: at **activation 0**, `courant_in_regime` is bit-equal while
+`over_courant_share` already differs at 5.2e-09. Same activation, same fields — the max
+agrees and the ratio-of-sums does not, because sums *are* order-sensitive and maxima
+are not.
+
+**So `over_courant_share` must not be quoted beside the counts.** It is the one
+breakdown quantity carrying both exposures — a ratio of two sums — and per activation
+it is the least stable of them all (2.6e-01 worst case, 3.3e-03 median). The integer
+counts are exact on 89 of 96 activations and differ only when a cell sits on the
+threshold.
+
+**Practical rule:** quote every one of these with its backend, as bed volumes already
+are. The breakdown is *more reproducible* than the peak; it is not reproducible full
+stop, and the honest single sentence is "the reduction taken where the law applies is
+~600× less backend-sensitive than the one taken at the guard."
 
 Note the trap in §2.3 is a **CPU-only**
 failure mode (`warp.array.numpy()` copies on CUDA and lends a view on CPU), so the
