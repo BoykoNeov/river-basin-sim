@@ -48,10 +48,11 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   comparison it cannot support (the peak prints at 7 significant figures, the in-regime
   number at 4, the share at 2), and "identical to every digit" was a claim about format
   strings. At full precision, over all 96 activations: **nothing is backend-invariant**
-  — the in-regime peak is bit-identical only because its argmax is *activation 0*, the
-  one bit-equal activation of 96. What survives is a **sensitivity ranking**: worst-case
-  relative difference per activation **7.6e-5** for `courant_in_regime` against
-  **4.8e-2** for the raw peak, ~630×. The `.copy()` on the `dz_cum` snapshot
+  — the in-regime peak is bit-identical only because its argmax is *activation 0*, where
+  the runs have diverged least, and it is the one bit-equal activation of 96. What
+  survives is a **sensitivity ranking**: worst-case relative difference per activation
+  **7.6e-5** for `courant_in_regime` against **4.8e-2** for the raw peak, ~630×.
+  The `.copy()` on the `dz_cum` snapshot
   is load-bearing and **CPU-only** (`warp.array.numpy()` copies on CUDA, lends a view on
   CPU); its gate was checked by re-introducing the bug — one test fails, nothing else
   notices. Suite run against the changed code *before* any test was added: **358 green,
@@ -536,14 +537,15 @@ regulatory-certification tool**. State that honestly anywhere it matters.
   39 271 CUDA vs 39 256 CPU, and per activation the worst relative gap is **4.8e-2** raw
   against **7.6e-5** in-regime, ~630×. **Quote all of them with their backend**, the way
   bed volumes are quoted: none of it is invariant (the in-regime peak looks bit-identical
-  only because its argmax lands on activation 0, the one bit-equal activation of 96).
-  Two traps if you re-derive this: it is **not** reduction-order noise — a max is
-  order-invariant in IEEE, the *fields* differ and `bed_celerity ∝ h^-4.5` amplifies that
-  at the guard and barely in the reach; and **`over_courant_share` is a ratio of sums**,
-  so it does carry order sensitivity and is the least stable of the breakdown per
-  activation (2.6e-1 worst case) — do not quote it beside the integer counts. The clean
-  proof of both: at activation 0 the in-regime max is bit-equal while the share already
-  differs at 5.2e-9. Related
+  only because its argmax lands on activation 0, where the runs have diverged least —
+  the one bit-equal activation of 96). **Reduction order is not involved at all and
+  cannot be**: `courant_summary` and `celerity_field` are pure host numpy float64 over
+  `.numpy()` copies, so both arms run the identical reduction; what differs is the
+  *fields*, and `bed_celerity ∝ h^-4.5` (wide-section branch) amplifies that at the
+  wet/dry guard and barely in the reach. **A max reads one cell and discards the rest; a
+  sum accumulates every cell's difference** — which is why `over_courant_share` is the
+  least stable of the breakdown per activation (2.6e-1 worst case) and must not be
+  quoted beside the integer cell counts (exact on 89 of 96). Related
   and still true: **do not shorten `interval_s` on this warning's say-so** — check the
   bed against a *longer* interval first. See `docs/plans/morph-courant-diagnostic.md`.
 - **A distributed source is an accumulator, and float32 accumulators need

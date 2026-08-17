@@ -350,11 +350,18 @@ four and the share at two. A 3.8e-04 relative difference on `19.38` is ±0.007 a
 strings, not about the arithmetic. The stores carry both at full precision, so the
 check costs nothing and should have been the first move.
 
-**Wrong version 2 — "reduction-order noise" is the wrong mechanism.** A maximum is
-order-invariant in IEEE arithmetic (max is associative and commutative), so reduction
-order *cannot* move a field maximum and cannot be what puts 14.8 between the two
-peaks. M5's note in `CLAUDE.md` already reasons this way about a backend delta; I
-wrote the opposite here.
+**Wrong version 2 — "reduction-order noise" is the wrong mechanism, and so is the
+weaker version I reached for next.** A maximum is order-invariant in IEEE arithmetic
+(max is associative and commutative), so reduction order cannot move a field maximum
+and cannot be what puts 14.8 between the two peaks. M5's note in `CLAUDE.md` already
+reasons this way about a backend delta; I wrote the opposite here. The retreat position
+— "maxima are order-invariant but *sums* are, so that is why the share moves" — is also
+wrong, for a sharper reason: **there are no device-side reductions in this code at
+all.** `courant_summary`, `celerity_field`, `submergence_field` and
+`column_depth_field` are pure host numpy float64 over `.numpy()` field copies (they are
+deliberately not kernels — nothing in the physics reads them). Same numpy, same shapes,
+same pairwise blocking, both arms. **Reduction order is identical between backends by
+construction, and none of the observed difference can come from it.**
 
 **What the full-precision comparison actually says** (both stores' `.zattrs`, all 96
 activations, `repr()` not `%.2f` — `M:\claud_projects\temp\morph-courant\backend_compare.py`):
@@ -371,36 +378,46 @@ activations, `repr()` not `%.2f` — `M:\claud_projects\temp\morph-courant\backe
 **Three corrections follow, and the headline claim does not survive intact.**
 
 **(a) Nothing here is backend-invariant.** The in-regime peak is bit-identical for one
-reason only: its argmax is **activation 0**, and activation 0 is the single bit-equal
-activation of the 96. Per activation, `courant_in_regime` agrees bitwise 1 time in 96.
-Reporting "identical to every digit" as though it were a property of the reduction
-would have planted a false invariant in `CLAUDE.md` for every future session to trust.
+reason only: its argmax is **activation 0**, where the two runs have diverged least, so
+the one cell the max reads is the most likely to still agree bitwise. It is the single
+bit-equal activation of the 96; per activation, `courant_in_regime` agrees bitwise 1
+time in 96. Note "least diverged" and not "not yet diverged" — the table's own last row
+shows `over_courant_share` already differing at activation 0. Reporting "identical to
+every digit" as a property of the reduction would have planted a false invariant in
+`CLAUDE.md` for every future session to trust.
 
 **(b) The surviving finding is a sensitivity *ranking*, not an invariance.** Per
 activation the in-regime max is the most reproducible quantity in the record —
-worst case **7.6e-05**, against **4.8e-02** for the raw max, a factor of ~630 — and
-`courant_moving` is the least reproducible of the maxima at **6.4e-01**, which is
-consistent with §1.3's finding that it *is* the raw max on this run.
+worst case **7.6e-05**, against **4.8e-02** for the raw max, a factor of ~630 — while
+`courant_moving` is the least reproducible of the maxima at **6.4e-01**. Note this does
+*not* make the moving and raw series the same series: they are bit-equal against CPU on
+2 and 8 activations respectively and their spreads differ. §1.3's finding is only that
+they **coincide at the run-level peak** (both take it at activation 45), which the peak
+column shows and the per-activation columns do not contradict.
 
 **(c) The mechanism is where on the divergence curve the max is taken.** The fields
 themselves differ slightly between backends (FMA contraction, libm `pow`/`sqrt`), and
-`bed_celerity` goes as roughly **h^(−4.5)** at fixed discharge for a wide section well
-above threshold (θ ∝ h^(−7/3) ⇒ (θ/h)·√θ ∝ h^(−10/3)·h^(−7/6)). So one perturbation of
-the same size is amplified where the raw max lives — a cell at the wet/dry guard — and
-mild where the in-regime max lives. The measured 3.8e-04 on celerity implies ~8e-05 on
-depth, which is the right order for float32 fields after 24 h.
+in the **wide-section branch** `bed_celerity` goes as roughly **h^(−4.5)** at fixed
+discharge well above threshold (`R = h`, `kappa = 7/3`: θ ∝ h^(−7/3) ⇒ (θ/h)·√θ ∝
+h^(−10/3)·h^(−7/6)). So one perturbation of the same size is amplified where the raw max
+lives — a cell at the wet/dry guard — and mild where the in-regime max lives. The
+measured 3.8e-04 on celerity implies ~8e-05 on depth, the right order for float32
+fields after 24 h. *Scope:* a sub-grid **channel** cell takes the width branch instead
+(`R = A/P`, `kappa = 2 + w/(3(w+2h))`, times `w/dx`) and carries a different exponent;
+which branch activation 45's argmax cell takes was not checked. That changes the
+arithmetic of the estimate, not the qualitative claim or the measured 630×.
 
-**The clean evidence that it is not reduction order** is in the table's last column
-against its first: at **activation 0**, `courant_in_regime` is bit-equal while
-`over_courant_share` already differs at 5.2e-09. Same activation, same fields — the max
-agrees and the ratio-of-sums does not, because sums *are* order-sensitive and maxima
-are not.
+**Why the share moves where the max does not, correctly this time.** Not because sums
+are order-sensitive here — see wrong version 2; they are the same numpy call on both
+arms. Because **a max reads one cell and discards the other 1413, while a sum
+accumulates every cell's difference.** Differing inputs explain the whole table with no
+appeal to reduction order: the max can agree whenever its single argmax cell agrees,
+and the share cannot, because there is no such thing as one cell agreeing for a sum.
 
-**So `over_courant_share` must not be quoted beside the counts.** It is the one
-breakdown quantity carrying both exposures — a ratio of two sums — and per activation
-it is the least stable of them all (2.6e-01 worst case, 3.3e-03 median). The integer
-counts are exact on 89 of 96 activations and differ only when a cell sits on the
-threshold.
+**So `over_courant_share` still must not be quoted beside the counts**, on the
+measurement rather than the theory: per activation it is the least stable quantity in
+the record (2.6e-01 worst case, 3.3e-03 median), while the integer counts are exact on
+89 of 96 activations and differ only when a cell sits on the threshold.
 
 **Practical rule:** quote every one of these with its backend, as bed volumes already
 are. The breakdown is *more reproducible* than the peak; it is not reproducible full
